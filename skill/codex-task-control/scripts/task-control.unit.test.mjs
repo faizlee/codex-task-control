@@ -8,6 +8,7 @@ import {
   TaskControlError,
   controllerIngestCompletion,
   controllerIngestNotificationFailed,
+  controllerMarkChangesRequested,
   controllerMarkAccepted,
   controllerMarkBlocked,
   controllerMarkIntegrated,
@@ -47,6 +48,11 @@ async function withFixture(run) {
       executionSurface: 'visible_task',
       modelClass: 'economical',
       quotaReason: 'mechanical scan verification saves controller quota',
+      workClass: 'repeatable',
+      decisionStatus: 'resolved',
+      scope: 'Only inspect and update the named provider call sites.',
+      acceptance: 'Run the targeted unit test and require a zero exit code.',
+      forbiddenDecisions: 'Do not change provider contracts or routing policy.',
     };
     await register(base);
     await run({ ...base });
@@ -71,6 +77,11 @@ test('registration allocates readable hierarchy and blocks dispatch until title 
     executionSurface: 'visible_task',
     modelClass: 'economical',
     quotaReason: 'mechanical title verification saves controller quota',
+    workClass: 'repeatable',
+    decisionStatus: 'resolved',
+    scope: 'Only inspect and update the named provider call sites.',
+    acceptance: 'Run the targeted unit test and require a zero exit code.',
+    forbiddenDecisions: 'Do not change provider contracts or routing policy.',
   };
   try {
     const root = await controllerRegisterTask(rootInput);
@@ -100,6 +111,22 @@ test('controller scan discovers a fresh completion and keeps the heartbeat', asy
     assert.equal(scan.needsControllerAttention, true);
     assert.equal(scan.shouldKeepHeartbeat, true);
     assert.deepEqual(scan.pendingEvents.map((event) => ({ type: event.type, eventPath })), [{ type: 'task_completed', eventPath }]);
+  });
+});
+
+test('changes requested enters a stopped routing queue instead of pretending to run', async () => {
+  await withFixture(async (fixture) => {
+    await delay();
+    const eventPath = await createCompletionEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, candidateCommit: 'candidate-routing' });
+    await controllerIngestCompletion({ ...fixture, eventPath });
+    const pending = await controllerMarkChangesRequested({ ...fixture, failureClass: 'comprehension', reason: 'The change crossed a decided module boundary.' });
+    assert.equal(pending.desiredThreadTitle, '待决｜01 审计 Provider 调用');
+
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.deepEqual(scan.activeTasks, []);
+    assert.deepEqual(scan.routingQueue, [{ threadId: fixture.threadId, displayKey: '01', status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: 'comprehension' }]);
+    assert.equal(scan.needsControllerAttention, true);
+    assert.equal(scan.shouldKeepHeartbeat, true);
   });
 });
 

@@ -11,10 +11,12 @@ import {
   buildCompletionNotification,
   controllerIngestCompletion,
   controllerIngestNotificationFailed,
+  controllerDispatchRework,
   controllerMarkAccepted,
   controllerMarkChangesRequested,
   controllerMarkIntegrated,
   controllerMarkNotificationSent,
+  controllerReclaimTask,
   controllerRecordTitleSynced,
   controllerRegisterTask,
   createCompletionEvent,
@@ -97,6 +99,11 @@ async function register(codexHome, projectRoot, threadId, overrides = {}) {
     executionSurface: overrides.executionSurface ?? 'visible_task',
     modelClass: overrides.modelClass ?? 'economical',
     quotaReason: overrides.quotaReason ?? 'Use a cheaper worker for repetitive mechanical execution.',
+    workClass: overrides.workClass ?? 'repeatable',
+    decisionStatus: overrides.decisionStatus ?? 'resolved',
+    scope: overrides.scope ?? 'Only update the named files and fields.',
+    acceptance: overrides.acceptance ?? 'Run the named targeted test and require a zero exit code.',
+    forbiddenDecisions: overrides.forbiddenDecisions ?? 'Do not change contracts, architecture, or error policy.',
   });
   if (overrides.syncTitle === false) return task;
   return controllerRecordTitleSynced({
@@ -198,7 +205,9 @@ describe('project-isolated task control', () => {
     const receipt = await createNotificationFailureReceipt({ codexHome, selfThreadId: 'child', reason: 'send_message_to_thread unavailable' });
     await controllerIngestNotificationFailed({ codexHome, projectRoot: root, controllerThreadId: defaultController, receiptPath: receipt });
 
-    const rework = await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
+    const pendingDecision = await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', failureClass: 'mechanical', reason: 'A dedicated test was omitted.' });
+    assert.equal(pendingDecision.desiredThreadTitle, '待决｜01 same task');
+    const rework = await controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
     await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', title: rework.desiredThreadTitle });
     const secondEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-2' });
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: secondEvent });
@@ -219,15 +228,15 @@ describe('project-isolated task control', () => {
     await register(codexHome, root, 'root-child-b', { controllerThreadId: 'root-b', parentThreadId: 'root-b' });
     await register(codexHome, root, 'nested-a', { controllerThreadId: 'root-child-a', parentThreadId: 'root-child-a' });
     await register(codexHome, root, 'nested-b', { controllerThreadId: 'root-child-b', parentThreadId: 'root-child-b' });
-    await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-child-a', threadId: 'nested-a' });
-    await expectCode(() => controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-child-a', threadId: 'nested-b' }), 'CONTROLLER_UNAUTHORIZED');
-    await expectCode(() => controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-b', threadId: 'root-child-a' }), 'CONTROLLER_UNAUTHORIZED');
+    await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-child-a', threadId: 'nested-a', failureClass: 'mechanical', reason: 'A mechanical assertion is missing.' });
+    await expectCode(() => controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-child-a', threadId: 'nested-b', failureClass: 'mechanical', reason: 'A mechanical assertion is missing.' }), 'CONTROLLER_UNAUTHORIZED');
+    await expectCode(() => controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-b', threadId: 'root-child-a', failureClass: 'mechanical', reason: 'A mechanical assertion is missing.' }), 'CONTROLLER_UNAUTHORIZED');
   });
 
   it('denies subagents by default and enforces economical low-thinking delegation', async () => {
     const codexHome = await freshCodexHome();
     const root = 'C:/work/delegation-policy';
-    const base = { codexHome, projectRoot: root, controllerThreadId: defaultController, parentThreadId: defaultController, title: 'mechanical task', model: 'worker-model', thinking: 'low', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Move repetitive mechanical work off the frontier controller.' };
+    const base = { codexHome, projectRoot: root, controllerThreadId: defaultController, parentThreadId: defaultController, title: 'mechanical task', model: 'worker-model', thinking: 'low', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Move repetitive mechanical work off the frontier controller.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' };
     await expectCode(() => controllerRegisterTask({ ...base, threadId: 'missing-auth' }), 'DELEGATION_NOT_AUTHORIZED');
     await expectCode(() => controllerRegisterTask({ ...base, threadId: 'internal-subagent', delegationMode: 'explicit', executionSurface: 'internal_subagent' }), 'INTERNAL_SUBAGENT_FORBIDDEN');
     await expectCode(() => controllerRegisterTask({ ...base, threadId: 'frontier-worker', delegationMode: 'explicit', modelClass: 'frontier' }), 'DELEGATION_MODEL_NOT_ECONOMICAL');
@@ -236,6 +245,66 @@ describe('project-isolated task control', () => {
     const allowed = await controllerRegisterTask({ ...base, threadId: 'allowed-worker', delegationMode: 'explicit' });
     assert.equal(allowed.modelClass, 'economical');
     assert.equal(allowed.thinking, 'low');
+  });
+
+  it('fails closed unless delegated work is decision-complete and testable', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/readiness-gate';
+    const base = { codexHome, projectRoot: root, controllerThreadId: defaultController, parentThreadId: defaultController, title: 'bounded implementation', model: 'gpt-5.6-terra', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'A bounded implementation saves meaningful frontier quota.', workClass: 'bounded_reasoning', decisionStatus: 'resolved', scope: 'Only modify the payload validator module.', acceptance: 'Run the validator unit suite and require a zero exit code.', forbiddenDecisions: 'Do not reinterpret persistence trust or error policy.' };
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'unresolved', decisionStatus: 'unresolved' }), 'DELEGATION_DECISIONS_UNRESOLVED');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'controller-only', workClass: 'controller_only' }), 'DELEGATION_CONTROLLER_ONLY');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'missing-scope', scope: '' }), 'DELEGATION_EVIDENCE_REQUIRED');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'missing-acceptance', acceptance: '' }), 'DELEGATION_EVIDENCE_REQUIRED');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'missing-boundary', forbiddenDecisions: '' }), 'DELEGATION_EVIDENCE_REQUIRED');
+    const allowed = await controllerRegisterTask({ ...base, threadId: 'bounded-worker' });
+    assert.equal(allowed.workClass, 'bounded_reasoning');
+    assert.equal(allowed.executionStatus, 'running');
+    assert.equal(allowed.nextOwner, 'worker');
+    assert.equal(allowed.attemptCount, 1);
+  });
+
+  it('separates review failure from actual rework and reclaims judgment work', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/rework-routing';
+    await register(codexHome, root, 'worker');
+    const completion = await createCompletionEvent({ codexHome, selfThreadId: 'worker', candidateCommit: 'candidate-1' });
+    await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: completion });
+
+    const pending = await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', failureClass: 'judgment', reason: 'The worker attempted to decide conflicting contracts.' });
+    assert.equal(pending.status, 'changes_requested');
+    assert.equal(pending.executionStatus, 'stopped');
+    assert.equal(pending.nextOwner, 'undecided');
+    assert.equal(pending.desiredThreadTitle, '待决｜01 same task');
+    assert.equal(pending.dispatchAllowed, false);
+    await expectCode(() => createCompletionEvent({ codexHome, selfThreadId: 'worker', candidateCommit: 'candidate-2' }), 'TASK_DISPATCH_NOT_AUTHORIZED');
+    await expectCode(() => controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker' }), 'REWORK_REQUIRES_CONTROLLER');
+
+    const reclaimed = await controllerReclaimTask({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', reason: 'The controller will resolve the contracts and implement the core fix.' });
+    assert.equal(reclaimed.status, 'reclaimed');
+    assert.equal(reclaimed.executionStatus, 'terminal');
+    assert.equal(reclaimed.nextOwner, 'controller');
+    assert.equal(reclaimed.desiredThreadTitle, '收回｜01 same task');
+    assert.equal(reclaimed.archiveStatus, 'pending');
+  });
+
+  it('allows one explicit mechanical rework and then forces controller recovery', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/rework-limit';
+    await register(codexHome, root, 'worker');
+    let completion = await createCompletionEvent({ codexHome, selfThreadId: 'worker', candidateCommit: 'candidate-1' });
+    await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: completion });
+    await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', failureClass: 'mechanical', reason: 'One expected assertion is missing.' });
+    const rework = await controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker' });
+    assert.equal(rework.executionStatus, 'running');
+    assert.equal(rework.nextOwner, 'worker');
+    assert.equal(rework.attemptCount, 2);
+    assert.equal(rework.desiredThreadTitle, '返工｜01 same task');
+    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', title: rework.desiredThreadTitle });
+
+    completion = await createCompletionEvent({ codexHome, selfThreadId: 'worker', candidateCommit: 'candidate-2' });
+    await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: completion });
+    await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', failureClass: 'mechanical', reason: 'The same bounded task still fails review.' });
+    await expectCode(() => controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker' }), 'REWORK_LIMIT_REACHED');
   });
 
   it('allows multiple registered visible workers for model-routed work', async () => {
@@ -298,7 +367,7 @@ describe('project-isolated task control', () => {
 
   it('keeps omitted codexHome calls inside the temporary CODEX_HOME sandbox', async () => {
     const root = 'C:/work/omitted-codex-home';
-    const registered = await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'economical-worker', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.' });
+    const registered = await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'economical-worker', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' });
     await controllerRecordTitleSynced({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', title: registered.desiredThreadTitle });
     const eventPath = await createCompletionEvent({ selfThreadId: 'omitted', candidateCommit: 'candidate-omitted-home' });
     await controllerIngestCompletion({ projectRoot: root, controllerThreadId: defaultController, eventPath });
