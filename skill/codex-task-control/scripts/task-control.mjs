@@ -79,6 +79,19 @@ async function readJson(filePath, code) {
   }
 }
 
+async function replaceFileWithRetry(tempPath, filePath) {
+  const transientCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    try {
+      await rename(tempPath, filePath);
+      return;
+    } catch (error) {
+      if (!transientCodes.has(error?.code) || attempt === 7) throw error;
+      await sleep(10 * (attempt + 1));
+    }
+  }
+}
+
 async function atomicWriteJson(filePath, value) {
   await mkdir(dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -90,7 +103,7 @@ async function atomicWriteJson(filePath, value) {
     } finally {
       await handle.close();
     }
-    await rename(tempPath, filePath);
+    await replaceFileWithRetry(tempPath, filePath);
   } catch (error) {
     await rm(tempPath, { force: true });
     fail('REGISTRY_WRITE_FAILED', `无法原子写入 ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
