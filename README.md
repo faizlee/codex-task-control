@@ -8,6 +8,10 @@ GPT-5.6 can delegate aggressively. That is useful, but a large fan-out can also 
 
 [简体中文](README.zh-CN.md)
 
+![Codex Task Control demo](media/codex-task-control-demo.gif)
+
+[MP4 version](media/codex-task-control-demo.mp4) · Generated from a real CLI flow in an isolated temporary ledger by [`demo/render_demo.py`](demo/render_demo.py).
+
 ## Why it exists
 
 Codex Task Control is for workflows where a controller delegates visible work and needs evidence for four questions:

@@ -8,6 +8,10 @@ GPT-5.6 很擅长主动委派任务，但大量 fan-out 也会让模型消耗、
 
 [English](README.md)
 
+![Codex Task Control 演示](media/codex-task-control-demo.gif)
+
+[MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
+
 ## v0.1 已经解决什么
 
 - 按项目根目录隔离任务注册表。
