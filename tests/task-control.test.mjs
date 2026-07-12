@@ -7,6 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  auditArchiveBacklog,
   auditModelRouting,
   TaskControlError,
   buildCompletionNotification,
@@ -14,6 +15,7 @@ import {
   controllerIngestNotificationFailed,
   controllerDispatchRework,
   controllerMarkAccepted,
+  controllerMarkBlocked,
   controllerMarkChangesRequested,
   controllerMarkIntegrated,
   controllerMarkNotificationSent,
@@ -284,6 +286,53 @@ describe('project-isolated task control', () => {
       { threadId: 'legacy-active', reason: 'legacy_missing_routing_evidence', currentModel: 'gpt-5.4-mini', expectedModel: null },
       { threadId: 'mismatched-active', reason: 'model_work_class_mismatch', currentModel: 'gpt-5.4-mini', expectedModel: 'gpt-5.6-luna' },
     ]);
+    assert.equal(after, before);
+  });
+
+  it('plans terminal archive cleanup by direct controller and descendants first without writes', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/archive-backlog';
+    await register(codexHome, root, 'parent-task');
+    await register(codexHome, root, 'child-task', { controllerThreadId: 'parent-task', parentThreadId: 'parent-task', title: 'nested terminal task' });
+    const parent = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'parent-task', reason: 'superseded parent' });
+    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'parent-task', title: parent.desiredThreadTitle });
+    const child = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: 'parent-task', threadId: 'child-task', reason: 'superseded child' });
+    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: 'parent-task', threadId: 'child-task', title: child.desiredThreadTitle });
+
+    const registryPath = join(codexHome, 'task-control', 'projects', projectKeyForRoot(root), 'task-registry.json');
+    const before = await readFile(registryPath, 'utf8');
+    const audit = await auditArchiveBacklog({ codexHome });
+    const after = await readFile(registryPath, 'utf8');
+    assert.equal(audit.backlogCount, 2);
+    assert.equal(audit.ownerCount, 2);
+    assert.equal(audit.readyActionCount, 1);
+    const parentPlan = audit.owners.find((owner) => owner.controllerThreadId === defaultController);
+    const childPlan = audit.owners.find((owner) => owner.controllerThreadId === 'parent-task');
+    assert.equal(parentPlan.tasks[0].blockedByDescendants, true);
+    assert.deepEqual(parentPlan.threadActions, []);
+    assert.equal(childPlan.tasks[0].blockedByDescendants, false);
+    assert.deepEqual(childPlan.threadActions, [{ type: 'set_thread_archived', threadId: 'child-task', archived: true }]);
+    assert.equal(after, before);
+  });
+
+  it('surfaces legacy terminal records as pending title-first cleanup without migrating the ledger', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/legacy-archive-backlog';
+    await register(codexHome, root, 'legacy-terminal');
+    await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'legacy-terminal', reason: 'legacy terminal task' });
+    const registryPath = join(codexHome, 'task-control', 'projects', projectKeyForRoot(root), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const task = registry.tasks[0];
+    for (const key of ['displayKey', 'desiredThreadTitle', 'titleSyncStatus', 'lastSyncedTitle', 'titleSyncError', 'archiveStatus', 'archivedAt', 'archiveError']) delete task[key];
+    await writeFile(registryPath, JSON.stringify(registry, null, 2), 'utf8');
+
+    const before = await readFile(registryPath, 'utf8');
+    const audit = await auditArchiveBacklog({ codexHome });
+    const after = await readFile(registryPath, 'utf8');
+    assert.equal(audit.backlogCount, 1);
+    assert.equal(audit.owners[0].tasks[0].legacyArchiveMetadata, true);
+    assert.equal(audit.owners[0].tasks[0].archiveStatus, 'pending');
+    assert.deepEqual(audit.owners[0].threadActions, [{ type: 'set_thread_title', threadId: 'legacy-terminal', title: '阻塞｜01 same task' }]);
     assert.equal(after, before);
   });
 
