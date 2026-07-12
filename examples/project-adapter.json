@@ -1,0 +1,10 @@
+{
+  "projectRoot": "C:\\work\\example",
+  "rulesSources": [
+    "AGENTS.md"
+  ],
+  "workflowSources": [
+    "docs/WORKFLOW.md"
+  ],
+  "modelRoutingSource": "config/codex-model-routing.json"
+}

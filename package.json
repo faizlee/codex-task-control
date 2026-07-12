@@ -1,0 +1,15 @@
+{
+  "name": "codex-task-control",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local, review-gated lifecycle ledger for Codex tasks and subagents.",
+  "type": "module",
+  "scripts": {
+    "check": "node --check skill/codex-task-control/scripts/task-control.mjs",
+    "test": "node --test tests/task-control.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
