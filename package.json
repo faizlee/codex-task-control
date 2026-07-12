@@ -1,12 +1,12 @@
 {
   "name": "codex-task-control",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "A quota-aware gate that forbids internal subagents and routes work to visible Codex tasks.",
+  "description": "A quota-aware controller that names, reviews, and archives visible Codex tasks while forbidding internal subagents.",
   "type": "module",
   "scripts": {
     "check": "node --check skill/codex-task-control/scripts/task-control.mjs",
-    "test": "node --test tests/task-control.test.mjs"
+    "test": "node --test tests/task-control.test.mjs skill/codex-task-control/scripts/task-control.unit.test.mjs"
   },
   "engines": {
     "node": ">=20"

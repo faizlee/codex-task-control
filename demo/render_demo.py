@@ -45,7 +45,7 @@ def run_real_scenario() -> dict[str, object]:
         controller = "controller-1"
         worker = "worker-1"
 
-        run_cli(
+        registered = json.loads(run_cli(
             home,
             "register",
             "--project-root",
@@ -70,16 +70,18 @@ def run_real_scenario() -> dict[str, object]:
             "economical",
             "--quota-reason",
             "Mechanical audit work is cheaper than using the frontier controller.",
-        )
+        ))
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", controller, "--thread", worker, "--title", registered["desiredThreadTitle"])
         executing = json.loads(run_cli(home, "query-self", "--self", worker))
-        event_path = run_cli(
+        completion = json.loads(run_cli(
             home,
             "complete",
             "--self",
             worker,
             "--candidate-commit",
             "candidate-auth-v1",
-        )
+        ))
+        event_path = completion["eventPath"]
         run_cli(
             home,
             "controller-ingest-completion",
@@ -91,7 +93,8 @@ def run_real_scenario() -> dict[str, object]:
             event_path,
         )
         awaiting_review = json.loads(run_cli(home, "query-self", "--self", worker))
-        run_cli(
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", controller, "--thread", worker, "--title", awaiting_review["desiredThreadTitle"])
+        accepted = json.loads(run_cli(
             home,
             "mark-accepted",
             "--project-root",
@@ -100,8 +103,9 @@ def run_real_scenario() -> dict[str, object]:
             controller,
             "--thread",
             worker,
-        )
-        run_cli(
+        ))
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", controller, "--thread", worker, "--title", accepted["desiredThreadTitle"])
+        integrated_result = json.loads(run_cli(
             home,
             "mark-integrated",
             "--project-root",
@@ -110,7 +114,9 @@ def run_real_scenario() -> dict[str, object]:
             controller,
             "--thread",
             worker,
-        )
+        ))
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", controller, "--thread", worker, "--title", integrated_result["desiredThreadTitle"])
+        run_cli(home, "controller-record-archive-succeeded", "--project-root", project, "--controller", controller, "--thread", worker)
         integrated = json.loads(run_cli(home, "query-self", "--self", worker))
 
         return {
@@ -351,8 +357,10 @@ def render_gif(mp4_path: Path, gif_path: Path) -> None:
 def main() -> None:
     scenario = run_real_scenario()
     assert scenario["executing"]["status"] == "executing"
+    assert scenario["executing"]["dispatchAllowed"] is True
     assert scenario["awaiting_review"]["status"] == "awaiting_review"
     assert scenario["integrated"]["status"] == "integrated"
+    assert scenario["integrated"]["archiveStatus"] == "archived"
 
     MEDIA.mkdir(parents=True, exist_ok=True)
     mp4_path = MEDIA / "codex-task-control-demo.mp4"

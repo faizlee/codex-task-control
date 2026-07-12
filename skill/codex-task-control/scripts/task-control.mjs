@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { dirname, join, win32 } from 'node:path';
+import { basename, dirname, join, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { access, mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { access, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 
 export const TASK_STATUSES = Object.freeze(['executing', 'awaiting_review', 'changes_requested', 'accepted', 'integrated', 'blocked']);
 export const REVIEW_VERDICTS = Object.freeze(['pending', 'changes_requested', 'accepted']);
@@ -12,6 +12,8 @@ export const THINKING_LEVELS = Object.freeze(['low', 'medium', 'high']);
 export const DELEGATION_MODES = Object.freeze(['explicit']);
 export const MODEL_CLASSES = Object.freeze(['economical']);
 export const EXECUTION_SURFACES = Object.freeze(['visible_task']);
+export const TITLE_SYNC_STATUSES = Object.freeze(['pending', 'synced', 'failed']);
+export const ARCHIVE_STATUSES = Object.freeze(['not_ready', 'pending', 'archived', 'failed']);
 
 export class TaskControlError extends Error {
   constructor(code, message) {
@@ -283,6 +285,125 @@ function lifecycleConsistent(task) {
   return (task.reviewVerdict === 'pending' || task.reviewVerdict === 'changes_requested') && task.integrationStatus === 'not_integrated';
 }
 
+const TERMINAL_STATUSES = new Set(['integrated', 'blocked']);
+const TITLE_STATUS_LABELS = Object.freeze({
+  executing: '执行',
+  awaiting_review: '待审',
+  changes_requested: '返工',
+  accepted: '接收',
+  integrated: '完成',
+  blocked: '阻塞',
+});
+
+const hasThreadControl = (task) => 'displayKey' in task;
+const isTerminalTask = (task) => TERMINAL_STATUSES.has(task.status);
+const dispatchAllowed = (task) => !hasThreadControl(task) || task.titleSyncStatus === 'synced';
+
+function compactBaseTitle(value) {
+  const normalized = value.trim().replace(/\s+/g, ' ');
+  return normalized.length <= 48 ? normalized : `${normalized.slice(0, 47)}…`;
+}
+
+export function desiredThreadTitle(task) {
+  if (!nonEmpty(task.displayKey)) fail('REGISTRY_INVALID', 'displayKey 缺失，无法生成 thread title');
+  return `${TITLE_STATUS_LABELS[task.status]}｜${task.displayKey} ${compactBaseTitle(task.title)}`;
+}
+
+function nextNumericSegment(used, width = 0) {
+  let value = 1;
+  while (used.has(String(value).padStart(width, '0'))) value += 1;
+  return String(value).padStart(width, '0');
+}
+
+function ensureDisplayKeys(tasks, rootControllers) {
+  const rootSet = new Set(rootControllers);
+  const next = tasks.map((task) => ({ ...task }));
+  const byId = new Map(next.map((task) => [task.threadId, task]));
+  const used = new Set(next.filter((task) => nonEmpty(task.displayKey)).map((task) => task.displayKey));
+  let remaining = next.filter((task) => !nonEmpty(task.displayKey));
+  while (remaining.length > 0) {
+    let progressed = false;
+    for (const task of remaining) {
+      if (rootSet.has(task.parentThreadId)) {
+        const rootSegments = new Set([...used].filter((key) => /^\d{2}$/.test(key)));
+        task.displayKey = nextNumericSegment(rootSegments, 2);
+      } else {
+        const parent = byId.get(task.parentThreadId);
+        if (!parent || !nonEmpty(parent.displayKey)) continue;
+        const prefix = `${parent.displayKey}.`;
+        const childSegments = new Set([...used].filter((key) => key.startsWith(prefix) && /^\d+$/.test(key.slice(prefix.length))).map((key) => key.slice(prefix.length)));
+        task.displayKey = `${prefix}${nextNumericSegment(childSegments)}`;
+      }
+      if (used.has(task.displayKey)) fail('REGISTRY_INVALID', `重复 displayKey: ${task.displayKey}`);
+      used.add(task.displayKey);
+      progressed = true;
+    }
+    if (!progressed) fail('REGISTRY_INVALID', '无法为任务分配层级 displayKey');
+    remaining = next.filter((task) => !nonEmpty(task.displayKey));
+  }
+  return next;
+}
+
+function ensureThreadControl(tasks, rootControllers) {
+  return ensureDisplayKeys(tasks, rootControllers).map((task) => {
+    if (hasThreadControl(task) && 'titleSyncStatus' in task) return task;
+    const controlled = { ...task };
+    controlled.desiredThreadTitle = desiredThreadTitle(controlled);
+    controlled.titleSyncStatus = 'pending';
+    controlled.lastSyncedTitle = null;
+    controlled.titleSyncError = null;
+    controlled.archiveStatus = isTerminalTask(controlled) ? 'pending' : 'not_ready';
+    controlled.archivedAt = null;
+    controlled.archiveError = null;
+    return controlled;
+  });
+}
+
+function refreshThreadControl(task, previousTask) {
+  const next = { ...task };
+  const desired = desiredThreadTitle(next);
+  if (desired !== previousTask.desiredThreadTitle) {
+    next.desiredThreadTitle = desired;
+    next.titleSyncStatus = 'pending';
+    next.titleSyncError = null;
+  }
+  if (isTerminalTask(next)) {
+    if (next.archiveStatus === 'not_ready') next.archiveStatus = 'pending';
+  } else {
+    next.archiveStatus = 'not_ready';
+    next.archivedAt = null;
+    next.archiveError = null;
+  }
+  return next;
+}
+
+function descendantsOf(tasks, threadId) {
+  const descendants = [];
+  const queue = [threadId];
+  while (queue.length > 0) {
+    const parent = queue.shift();
+    for (const task of tasks.filter((candidate) => candidate.parentThreadId === parent)) {
+      descendants.push(task);
+      queue.push(task.threadId);
+    }
+  }
+  return descendants;
+}
+
+function threadActionsForTask(task, tasks) {
+  const actions = [];
+  if (task.titleSyncStatus !== 'synced') actions.push({ type: 'set_thread_title', threadId: task.threadId, title: task.desiredThreadTitle });
+  const descendantsArchived = descendantsOf(tasks, task.threadId).every((descendant) => descendant.archiveStatus === 'archived');
+  if (isTerminalTask(task) && task.titleSyncStatus === 'synced' && task.archiveStatus !== 'archived' && descendantsArchived) {
+    actions.push({ type: 'set_thread_archived', threadId: task.threadId, archived: true });
+  }
+  return actions;
+}
+
+function controllerMutationResult(task, tasks) {
+  return { ...task, dispatchAllowed: dispatchAllowed(task), requiredThreadActions: threadActionsForTask(task, tasks) };
+}
+
 function validateTask(value) {
   if (!isObject(value)) fail('REGISTRY_INVALID', '任务记录必须是对象');
   const required = ['threadId', 'parentThreadId', 'directControllerThreadId', 'title', 'model', 'thinking', 'status', 'candidateCommit', 'reviewVerdict', 'integrationStatus', 'notificationStatus', 'updatedAt'];
@@ -298,6 +419,7 @@ function validateTask(value) {
   if (!has(value.integrationStatus, INTEGRATION_STATUSES)) fail('REGISTRY_INVALID', `integrationStatus 无效: ${value.integrationStatus}`);
   if (!has(value.notificationStatus, NOTIFICATION_STATUSES)) fail('REGISTRY_INVALID', `notificationStatus 无效: ${value.notificationStatus}`);
   if (value.candidateCommit !== null && !nonEmpty(value.candidateCommit)) fail('REGISTRY_INVALID', 'candidateCommit 无效');
+  if (value.completionEventCreatedAt !== undefined && !isTimestamp(value.completionEventCreatedAt)) fail('REGISTRY_INVALID', 'completionEventCreatedAt 无效');
   const delegationFields = ['delegationMode', 'executionSurface', 'modelClass', 'quotaReason'];
   const presentDelegationFields = delegationFields.filter((key) => key in value);
   if (presentDelegationFields.length !== 0 && presentDelegationFields.length !== delegationFields.length) fail('REGISTRY_INVALID', '委派字段必须同时存在');
@@ -306,6 +428,25 @@ function validateTask(value) {
     if (!has(value.executionSurface, EXECUTION_SURFACES)) fail('REGISTRY_INVALID', `executionSurface 无效: ${value.executionSurface}`);
     if (!has(value.modelClass, MODEL_CLASSES)) fail('REGISTRY_INVALID', `modelClass 无效: ${value.modelClass}`);
     if (!nonEmpty(value.quotaReason)) fail('REGISTRY_INVALID', 'quotaReason 无效');
+  }
+  const threadControlFields = ['displayKey', 'desiredThreadTitle', 'titleSyncStatus', 'lastSyncedTitle', 'titleSyncError', 'archiveStatus', 'archivedAt', 'archiveError'];
+  const presentThreadControlFields = threadControlFields.filter((key) => key in value);
+  if (presentThreadControlFields.length !== 0 && presentThreadControlFields.length !== threadControlFields.length) fail('REGISTRY_INVALID', 'thread control 字段必须同时存在');
+  if (presentThreadControlFields.length === threadControlFields.length) {
+    if (!/^\d{2}(?:\.\d+)*$/.test(value.displayKey)) fail('REGISTRY_INVALID', `displayKey 无效: ${value.displayKey}`);
+    if (!nonEmpty(value.desiredThreadTitle) || value.desiredThreadTitle !== desiredThreadTitle(value)) fail('REGISTRY_INVALID', 'desiredThreadTitle 与 lifecycle 不一致');
+    if (!has(value.titleSyncStatus, TITLE_SYNC_STATUSES)) fail('REGISTRY_INVALID', `titleSyncStatus 无效: ${value.titleSyncStatus}`);
+    if (value.lastSyncedTitle !== null && !nonEmpty(value.lastSyncedTitle)) fail('REGISTRY_INVALID', 'lastSyncedTitle 无效');
+    if (value.titleSyncError !== null && !nonEmpty(value.titleSyncError)) fail('REGISTRY_INVALID', 'titleSyncError 无效');
+    if (value.titleSyncStatus === 'synced' && (value.lastSyncedTitle !== value.desiredThreadTitle || value.titleSyncError !== null)) fail('REGISTRY_INVALID', '已同步 title 必须匹配 desiredThreadTitle');
+    if (value.titleSyncStatus === 'failed' && !nonEmpty(value.titleSyncError)) fail('REGISTRY_INVALID', 'title sync failed 必须记录原因');
+    if (!has(value.archiveStatus, ARCHIVE_STATUSES)) fail('REGISTRY_INVALID', `archiveStatus 无效: ${value.archiveStatus}`);
+    if (!isTerminalTask(value) && value.archiveStatus !== 'not_ready') fail('REGISTRY_INVALID', '非终态任务不能归档');
+    if (isTerminalTask(value) && value.archiveStatus === 'not_ready') fail('REGISTRY_INVALID', '终态任务必须进入归档流程');
+    if (value.archiveStatus === 'archived' && !isTimestamp(value.archivedAt)) fail('REGISTRY_INVALID', 'archivedAt 无效');
+    if (value.archiveStatus !== 'archived' && value.archivedAt !== null) fail('REGISTRY_INVALID', '未归档任务不能有 archivedAt');
+    if (value.archiveStatus === 'failed' && !nonEmpty(value.archiveError)) fail('REGISTRY_INVALID', 'archive failed 必须记录原因');
+    if (value.archiveStatus !== 'failed' && value.archiveError !== null) fail('REGISTRY_INVALID', '非失败归档不能有 archiveError');
   }
   if (!isTimestamp(value.updatedAt) || !lifecycleConsistent(value)) fail('REGISTRY_INVALID', '任务生命周期或 updatedAt 无效');
   return { ...value };
@@ -331,6 +472,7 @@ export function validateRegistry(value, expectedProjectKey, expectedProjectRoot)
     if (ids.has(task.threadId)) fail('REGISTRY_INVALID', `重复 threadId: ${task.threadId}`);
     ids.add(task.threadId);
   }
+  const controlledKeys = new Set();
   for (const task of tasks) {
     if (task.parentThreadId !== task.directControllerThreadId) fail('REGISTRY_INVALID', 'task 的 parent/controller 不一致');
     if (!rootSet.has(task.parentThreadId) && !ids.has(task.parentThreadId)) fail('REGISTRY_INVALID', `父任务未登记: ${task.parentThreadId}`);
@@ -342,6 +484,13 @@ export function validateRegistry(value, expectedProjectKey, expectedProjectRoot)
       const parent = tasks.find((candidate) => candidate.threadId === cursor);
       if (!parent) fail('REGISTRY_INVALID', `父任务未登记: ${cursor}`);
       cursor = parent.parentThreadId;
+    }
+    if (hasThreadControl(task)) {
+      if (controlledKeys.has(task.displayKey)) fail('REGISTRY_INVALID', `重复 displayKey: ${task.displayKey}`);
+      controlledKeys.add(task.displayKey);
+      if (rootSet.has(task.parentThreadId) && !/^\d{2}$/.test(task.displayKey)) fail('REGISTRY_INVALID', `root child displayKey 无效: ${task.displayKey}`);
+      const parent = tasks.find((candidate) => candidate.threadId === task.parentThreadId);
+      if (parent && hasThreadControl(parent) && !task.displayKey.startsWith(`${parent.displayKey}.`)) fail('REGISTRY_INVALID', `nested displayKey 未继承 parent: ${task.displayKey}`);
     }
   }
   return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], updatedAt: value.updatedAt, tasks };
@@ -438,12 +587,14 @@ async function mutateController({ codexHome, taskControlHome, projectRoot, contr
   const { paths } = await ensureProject(resolvedHome, projectRoot);
   return withExclusiveLock(paths.registryPath, async () => {
     const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
-    const current = taskOrThrow(registry, threadId);
+    const controlledRegistry = { ...registry, tasks: ensureThreadControl(registry.tasks, registry.rootControllerThreadIds) };
+    const current = taskOrThrow(controlledRegistry, threadId);
     assertTaskController(current, controllerThreadId);
-    const nextTask = mutate(current);
-    const next = validateRegistry({ ...registry, updatedAt: new Date().toISOString(), tasks: registry.tasks.map((task) => task.threadId === threadId ? nextTask : task) }, paths.projectKey, paths.projectRoot);
+    const mutatedTask = mutate(current, controlledRegistry);
+    const nextTask = refreshThreadControl(mutatedTask, current);
+    const next = validateRegistry({ ...controlledRegistry, updatedAt: new Date().toISOString(), tasks: controlledRegistry.tasks.map((task) => task.threadId === threadId ? nextTask : task) }, paths.projectKey, paths.projectRoot);
     await atomicWriteJson(paths.registryPath, next);
-    return nextTask;
+    return controllerMutationResult(nextTask, next.tasks);
   });
 }
 
@@ -454,6 +605,7 @@ export async function controllerRegisterTask(input) {
   assertSafeThreadId(input.threadId);
   assertSafeThreadId(input.parentThreadId, 'parentThreadId');
   if (![input.title, input.model, input.thinking].every(nonEmpty)) fail('CLI_INVALID_ARGUMENTS', 'register 字段不能为空');
+  if (input.title.trim() === '等待主控登记') fail('TASK_TITLE_PLACEHOLDER_FORBIDDEN', '必须在登记时提供可区分的语义标题');
   if (!has(input.thinking, THINKING_LEVELS)) fail('CLI_INVALID_ARGUMENTS', `thinking 非法: ${input.thinking}`);
   if (input.delegationMode !== 'explicit') fail('DELEGATION_NOT_AUTHORIZED', '默认禁止子智能体；必须由主控显式授权 --delegation explicit');
   if (input.executionSurface !== 'visible_task') fail('INTERNAL_SUBAGENT_FORBIDDEN', '禁止 Codex 内部 subagent；子任务必须使用可见 task/thread');
@@ -465,17 +617,20 @@ export async function controllerRegisterTask(input) {
     if (registry.tasks.some((task) => task.threadId === input.threadId)) fail('DUPLICATE_THREAD', `重复 threadId: ${input.threadId}`);
     if (input.threadId === input.controllerThreadId) fail('DUPLICATE_THREAD', '任务不能等于 direct controller');
     let rootControllers = [...registry.rootControllerThreadIds];
-    const parent = registry.tasks.find((task) => task.threadId === input.parentThreadId);
+    const controlledTasks = ensureThreadControl(registry.tasks, rootControllers);
+    const parent = controlledTasks.find((task) => task.threadId === input.parentThreadId);
     if (parent) {
       if (parent.threadId !== input.controllerThreadId) fail('CONTROLLER_UNAUTHORIZED', 'nested visible task 的 controller 必须等于已登记 parent task.threadId');
     } else {
       if (input.parentThreadId !== input.controllerThreadId) fail('PARENT_NOT_REGISTERED', `父任务未登记: ${input.parentThreadId}`);
       if (!rootControllers.includes(input.controllerThreadId)) rootControllers.push(input.controllerThreadId);
     }
-    const task = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title, model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), status: 'executing', candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
-    const next = validateRegistry({ ...registry, rootControllerThreadIds: rootControllers, updatedAt: new Date().toISOString(), tasks: [...registry.tasks, task] }, paths.projectKey, paths.projectRoot);
+    const draft = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), status: 'executing', candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
+    const tasks = ensureThreadControl([...controlledTasks, draft], rootControllers);
+    const task = tasks.find((candidate) => candidate.threadId === input.threadId);
+    const next = validateRegistry({ ...registry, rootControllerThreadIds: rootControllers, updatedAt: new Date().toISOString(), tasks }, paths.projectKey, paths.projectRoot);
     await atomicWriteJson(paths.registryPath, next);
-    return task;
+    return controllerMutationResult(task, next.tasks);
   });
 }
 
@@ -496,7 +651,7 @@ export async function controllerIngestCompletion(input) {
     if (Date.parse(event.createdAt) <= Date.parse(task.updatedAt)) fail('EVENT_STALE', 'completion event 过期或重复');
     if (task.status !== 'executing' && task.status !== 'changes_requested') fail('EVENT_STALE', `不能从 ${task.status} 入账 completion event`);
     if (task.status === 'changes_requested' && task.candidateCommit === event.candidateCommit) fail('EVENT_STALE', '返工必须产生新 candidateCommit');
-    return { ...task, status: 'awaiting_review', candidateCommit: event.candidateCommit, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
+    return { ...task, status: 'awaiting_review', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
   }});
 }
 
@@ -514,16 +669,83 @@ export async function controllerIngestNotificationFailed(input) {
   if (receipt.projectKey !== paths.projectKey || !nonEmpty(receipt.reason)) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed 项目或 reason 无效');
   return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: receipt.threadId, mutate: (task) => {
     if (receipt.parentThreadId !== task.parentThreadId || receipt.controllerThreadId !== task.directControllerThreadId) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed parent/controller 不匹配');
-    if (Date.parse(receipt.createdAt) <= Date.parse(task.updatedAt)) fail('NOTIFICATION_RECEIPT_STALE', 'notification_failed 回执过期或重复');
+    const freshnessAnchor = task.completionEventCreatedAt ?? task.updatedAt;
+    if (Date.parse(receipt.createdAt) <= Date.parse(freshnessAnchor)) fail('NOTIFICATION_RECEIPT_STALE', 'notification_failed 回执早于当前 completion 或已过期');
     if (task.notificationStatus !== 'pending') fail('NOTIFICATION_ALREADY_RECORDED', `notificationStatus 已是 ${task.notificationStatus}`);
     return { ...task, notificationStatus: 'failed', updatedAt: new Date().toISOString() };
   }});
+}
+
+async function listTaskEventFiles(paths, task) {
+  const taskEventDir = join(paths.eventsDir, task.threadId);
+  let entries;
+  try {
+    entries = await readdir(taskEventDir, { withFileTypes: true });
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') return [];
+    fail('EVENT_SCAN_FAILED', `无法扫描 ${taskEventDir}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return entries
+    .filter((entry) => entry.isFile() && (entry.name.startsWith('completion-') || entry.name.startsWith('notification-failed-')) && entry.name.endsWith('.json'))
+    .map((entry) => join(taskEventDir, entry.name));
+}
+
+export async function controllerScanPendingEvents(input) {
+  const home = resolveTaskControlHome(input);
+  const paths = pathsFor(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  const rawRegistry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+  const registry = { ...rawRegistry, tasks: ensureThreadControl(rawRegistry.tasks, rawRegistry.rootControllerThreadIds) };
+  const controllerKnown = registry.rootControllerThreadIds.includes(input.controllerThreadId) || registry.tasks.some((task) => task.threadId === input.controllerThreadId);
+  if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
+
+  const directTasks = registry.tasks.filter((task) => task.directControllerThreadId === input.controllerThreadId);
+  const pendingEvents = [];
+  for (const task of directTasks) {
+    for (const eventPath of await listTaskEventFiles(paths, task)) {
+      const isCompletion = eventPath.includes(`${win32.sep}completion-`);
+      const type = isCompletion ? 'task_completed' : 'notification_failed';
+      const artifact = await readArtifact(eventPath, type);
+      if (artifact.projectKey !== paths.projectKey || artifact.threadId !== task.threadId || artifact.parentThreadId !== task.parentThreadId || artifact.controllerThreadId !== task.directControllerThreadId) {
+        fail('EVENT_INVALID', `事件身份与台账不一致: ${eventPath}`);
+      }
+      const freshnessAnchor = type === 'notification_failed' ? (task.completionEventCreatedAt ?? task.updatedAt) : task.updatedAt;
+      if (Date.parse(artifact.createdAt) <= Date.parse(freshnessAnchor)) continue;
+      if (type === 'task_completed' && task.status !== 'executing' && task.status !== 'changes_requested') continue;
+      if (type === 'notification_failed' && task.notificationStatus !== 'pending') continue;
+      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : { reason: artifact.reason }) });
+    }
+  }
+  pendingEvents.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.eventPath.localeCompare(right.eventPath));
+  const activeTasks = directTasks.filter((task) => !isTerminalTask(task)).map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, notificationStatus: task.notificationStatus }));
+  const reviewQueue = directTasks.filter((task) => task.status === 'awaiting_review' || task.status === 'accepted').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, candidateCommit: task.candidateCommit, notificationStatus: task.notificationStatus }));
+  const pendingCleanupTasks = directTasks.filter((task) => isTerminalTask(task) && task.archiveStatus !== 'archived').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, archiveStatus: task.archiveStatus }));
+  const threadActions = directTasks.flatMap((task) => threadActionsForTask(task, registry.tasks));
+  return {
+    projectKey: registry.projectKey,
+    controllerThreadId: input.controllerThreadId,
+    pendingEvents,
+    reviewQueue,
+    activeTasks,
+    pendingCleanupTasks,
+    threadActions,
+    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || threadActions.length > 0,
+    shouldKeepHeartbeat: activeTasks.length > 0 || pendingCleanupTasks.length > 0,
+  };
 }
 
 export async function controllerMarkChangesRequested(input) {
   return mutateController({ ...input, mutate: (task) => {
     if (task.status !== 'executing' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 changes_requested`);
     return { ...task, status: 'changes_requested', reviewVerdict: 'changes_requested', updatedAt: new Date().toISOString() };
+  }});
+}
+
+export async function controllerMarkBlocked(input) {
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'blocked reason 不能为空');
+  return mutateController({ ...input, mutate: (task) => {
+    if (task.status !== 'executing' && task.status !== 'changes_requested' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 blocked`);
+    return { ...task, status: 'blocked', blockedReason: input.reason.trim(), updatedAt: new Date().toISOString() };
   }});
 }
 
@@ -538,6 +760,39 @@ export async function controllerMarkIntegrated(input) {
   return mutateController({ ...input, mutate: (task) => {
     if (task.status !== 'accepted') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 integrated`);
     return { ...task, status: 'integrated', reviewVerdict: 'accepted', integrationStatus: 'integrated', updatedAt: new Date().toISOString() };
+  }});
+}
+
+export async function controllerRecordTitleSynced(input) {
+  if (!nonEmpty(input.title)) fail('CLI_INVALID_ARGUMENTS', 'synced title 不能为空');
+  return mutateController({ ...input, mutate: (task) => {
+    if (input.title !== task.desiredThreadTitle) fail('THREAD_TITLE_STALE', '确认的 title 与当前 lifecycle title 不一致');
+    return { ...task, titleSyncStatus: 'synced', lastSyncedTitle: input.title, titleSyncError: null, updatedAt: new Date().toISOString() };
+  }});
+}
+
+export async function controllerRecordTitleFailed(input) {
+  if (!nonEmpty(input.title) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'title 与失败原因不能为空');
+  return mutateController({ ...input, mutate: (task) => {
+    if (input.title !== task.desiredThreadTitle) fail('THREAD_TITLE_STALE', '失败的 title 已不是当前 lifecycle title');
+    return { ...task, titleSyncStatus: 'failed', titleSyncError: input.reason.trim(), updatedAt: new Date().toISOString() };
+  }});
+}
+
+export async function controllerRecordArchiveSucceeded(input) {
+  return mutateController({ ...input, mutate: (task, registry) => {
+    if (!isTerminalTask(task)) fail('TASK_TRANSITION_INVALID', '只有 integrated 或 blocked 任务可以归档');
+    if (task.titleSyncStatus !== 'synced') fail('THREAD_ARCHIVE_NOT_READY', '终态 title 尚未同步');
+    if (!descendantsOf(registry.tasks, task.threadId).every((descendant) => descendant.archiveStatus === 'archived')) fail('THREAD_ARCHIVE_NOT_READY', '必须先归档所有可见后代任务');
+    return { ...task, archiveStatus: 'archived', archivedAt: new Date().toISOString(), archiveError: null, updatedAt: new Date().toISOString() };
+  }});
+}
+
+export async function controllerRecordArchiveFailed(input) {
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'archive 失败原因不能为空');
+  return mutateController({ ...input, mutate: (task) => {
+    if (!isTerminalTask(task)) fail('TASK_TRANSITION_INVALID', '只有 integrated 或 blocked 任务可以记录 archive 失败');
+    return { ...task, archiveStatus: 'failed', archivedAt: null, archiveError: input.reason.trim(), updatedAt: new Date().toISOString() };
   }});
 }
 
@@ -566,14 +821,16 @@ export async function queryParent(input) {
 }
 
 export function buildCompletionNotification(task) {
-  return `Task completed and awaiting controller review. Task ID: ${task.threadId}`;
+  const identity = nonEmpty(task.displayKey) ? `${task.displayKey} ${task.title}` : task.threadId;
+  return `任务已完成，等待主控审查。任务：${identity}`;
 }
 
 export async function createCompletionEvent(input) {
   const result = await querySelf(input);
+  if (!dispatchAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', 'thread title 尚未同步，任务不得开始或提交 completion');
   if (input.status !== undefined && input.status !== 'awaiting_review') fail('CHILD_STATUS_FORBIDDEN', '子任务只能提交 awaiting_review');
   if (!nonEmpty(input.candidateCommit)) fail('CLI_INVALID_ARGUMENTS', 'candidateCommit 不能为空');
-  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, title: result.task.title, status: 'awaiting_review', candidateCommit: input.candidateCommit, createdAt: new Date().toISOString() });
+  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, status: 'awaiting_review', candidateCommit: input.candidateCommit, createdAt: new Date().toISOString() });
 }
 
 export async function createNotificationFailureReceipt(input) {
@@ -628,22 +885,36 @@ export async function runCli(args = process.argv.slice(2)) {
   const storage = storageOptions(args);
   let result;
   if (command === 'query-parent') result = await queryParent({ ...storage, selfThreadId: required(args, '--self') });
-  else if (command === 'query-self') result = (await querySelf({ ...storage, selfThreadId: required(args, '--self') })).task;
-  else if (command === 'complete') result = await createCompletionEvent({ ...storage, selfThreadId: required(args, '--self'), candidateCommit: required(args, '--candidate-commit'), status: option(args, '--status') });
+  else if (command === 'query-self') {
+    const task = (await querySelf({ ...storage, selfThreadId: required(args, '--self') })).task;
+    result = { ...task, dispatchAllowed: dispatchAllowed(task) };
+  }
+  else if (command === 'complete') {
+    const selfThreadId = required(args, '--self');
+    const eventPath = await createCompletionEvent({ ...storage, selfThreadId, candidateCommit: required(args, '--candidate-commit'), status: option(args, '--status') });
+    const task = (await querySelf({ ...storage, selfThreadId })).task;
+    result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildCompletionNotification(task), notificationRequired: true, notificationFailureRequiredOnSendError: true };
+  }
   else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason') });
   else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason') });
   else if (command === 'controller-ingest-completion') result = await controllerIngestCompletion({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-notification-failed') result = await controllerIngestNotificationFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
+  else if (command === 'controller-scan-events') result = await controllerScanPendingEvents({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-mark-notification-sent') result = await controllerMarkNotificationSent({ ...controllerInput(args) });
   else if (command === 'mark-changes-requested') result = await controllerMarkChangesRequested({ ...controllerInput(args) });
+  else if (command === 'mark-blocked') result = await controllerMarkBlocked({ ...controllerInput(args), reason: required(args, '--reason') });
   else if (command === 'mark-accepted') result = await controllerMarkAccepted({ ...controllerInput(args) });
   else if (command === 'mark-integrated') result = await controllerMarkIntegrated({ ...controllerInput(args) });
+  else if (command === 'controller-record-title-synced') result = await controllerRecordTitleSynced({ ...controllerInput(args), title: required(args, '--title') });
+  else if (command === 'controller-record-title-failed') result = await controllerRecordTitleFailed({ ...controllerInput(args), title: required(args, '--title'), reason: required(args, '--reason') });
+  else if (command === 'controller-record-archive-succeeded') result = await controllerRecordArchiveSucceeded({ ...controllerInput(args) });
+  else if (command === 'controller-record-archive-failed') result = await controllerRecordArchiveFailed({ ...controllerInput(args), reason: required(args, '--reason') });
   else if (command === 'adapter') result = await loadProjectAdapter(required(args, '--file'));
   else fail('CLI_INVALID_ARGUMENTS', `未知命令: ${command || '(empty)'}`);
   process.stdout.write(`${typeof result === 'string' ? result : JSON.stringify(result)}\n`);
 }
 
-const invokedFile = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+const invokedFile = process.argv[1] && basename(fileURLToPath(import.meta.url)).toLowerCase() === basename(process.argv[1]).toLowerCase();
 if (invokedFile) runCli().catch((error) => {
   const prefix = error instanceof TaskControlError ? `[${error.code}] ` : '';
   process.stderr.write(`${prefix}${error instanceof Error ? error.message : String(error)}\n`);

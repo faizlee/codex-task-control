@@ -15,6 +15,7 @@ import {
   controllerMarkChangesRequested,
   controllerMarkIntegrated,
   controllerMarkNotificationSent,
+  controllerRecordTitleSynced,
   controllerRegisterTask,
   createCompletionEvent,
   createNotificationFailureReceipt,
@@ -83,7 +84,7 @@ async function freshCodexHome() {
 }
 
 async function register(codexHome, projectRoot, threadId, overrides = {}) {
-  return controllerRegisterTask({
+  const task = await controllerRegisterTask({
     codexHome,
     projectRoot,
     controllerThreadId: overrides.controllerThreadId ?? defaultController,
@@ -96,6 +97,14 @@ async function register(codexHome, projectRoot, threadId, overrides = {}) {
     executionSurface: overrides.executionSurface ?? 'visible_task',
     modelClass: overrides.modelClass ?? 'economical',
     quotaReason: overrides.quotaReason ?? 'Use a cheaper worker for repetitive mechanical execution.',
+  });
+  if (overrides.syncTitle === false) return task;
+  return controllerRecordTitleSynced({
+    codexHome,
+    projectRoot,
+    controllerThreadId: overrides.controllerThreadId ?? defaultController,
+    threadId,
+    title: task.desiredThreadTitle,
   });
 }
 
@@ -184,12 +193,13 @@ describe('project-isolated task control', () => {
     const root = 'C:/work/lifecycle';
     await register(codexHome, root, 'child');
     const firstEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-1' });
-    assert.equal(buildCompletionNotification({ threadId: 'child' }), 'Task completed and awaiting controller review. Task ID: child');
+    assert.equal(buildCompletionNotification({ threadId: 'child' }), '任务已完成，等待主控审查。任务：child');
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: firstEvent });
     const receipt = await createNotificationFailureReceipt({ codexHome, selfThreadId: 'child', reason: 'send_message_to_thread unavailable' });
     await controllerIngestNotificationFailed({ codexHome, projectRoot: root, controllerThreadId: defaultController, receiptPath: receipt });
 
-    await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
+    const rework = await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
+    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', title: rework.desiredThreadTitle });
     const secondEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-2' });
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: secondEvent });
     await controllerMarkNotificationSent({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
@@ -288,7 +298,8 @@ describe('project-isolated task control', () => {
 
   it('keeps omitted codexHome calls inside the temporary CODEX_HOME sandbox', async () => {
     const root = 'C:/work/omitted-codex-home';
-    await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'economical-worker', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.' });
+    const registered = await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'economical-worker', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.' });
+    await controllerRecordTitleSynced({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', title: registered.desiredThreadTitle });
     const eventPath = await createCompletionEvent({ selfThreadId: 'omitted', candidateCommit: 'candidate-omitted-home' });
     await controllerIngestCompletion({ projectRoot: root, controllerThreadId: defaultController, eventPath });
     assert.equal(eventPath.startsWith(join(sandboxCodexHome, 'task-control')), true);

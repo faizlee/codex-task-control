@@ -16,7 +16,7 @@ The project key is derived from a normalized, case-folded Windows path and a has
 
 ## Registry contract
 
-Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControllerThreadIds`, `updatedAt`, and `tasks`. New task records add `delegationMode`, `executionSurface`, `modelClass`, and `quotaReason` to the existing identity, model, thinking, lifecycle, and notification fields. Legacy records without all four delegation fields remain readable; partial delegation metadata fails closed. A task's `directControllerThreadId` equals its `parentThreadId`; both root children and nested visible tasks remain supported.
+Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControllerThreadIds`, `updatedAt`, and `tasks`. New task records include delegation evidence plus `displayKey`, `desiredThreadTitle`, `titleSyncStatus`, `lastSyncedTitle`, `titleSyncError`, `archiveStatus`, `archivedAt`, and `archiveError`. Completion ingestion records `completionEventCreatedAt` as the notification-failure freshness anchor. Legacy records remain readable; controller writes migrate them deterministically, while partial field groups fail closed. A task's `directControllerThreadId` equals its `parentThreadId`.
 
 Allowed values:
 
@@ -25,17 +25,13 @@ Allowed values:
 - `integrationStatus`: `not_integrated`, `integrated`.
 - `notificationStatus`: `pending`, `sent`, `failed`.
 - `thinking`: `low`, `medium`, `high`.
+- `titleSyncStatus`: `pending`, `synced`, `failed`.
+- `archiveStatus`: `not_ready`, `pending`, `archived`, `failed`.
 - New delegated workers require `delegationMode: explicit`, `executionSurface: visible_task`, `modelClass: economical`, and `thinking: low`.
 
 ## Delegation gate
 
-Internal Codex subagents are forbidden. Delegated work must be a user-visible Codex task/thread. A controller registration is the explicit authorization boundary and must include a non-trivial quota reason. Registration rejects:
-
-- missing explicit authorization;
-- any execution surface other than `visible_task`;
-- any model class other than `economical`;
-- any thinking value other than `low`;
-- a quota reason shorter than 12 characters;
+Internal Codex subagents are forbidden. Delegated work must be a user-visible Codex task/thread. Registration rejects missing explicit authorization, any execution surface other than `visible_task`, any model class other than `economical`, any thinking value other than `low`, a quota reason shorter than 12 characters, and the placeholder title `等待主控登记`.
 
 The ledger cannot intercept a host application's raw subagent tool. Skill and `AGENTS.md` policy therefore prohibit those tools outright. A visible task shell may be created to obtain its thread ID, but registration must succeed before any work prompt is sent to it.
 
@@ -45,6 +41,7 @@ Lifecycle invariants are checked before every controller write:
 executing -> awaiting_review -> accepted -> integrated
      └──-> changes_requested -> awaiting_review
 awaiting_review -> changes_requested
+executing | awaiting_review | changes_requested -> blocked
 ```
 
 Only the task's `directControllerThreadId` may perform register/ingest for that task, notification-status updates, `changes_requested`, `accepted`, and `integrated`. Root controllers are kept in `rootControllerThreadIds`; multiple roots may coexist in one project and cannot cross-review each other's children. A child cannot write the central registry and cannot claim `accepted` or `integrated`.
@@ -56,6 +53,37 @@ Self lookup scans the project index. Exactly one matching task is required; zero
 Completion artifacts are independently created JSON files with `schemaVersion: 1`, `type: "task_completed"`, the task's `projectKey`, `threadId`, direct `parentThreadId`, `controllerThreadId`, `status: "awaiting_review"`, non-empty `candidateCommit`, and an ISO `createdAt`. Notification failure receipts have `type: "notification_failed"`, the same identity fields, a non-empty `reason`, and `createdAt`.
 
 The controller verifies project, parent, timestamp freshness, and lifecycle before ingesting. A new completion after `changes_requested` must have a new candidate identity; ingest resets review and notification state. Old or repeated artifacts are rejected.
+
+Only the direct controller may mark a non-terminal task `blocked`, and it must persist a non-empty `blockedReason`. Use this for genuinely superseded or impossible work; never delete history merely to stop a heartbeat.
+
+## Sidebar title contract
+
+New registrations allocate stable hierarchical keys in project order: root children use `01`, `02`, and nested children use `01.1`, `01.2`, and deeper equivalents. Legacy tasks receive deterministic keys on the next controller write. The semantic `title` remains stable; only the lifecycle prefix changes:
+
+```text
+执行｜01 审计 Provider 调用
+待审｜01 审计 Provider 调用
+返工｜01 审计 Provider 调用
+接收｜01 审计 Provider 调用
+完成｜01 审计 Provider 调用
+阻塞｜01 审计 Provider 调用
+```
+
+Registration returns `dispatchAllowed: false` and a `set_thread_title` action. The controller calls `codex_app__set_thread_title` with the exact returned value and records success with `controller-record-title-synced`; only then may it send the work prompt. A stale acknowledgement fails closed. Title-tool failure is recorded with `controller-record-title-failed` and remains retryable. Later lifecycle title failures do not roll back the lifecycle state.
+
+## Terminal archive contract
+
+Only `integrated` and `blocked` tasks enter archive processing. `controller-scan-events` returns a `set_thread_archived` action only after the terminal title is synced and every visible descendant is already archived. The controller calls `codex_app__set_thread_archived` with `archived: true`, then records success or failure. Archive failures remain retryable.
+
+Archiving affects only the Codex sidebar thread. The registry record and event artifacts remain durable audit evidence. Root controllers are never represented as worker records and are never automatically archived.
+
+## Wake-up and scan contract
+
+A file under `events/` does not wake a Codex thread. The child sends the short completion notification to its registered direct parent, while the direct controller maintains a five-minute heartbeat and runs `controller-scan-events` as fallback.
+
+The scanner is read-only. It returns fresh `pendingEvents`, `reviewQueue`, direct `activeTasks`, terminal `pendingCleanupTasks`, and `threadActions`. `needsControllerAttention` covers actionable events, review items, and tool actions. `shouldKeepHeartbeat` remains true while work or terminal cleanup remains, including a parent waiting for descendant archives; it becomes false only after complete lifecycle and sidebar cleanup.
+
+`notificationStatus: sent` is allowed only after a real successful thread message. Completion ingestion alone leaves notification pending. A later `notification_failed` receipt remains ingestible because freshness is compared with `completionEventCreatedAt`, not the controller's later ingestion timestamp.
 
 ## Lock contract
 

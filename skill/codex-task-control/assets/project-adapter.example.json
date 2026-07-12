@@ -1,10 +1,11 @@
 {
-  "projectRoot": "C:\\work\\example",
+  "projectRoot": "E:\\work\\project\\example",
   "rulesSources": [
     "AGENTS.md"
   ],
   "workflowSources": [
     "docs/sops/example.md"
   ],
-  "modelRoutingSource": "config/codex-model-routing.json"
+  "modelRoutingSource": "config/codex-model-routing.json",
+  "nativeAdapter": "scripts/task-control/task-control.ts"
 }

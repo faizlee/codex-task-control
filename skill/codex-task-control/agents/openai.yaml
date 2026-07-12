@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Forbid subagents and route work to visible tasks"
-  default_prompt: "Use $codex-task-control to forbid internal subagents and route justified mechanical work only to registered visible Codex tasks."
+  short_description: "Name, review, and archive visible Codex tasks"
+  default_prompt: "Use $codex-task-control to route work only to registered visible tasks, keep sidebar titles synchronized, and archive terminal tasks without deleting ledger history."

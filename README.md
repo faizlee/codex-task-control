@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.2 preview. The ledger is local and makes zero model-provider calls.
+> Windows-first v0.3 preview. The ledger is local and makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,12 +23,15 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.2 does
+## What v0.3 does
 
 - Keeps task registries isolated by normalized project root.
 - Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
 - Rejects internal subagent execution and requires a user-visible Codex task/thread.
 - Requires explicit delegation to an economical model with low reasoning.
+- Assigns readable hierarchical keys such as `01` and `01.1`, then synchronizes lifecycle titles in the Codex sidebar.
+- Keeps a heartbeat until pending events, reviews, title changes, and terminal archives are resolved.
+- Archives `integrated` and `blocked` visible tasks after their descendants while retaining the complete ledger history.
 - Lets children query only themselves and emit completion or notification-failure artifacts.
 - Reserves registration, review, acceptance, and integration transitions for controllers.
 - Rejects unsafe identifiers, stale events, project mismatches, cycles, and contradictory state.
@@ -36,7 +39,7 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.2 does not do
+## What v0.3 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
@@ -62,7 +65,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.2 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.3 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -76,7 +79,8 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 
 - Never use internal Codex subagents or `spawn_agent`.
 - Delegate only through a user-visible Codex task/thread.
-- Register the visible task before sending its work prompt.
+- Register the visible task with a semantic title, synchronize the returned title action, and only then send its work prompt.
+- Apply lifecycle title and archive actions returned by the controller heartbeat.
 - Let a child notify only the direct parent stored in its record.
 - Let only the controller accept, request changes, or integrate.
 - Stop unregistered visible work instead of inventing lifecycle state.
@@ -89,7 +93,7 @@ Set a project root and the controller/child task IDs supplied by your Codex work
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $TaskControl = "$CodexHome\skills\codex-task-control\scripts\task-control.mjs"
 
-node $TaskControl register `
+$Registration = node $TaskControl register `
   --project-root "C:\work\example" `
   --controller "controller-1" `
   --thread "worker-1" `
@@ -102,9 +106,23 @@ node $TaskControl register `
   --model-class "economical" `
   --quota-reason "Mechanical work is cheaper than using the frontier controller."
 
+$Registration = $Registration | ConvertFrom-Json
+```
+
+Registration returns a title such as `执行｜01 Audit authentication flow` and `dispatchAllowed: false`. The Codex controller must call its thread-title tool with the exact returned title, then acknowledge the real successful rename:
+
+```powershell
+node $TaskControl controller-record-title-synced `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --thread "worker-1" `
+  --title $Registration.desiredThreadTitle
+
 node $TaskControl query-self --self "worker-1"
 node $TaskControl query-parent --self "worker-1"
 ```
+
+Do not record title success unless the Codex sidebar was actually renamed. The worker may start only after `query-self` reports `dispatchAllowed: true`. The controller heartbeat later applies returned title and archive actions; terminal descendants archive before their parent while audit records remain on disk.
 
 When the child has a candidate:
 
@@ -149,7 +167,7 @@ The test suite uses temporary `CODEX_HOME` directories and verifies that the rea
 
 - Cross-platform project-root normalization.
 - Complexity-based model and reasoning policy.
-- Product task-surface integration that verifies visibility before dispatch.
+- Broader Codex task-surface compatibility beyond the current title/archive tools.
 - Visible-task fan-out, depth, and stop-point budgets.
 - A local task/status dashboard.
 - Optional usage-window telemetry when a reliable data source is available.

@@ -132,17 +132,23 @@ def verify_real_lifecycle() -> dict[str, str]:
     with tempfile.TemporaryDirectory(prefix="codex-task-control-douyin-") as raw:
         home = Path(raw)
         project = r"C:\work\demo-project"
-        run_cli(home, "register", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1", "--parent", "controller-1", "--title", "Audit auth flow", "--model", "economical-worker", "--thinking", "low", "--delegation", "explicit", "--execution-surface", "visible_task", "--model-class", "economical", "--quota-reason", "Mechanical audit work is cheaper than using the frontier controller.")
+        registration = json.loads(run_cli(home, "register", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1", "--parent", "controller-1", "--title", "Audit auth flow", "--model", "economical-worker", "--thinking", "low", "--delegation", "explicit", "--execution-surface", "visible_task", "--model-class", "economical", "--quota-reason", "Mechanical audit work is cheaper than using the frontier controller."))
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1", "--title", registration["desiredThreadTitle"])
         registered = json.loads(run_cli(home, "query-self", "--self", "worker-1"))
-        event = run_cli(home, "complete", "--self", "worker-1", "--candidate-commit", "candidate-auth-v1")
-        run_cli(home, "controller-ingest-completion", "--project-root", project, "--controller", "controller-1", "--event", event)
+        completion = json.loads(run_cli(home, "complete", "--self", "worker-1", "--candidate-commit", "candidate-auth-v1"))
+        run_cli(home, "controller-ingest-completion", "--project-root", project, "--controller", "controller-1", "--event", completion["eventPath"])
         review = json.loads(run_cli(home, "query-self", "--self", "worker-1"))
-        run_cli(home, "mark-accepted", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1")
-        run_cli(home, "mark-integrated", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1")
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1", "--title", review["desiredThreadTitle"])
+        accepted = json.loads(run_cli(home, "mark-accepted", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1"))
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1", "--title", accepted["desiredThreadTitle"])
+        terminal = json.loads(run_cli(home, "mark-integrated", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1"))
+        run_cli(home, "controller-record-title-synced", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1", "--title", terminal["desiredThreadTitle"])
+        run_cli(home, "controller-record-archive-succeeded", "--project-root", project, "--controller", "controller-1", "--thread", "worker-1")
         integrated = json.loads(run_cli(home, "query-self", "--self", "worker-1"))
         assert registered["status"] == "executing"
         assert review["status"] == "awaiting_review"
         assert integrated["status"] == "integrated"
+        assert integrated["archiveStatus"] == "archived"
         return {"registered": registered["status"], "review": review["status"], "integrated": integrated["status"]}
 
 
