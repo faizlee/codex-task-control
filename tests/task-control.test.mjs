@@ -7,6 +7,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  auditModelRouting,
   TaskControlError,
   buildCompletionNotification,
   controllerIngestCompletion,
@@ -93,7 +94,7 @@ async function register(codexHome, projectRoot, threadId, overrides = {}) {
     threadId,
     parentThreadId: overrides.parentThreadId ?? (overrides.controllerThreadId ?? defaultController),
     title: overrides.title ?? 'same task',
-    model: overrides.model ?? 'economical-worker',
+    model: overrides.model ?? 'gpt-5.6-luna',
     thinking: overrides.thinking ?? 'low',
     delegationMode: overrides.delegationMode ?? 'explicit',
     executionSurface: overrides.executionSurface ?? 'visible_task',
@@ -236,7 +237,7 @@ describe('project-isolated task control', () => {
   it('denies subagents by default and enforces economical low-thinking delegation', async () => {
     const codexHome = await freshCodexHome();
     const root = 'C:/work/delegation-policy';
-    const base = { codexHome, projectRoot: root, controllerThreadId: defaultController, parentThreadId: defaultController, title: 'mechanical task', model: 'worker-model', thinking: 'low', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Move repetitive mechanical work off the frontier controller.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' };
+    const base = { codexHome, projectRoot: root, controllerThreadId: defaultController, parentThreadId: defaultController, title: 'mechanical task', model: 'gpt-5.6-luna', thinking: 'low', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Move repetitive mechanical work off the frontier controller.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' };
     await expectCode(() => controllerRegisterTask({ ...base, threadId: 'missing-auth' }), 'DELEGATION_NOT_AUTHORIZED');
     await expectCode(() => controllerRegisterTask({ ...base, threadId: 'internal-subagent', delegationMode: 'explicit', executionSurface: 'internal_subagent' }), 'INTERNAL_SUBAGENT_FORBIDDEN');
     await expectCode(() => controllerRegisterTask({ ...base, threadId: 'frontier-worker', delegationMode: 'explicit', modelClass: 'frontier' }), 'DELEGATION_MODEL_NOT_ECONOMICAL');
@@ -245,6 +246,45 @@ describe('project-isolated task control', () => {
     const allowed = await controllerRegisterTask({ ...base, threadId: 'allowed-worker', delegationMode: 'explicit' });
     assert.equal(allowed.modelClass, 'economical');
     assert.equal(allowed.thinking, 'low');
+  });
+
+  it('binds each delegated work class to its exact GPT-5.6 model', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/model-binding';
+    const base = { codexHome, projectRoot: root, controllerThreadId: defaultController, parentThreadId: defaultController, title: 'model-routed task', model: 'gpt-5.6-luna', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'The bounded worker saves meaningful frontier quota.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' };
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'legacy-mini', model: 'gpt-5.4-mini' }), 'DELEGATION_MODEL_WORK_CLASS_MISMATCH');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'terra-repeatable', model: 'gpt-5.6-terra' }), 'DELEGATION_MODEL_WORK_CLASS_MISMATCH');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'luna-bounded', workClass: 'bounded_reasoning' }), 'DELEGATION_MODEL_WORK_CLASS_MISMATCH');
+    const luna = await controllerRegisterTask({ ...base, threadId: 'valid-luna' });
+    const terra = await controllerRegisterTask({ ...base, threadId: 'valid-terra', model: 'gpt-5.6-terra', workClass: 'bounded_reasoning' });
+    assert.equal(luna.model, 'gpt-5.6-luna');
+    assert.equal(terra.model, 'gpt-5.6-terra');
+  });
+
+  it('audits active legacy and mismatched model registrations without mutating them', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/model-audit';
+    await register(codexHome, root, 'legacy-active');
+    await register(codexHome, root, 'mismatched-active');
+    const projectKey = projectKeyForRoot(root);
+    const registryPath = join(codexHome, 'task-control', 'projects', projectKey, 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const legacy = registry.tasks.find((task) => task.threadId === 'legacy-active');
+    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions']) delete legacy[key];
+    legacy.model = 'gpt-5.4-mini';
+    registry.tasks.find((task) => task.threadId === 'mismatched-active').model = 'gpt-5.4-mini';
+    await writeFile(registryPath, JSON.stringify(registry, null, 2), 'utf8');
+
+    const before = await readFile(registryPath, 'utf8');
+    const audit = await auditModelRouting({ codexHome });
+    const after = await readFile(registryPath, 'utf8');
+    assert.equal(audit.compliant, false);
+    assert.equal(audit.activeTaskCount, 2);
+    assert.deepEqual(audit.violations.map(({ threadId, reason, currentModel, expectedModel }) => ({ threadId, reason, currentModel, expectedModel })), [
+      { threadId: 'legacy-active', reason: 'legacy_missing_routing_evidence', currentModel: 'gpt-5.4-mini', expectedModel: null },
+      { threadId: 'mismatched-active', reason: 'model_work_class_mismatch', currentModel: 'gpt-5.4-mini', expectedModel: 'gpt-5.6-luna' },
+    ]);
+    assert.equal(after, before);
   });
 
   it('fails closed unless delegated work is decision-complete and testable', async () => {
@@ -367,7 +407,7 @@ describe('project-isolated task control', () => {
 
   it('keeps omitted codexHome calls inside the temporary CODEX_HOME sandbox', async () => {
     const root = 'C:/work/omitted-codex-home';
-    const registered = await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'economical-worker', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' });
+    const registered = await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'gpt-5.6-luna', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' });
     await controllerRecordTitleSynced({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', title: registered.desiredThreadTitle });
     const eventPath = await createCompletionEvent({ selfThreadId: 'omitted', candidateCommit: 'candidate-omitted-home' });
     await controllerIngestCompletion({ projectRoot: root, controllerThreadId: defaultController, eventPath });
