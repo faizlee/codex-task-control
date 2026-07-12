@@ -38,3 +38,17 @@ try {
 } catch {
   Write-Warning "Skill installed, but model routing audit could not run: $($_.Exception.Message)"
 }
+
+try {
+  $archiveAudit = (& node $auditScript audit-archive-backlog --codex-home $CodexHome | ConvertFrom-Json)
+  if ($archiveAudit.backlogCount -eq 0) {
+    Write-Output "Archive backlog audit: compliant (no terminal sidebar cleanup pending)"
+  } else {
+    Write-Warning "Archive backlog audit found $($archiveAudit.backlogCount) terminal task(s) across $($archiveAudit.ownerCount) direct-controller plan(s); $($archiveAudit.readyActionCount) thread action(s) are ready now. Each recorded direct controller must apply descendant-first title/archive actions and record the result."
+    foreach ($owner in $archiveAudit.owners) {
+      Write-Warning "[$($owner.projectRoot)] controller=$($owner.controllerThreadId) backlog=$($owner.tasks.Count) readyActions=$($owner.threadActions.Count)"
+    }
+  }
+} catch {
+  Write-Warning "Skill installed, but archive backlog audit could not run: $($_.Exception.Message)"
+}

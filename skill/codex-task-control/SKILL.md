@@ -23,7 +23,8 @@ Use the bundled `scripts/task-control.mjs` as the outer ledger layer. It records
 12. The controller alone ingests events and marks `changes_requested`, dispatches rework, reclaims work, blocks, accepts, and integrates. Classify each review failure as `mechanical`, `comprehension`, `judgment`, or `spec_missing`. Allow the same worker one explicit rework only for `mechanical`; reclaim all other failures immediately, and reclaim after a second failed review. A Luna-to-Terra escalation must close the old task as `reclaimed` and register a new bounded visible task.
 13. Maintain a five-minute heartbeat after visible-task registration or continuation. Run `controller-scan-events`; stay silent only when `needsControllerAttention: false`. Apply every returned `threadAction` through `codex_app__set_thread_title` or `codex_app__set_thread_archived`, then record success or failure with the matching controller command.
 14. Archive only `integrated`, `blocked`, or `reclaimed` tasks. Archive visible descendants first, then their parent. Keep registry and event history; archive only the Codex sidebar thread.
-15. Delete the heartbeat only when `controller-scan-events` returns `shouldKeepHeartbeat: false`, which means no active work, pending review, routing decision, title sync, or archive action remains.
+15. After installation or upgrade, run both `audit-model-routing` and `audit-archive-backlog`. The archive audit is read-only and groups terminal cleanup by registered direct controller. Each owner must run its controller scan, apply returned title/archive actions descendant-first, and record success or failure; never impersonate another controller or mutate legacy archive evidence directly.
+16. Delete the heartbeat only when `controller-scan-events` returns `shouldKeepHeartbeat: false`, which means no active work, pending review, routing decision, title sync, or archive action remains.
 
 ## Commands
 
@@ -32,6 +33,7 @@ node scripts/task-control.mjs query-parent --self <thread-id> --codex-home <CODE
 node scripts/task-control.mjs complete --self <thread-id> --candidate-commit <candidate> --codex-home <CODEX_HOME>
 node scripts/task-control.mjs notification-failed --self <thread-id> --reason "..." --codex-home <CODEX_HOME>
 node scripts/task-control.mjs audit-model-routing --codex-home <CODEX_HOME>
+node scripts/task-control.mjs audit-archive-backlog --codex-home <CODEX_HOME>
 
 node scripts/task-control.mjs register --project-root <root> --controller <controller-id> --thread <thread-id> --parent <parent-id> --title "..." --model <gpt-5.6-luna|gpt-5.6-terra> --thinking low --delegation explicit --execution-surface visible_task --model-class economical --quota-reason "Mechanical work is cheaper than using the frontier controller." --work-class repeatable --decision-status resolved --scope "Only update named files." --acceptance "Run the targeted test successfully." --forbidden-decisions "Do not change contracts or error policy." --codex-home <CODEX_HOME>
 node scripts/task-control.mjs controller-ingest-completion --project-root <root> --controller <controller-id> --event <event.json> --codex-home <CODEX_HOME>

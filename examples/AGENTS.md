@@ -11,5 +11,6 @@
 - Only the controller may register tasks, ingest events, request changes, explicitly dispatch one mechanical rework, reclaim work, accept, or integrate.
 - Treat `changes_requested` as stopped and undecided, not as running. Reclaim comprehension, judgment, and missing-spec failures immediately; after a second failed review, reclaim instead of looping.
 - The controller heartbeat applies pending title and archive actions. Archive `integrated`, `blocked`, or `reclaimed` descendants before their parent, but retain all ledger history.
+- After install or upgrade, run both `audit-model-routing` and `audit-archive-backlog`. Treat missing legacy archive metadata as pending cleanup in memory; only the recorded direct controller may apply the descendant-first thread actions and record their results.
 - Project-local `AGENTS.md`, workflows, tests, and acceptance rules remain authoritative.
 - If a visible task is not registered, stop and report that it is waiting for controller registration.

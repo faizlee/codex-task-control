@@ -94,6 +94,8 @@ Only `integrated`, `blocked`, and `reclaimed` tasks enter archive processing. `c
 
 Archiving affects only the Codex sidebar thread. The registry record and event artifacts remain durable audit evidence. Root controllers are never represented as worker records and are never automatically archived.
 
+`audit-archive-backlog` scans every project registry without writing it. It treats a complete legacy terminal record with no thread-control group as in-memory `archiveStatus: pending`, groups backlog by `projectKey + directControllerThreadId`, and returns the currently legal `set_thread_title` or `set_thread_archived` actions. Tasks report whether unarchived descendants block them. The registered direct controller applies each action and records the result; rerun the audit until `backlogCount: 0`.
+
 ## Wake-up and scan contract
 
 A file under `events/` does not wake a Codex thread. The child sends the short completion notification to its registered direct parent, while the direct controller maintains a five-minute heartbeat and runs `controller-scan-events` as fallback.
