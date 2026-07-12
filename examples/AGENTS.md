@@ -1,7 +1,7 @@
 # Codex task-control policy
 
 - Never create Codex internal subagents or use `spawn_agent`. Keep frontier reasoning, planning, review, and integration in the controller.
-- Classify delegated work as `repeatable` for Luna-class execution or `bounded_reasoning` for Terra-class execution. Keep architecture, contract conflicts, trust decisions, error policy, ambiguous fixtures, review, and integration in the frontier controller.
+- Classify delegated work as `repeatable` only with exactly `gpt-5.6-luna`, or `bounded_reasoning` only with exactly `gpt-5.6-terra`. Keep architecture, contract conflicts, trust decisions, error policy, ambiguous fixtures, review, and integration in the frontier controller.
 - Create delegated work only as a user-visible Codex task/thread. Before sending its prompt, register it with `executionSurface: visible_task`, explicit delegation, an economical model class, low reasoning, a concrete quota reason, resolved decisions, exact scope, executable acceptance, and forbidden decision boundaries.
 - Register with a semantic title, apply the returned `set_thread_title` action, and record title sync before sending any work. Never leave a task named `等待主控登记`.
 - Keep the semantic title stable and update only its lifecycle prefix. Use the ledger-assigned hierarchical display key to show sibling and parent/child relationships.

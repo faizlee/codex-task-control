@@ -30,6 +30,7 @@ Allowed values:
 - `titleSyncStatus`: `pending`, `synced`, `failed`.
 - `archiveStatus`: `not_ready`, `pending`, `archived`, `failed`.
 - `workClass`: `repeatable`, `bounded_reasoning`.
+- Model binding: `repeatable` requires exactly `gpt-5.6-luna`; `bounded_reasoning` requires exactly `gpt-5.6-terra`.
 - `decisionStatus`: `resolved` for every delegated task.
 - `executionStatus`: `running`, `stopped`, `awaiting_review`, `terminal`.
 - `nextOwner`: `worker`, `controller`, `undecided`, `none`.
@@ -41,6 +42,8 @@ Allowed values:
 Internal Codex subagents are forbidden. Delegated work must be a user-visible Codex task/thread. Registration rejects missing explicit authorization, any execution surface other than `visible_task`, any model class other than `economical`, any thinking value other than `low`, a quota reason shorter than 12 characters, unresolved decisions, `controller_only` work, missing scope/acceptance/forbidden-decision evidence, and the placeholder title `等待主控登记`.
 
 Use `repeatable` only when the worker can follow explicit rules and a fixed test oracle. Use `bounded_reasoning` only after the controller has resolved contracts and policy choices. Architecture, contract conflicts, persistence-trust selection, stop/continue policy, ambiguous fixtures, planning, review, and integration are controller-only even when a stronger worker might succeed.
+
+`audit-model-routing` scans only non-terminal tasks across project registries. It reports legacy records without routing evidence and records whose actual model does not match their `workClass`. The audit is read-only; remediation belongs to the recorded direct controller, which must stop or reclaim the old task and register a replacement rather than mutating model identity in place.
 
 The ledger cannot intercept a host application's raw subagent tool. Skill and `AGENTS.md` policy therefore prohibit those tools outright. A visible task shell may be created to obtain its thread ID, but registration must succeed before any work prompt is sent to it.
 

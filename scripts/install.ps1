@@ -23,3 +23,18 @@ if (Test-Path -LiteralPath $target) {
 }
 Copy-Item -LiteralPath $source -Destination $target -Recurse
 Write-Output "Installed codex-task-control to $target"
+
+$auditScript = Join-Path $target 'scripts\task-control.mjs'
+try {
+  $audit = (& node $auditScript audit-model-routing --codex-home $CodexHome | ConvertFrom-Json)
+  if ($audit.violationCount -eq 0) {
+    Write-Output "Model routing audit: compliant ($($audit.activeTaskCount) active tasks checked)"
+  } else {
+    Write-Warning "Model routing audit found $($audit.violationCount) active legacy or mismatched task(s). Do not mutate their model identity; the registered direct controller must stop/reclaim each old task and register a new GPT-5.6 Luna/Terra task."
+    foreach ($violation in $audit.violations) {
+      Write-Warning "[$($violation.projectRoot)] $($violation.threadId) model=$($violation.currentModel) workClass=$($violation.workClass) expected=$($violation.expectedModel) controller=$($violation.directControllerThreadId) reason=$($violation.reason)"
+    }
+  }
+} catch {
+  Write-Warning "Skill installed, but model routing audit could not run: $($_.Exception.Message)"
+}
