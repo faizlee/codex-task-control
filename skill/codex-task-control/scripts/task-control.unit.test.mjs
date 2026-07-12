@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -20,9 +20,23 @@ import {
   controllerScanPendingEvents,
   createCompletionEvent,
   createNotificationFailureReceipt,
+  projectKeyForRoot,
+  runCli,
 } from './task-control.mjs';
 
 const delay = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+async function invokeCli(args) {
+  let output = '';
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += String(chunk); return true; };
+  try {
+    await runCli(args);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  return JSON.parse(output);
+}
 
 async function register(input) {
   const task = await controllerRegisterTask(input);
@@ -128,6 +142,51 @@ test('changes requested enters a stopped routing queue instead of pretending to 
     assert.equal(scan.needsControllerAttention, true);
     assert.equal(scan.shouldKeepHeartbeat, true);
   });
+});
+
+test('v0.3 changes-requested titles migrate safely to a stopped pending decision', async () => {
+  await withFixture(async (fixture) => {
+    const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const task = registry.tasks[0];
+    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason']) delete task[key];
+    task.status = 'changes_requested';
+    task.reviewVerdict = 'changes_requested';
+    task.desiredThreadTitle = '返工｜01 审计 Provider 调用';
+    task.lastSyncedTitle = task.desiredThreadTitle;
+    task.titleSyncStatus = 'synced';
+    task.updatedAt = new Date().toISOString();
+    registry.updatedAt = task.updatedAt;
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.deepEqual(scan.routingQueue, [{ threadId: fixture.threadId, displayKey: '01', status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: 'unclassified' }]);
+    assert.deepEqual(scan.threadActions, [{ type: 'set_thread_title', threadId: fixture.threadId, title: '待决｜01 审计 Provider 调用' }]);
+  });
+});
+
+test('CLI enforces readiness and drives an explicit controller reclaim flow', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-cli-'));
+  const projectRoot = 'E:\\work\\project\\cli-routing';
+  const common = ['--task-control-home', taskControlHome, '--project-root', projectRoot, '--controller', 'controller-cli', '--thread', 'worker-cli'];
+  try {
+    const registered = await invokeCli(['register', ...common, '--parent', 'controller-cli', '--title', 'Implement bounded validator', '--model', 'gpt-5.6-terra', '--thinking', 'low', '--delegation', 'explicit', '--execution-surface', 'visible_task', '--model-class', 'economical', '--quota-reason', 'A bounded validator implementation saves frontier quota.', '--work-class', 'bounded_reasoning', '--decision-status', 'resolved', '--scope', 'Only modify the named validator module.', '--acceptance', 'Run the validator unit test with a zero exit code.', '--forbidden-decisions', 'Do not change persistence trust or error policy.']);
+    assert.equal(registered.dispatchAllowed, false);
+    await invokeCli(['controller-record-title-synced', ...common, '--title', registered.desiredThreadTitle]);
+    const self = await invokeCli(['query-self', '--task-control-home', taskControlHome, '--self', 'worker-cli']);
+    assert.equal(self.dispatchAllowed, true);
+
+    await delay();
+    const completion = await invokeCli(['complete', '--task-control-home', taskControlHome, '--self', 'worker-cli', '--candidate-commit', 'candidate-cli-1']);
+    await delay();
+    await invokeCli(['controller-ingest-completion', '--task-control-home', taskControlHome, '--project-root', projectRoot, '--controller', 'controller-cli', '--event', completion.eventPath]);
+    const pending = await invokeCli(['mark-changes-requested', ...common, '--failure-class', 'judgment', '--reason', 'The candidate attempted to choose between conflicting contracts.']);
+    assert.equal(pending.desiredThreadTitle, '待决｜01 Implement bounded validator');
+    const reclaimed = await invokeCli(['controller-reclaim', ...common, '--reason', 'The controller will resolve the contract boundary.']);
+    assert.equal(reclaimed.desiredThreadTitle, '收回｜01 Implement bounded validator');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
 });
 
 test('lifecycle titles synchronize before terminal archive and heartbeat cleanup', async () => {

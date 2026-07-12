@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.3 是 Windows-first preview。台账完全保存在本地，台账操作不会调用模型 provider。
+> v0.4 是 Windows-first preview。台账完全保存在本地，台账操作不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,15 +12,18 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.3 已经解决什么
+## v0.4 已经解决什么
 
 - 按项目根目录隔离任务注册表。
 - 记录直接父任务、controller、执行界面、模型等级、reasoning、额度理由和生命周期状态。
 - 拒绝内部 subagent，只接受用户可见的 Codex task/thread。
 - 委派必须显式授权，并使用 economical 模型与 low reasoning。
+- 架构/合同/错误策略未决、scope 或验收证据不明确时，登记直接 fail closed。
+- 把 Luna 类的 `repeatable` 任务与 Terra 类的 `bounded_reasoning` 任务分开，有歧义的判断继续由前沿主控完成。
+- 审查失败先进入停止的“待决”状态，只允许一次明确的机械返工，其他失败由主控收回。
 - 自动分配 `01`、`01.1` 这类层级编号，并把生命周期标题同步到 Codex 侧边栏。
 - heartbeat 会持续处理事件、审查队列、标题同步和终态归档，全部收口后才删除。
-- `integrated` 或 `blocked` 的可见任务按后代优先顺序归档，但完整台账历史永久保留。
+- `integrated`、`blocked` 或 `reclaimed` 的可见任务按后代优先顺序归档，但完整台账历史永久保留。
 - 子任务只能查询自己、生成 completion event 或通知失败回执。
 - 只有 controller 可以登记、要求返工、接受和集成。
 - 拒绝不安全 task ID、旧事件、项目错配、父子环和矛盾状态。
@@ -28,7 +31,7 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.3 不做什么
+## v0.4 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
@@ -75,7 +78,12 @@ $Registration = node $TaskControl register `
   --delegation "explicit" `
   --execution-surface "visible_task" `
   --model-class "economical" `
-  --quota-reason "Mechanical work is cheaper than using the frontier controller."
+  --quota-reason "Mechanical work is cheaper than using the frontier controller." `
+  --work-class "repeatable" `
+  --decision-status "resolved" `
+  --scope "Only update the named authentication tests." `
+  --acceptance "Run the targeted authentication test successfully." `
+  --forbidden-decisions "Do not change authentication contracts or error policy."
 
 $Registration = $Registration | ConvertFrom-Json
 ```
@@ -100,10 +108,29 @@ node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1"
 
 ```text
 executing -> awaiting_review -> accepted -> integrated
-     \----> changes_requested -> awaiting_review
+                 \----> changes_requested（已停止 / 待决）
+                              \----> 明确派发一次机械返工
+                              \----> 主控收回
 ```
 
 完整存储、事件和锁协议见 [`lifecycle.md`](skill/codex-task-control/references/lifecycle.md)。
+
+审查不通过后，先记录原因，再由主控明确选择返工或收回：
+
+```powershell
+node $TaskControl mark-changes-requested `
+  --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" `
+  --failure-class "mechanical" --reason "A named assertion is missing."
+
+# 只允许第一次机械性失败原 worker 返工：
+node $TaskControl controller-dispatch-rework `
+  --project-root "C:\work\example" --controller "controller-1" --thread "worker-1"
+
+# 理解/判断/规格失败，或已经返工过一次：
+node $TaskControl controller-reclaim `
+  --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" `
+  --reason "The controller must resolve the contract boundary."
+```
 
 ## 验证
 
@@ -117,7 +144,7 @@ npm test
 ## 后续路线
 
 - 跨平台项目路径规范化。
-- 按任务复杂度选择 model/reasoning。
+- 在 work-class 路由之上增加可选的项目级具体模型名验证。
 - 扩展当前改名/归档工具之外的 Codex task 界面兼容性。
 - 可见任务的 fan-out、深度和停止点预算。
 - 本地 task dashboard。

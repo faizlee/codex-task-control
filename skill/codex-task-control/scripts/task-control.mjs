@@ -316,6 +316,10 @@ export function desiredThreadTitle(task) {
   return `${label}｜${task.displayKey} ${compactBaseTitle(task.title)}`;
 }
 
+function isLegacyChangesRequestedTitle(task) {
+  return !('executionStatus' in task) && task.status === 'changes_requested' && task.desiredThreadTitle === `返工｜${task.displayKey} ${compactBaseTitle(task.title)}`;
+}
+
 function executionDefaults(task) {
   const attemptCount = Number.isInteger(task.attemptCount) && task.attemptCount > 0 ? task.attemptCount : 1;
   if (task.status === 'executing') return { executionStatus: 'running', nextOwner: 'worker', attemptCount, failureClass: task.failureClass ?? null, changesRequestedReason: task.changesRequestedReason ?? null, reclaimedReason: null };
@@ -367,7 +371,16 @@ function ensureDisplayKeys(tasks, rootControllers) {
 
 function ensureThreadControl(tasks, rootControllers) {
   return ensureDisplayKeys(tasks, rootControllers).map((task) => {
-    if (hasThreadControl(task) && 'titleSyncStatus' in task) return task;
+    if (hasThreadControl(task) && 'titleSyncStatus' in task) {
+      const controlled = { ...task };
+      const desired = desiredThreadTitle(controlled);
+      if (controlled.desiredThreadTitle !== desired) {
+        controlled.desiredThreadTitle = desired;
+        controlled.titleSyncStatus = 'pending';
+        controlled.titleSyncError = null;
+      }
+      return controlled;
+    }
     const controlled = { ...task };
     controlled.desiredThreadTitle = desiredThreadTitle(controlled);
     controlled.titleSyncStatus = 'pending';
@@ -482,7 +495,7 @@ function validateTask(value) {
   if (presentThreadControlFields.length !== 0 && presentThreadControlFields.length !== threadControlFields.length) fail('REGISTRY_INVALID', 'thread control 字段必须同时存在');
   if (presentThreadControlFields.length === threadControlFields.length) {
     if (!/^\d{2}(?:\.\d+)*$/.test(value.displayKey)) fail('REGISTRY_INVALID', `displayKey 无效: ${value.displayKey}`);
-    if (!nonEmpty(value.desiredThreadTitle) || value.desiredThreadTitle !== desiredThreadTitle(value)) fail('REGISTRY_INVALID', 'desiredThreadTitle 与 lifecycle 不一致');
+    if (!nonEmpty(value.desiredThreadTitle) || (value.desiredThreadTitle !== desiredThreadTitle(value) && !isLegacyChangesRequestedTitle(value))) fail('REGISTRY_INVALID', 'desiredThreadTitle 与 lifecycle 不一致');
     if (!has(value.titleSyncStatus, TITLE_SYNC_STATUSES)) fail('REGISTRY_INVALID', `titleSyncStatus 无效: ${value.titleSyncStatus}`);
     if (value.lastSyncedTitle !== null && !nonEmpty(value.lastSyncedTitle)) fail('REGISTRY_INVALID', 'lastSyncedTitle 无效');
     if (value.titleSyncError !== null && !nonEmpty(value.titleSyncError)) fail('REGISTRY_INVALID', 'titleSyncError 无效');
