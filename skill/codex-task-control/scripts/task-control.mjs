@@ -723,6 +723,34 @@ export async function auditModelRouting(input = {}) {
   return { compliant: violations.length === 0, activeTaskCount, violationCount: violations.length, violations, auditedAt: new Date().toISOString() };
 }
 
+export async function auditArchiveBacklog(input = {}) {
+  const home = resolveTaskControlHome(input);
+  const index = await readIndex(home);
+  const ownerPlans = new Map();
+  let backlogCount = 0;
+  let readyActionCount = 0;
+  for (const project of index.projects) {
+    const { registry: rawRegistry } = await readProjectRegistry(home, project);
+    const rawById = new Map(rawRegistry.tasks.map((task) => [task.threadId, task]));
+    const registry = { ...rawRegistry, tasks: ensureTaskControls(rawRegistry.tasks, rawRegistry.rootControllerThreadIds) };
+    for (const task of registry.tasks) {
+      if (!isTerminalTask(task) || task.archiveStatus === 'archived') continue;
+      backlogCount += 1;
+      const descendants = descendantsOf(registry.tasks, task.threadId);
+      const blockedByDescendants = descendants.some((descendant) => descendant.archiveStatus !== 'archived');
+      const actions = threadActionsForTask(task, registry.tasks);
+      readyActionCount += actions.length;
+      const ownerKey = `${registry.projectKey}:${task.directControllerThreadId}`;
+      if (!ownerPlans.has(ownerKey)) ownerPlans.set(ownerKey, { projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: task.directControllerThreadId, tasks: [], threadActions: [] });
+      const owner = ownerPlans.get(ownerKey);
+      owner.tasks.push({ threadId: task.threadId, displayKey: task.displayKey, title: task.title, status: task.status, archiveStatus: task.archiveStatus, legacyArchiveMetadata: !('archiveStatus' in rawById.get(task.threadId)), blockedByDescendants, descendantCount: descendants.length, updatedAt: task.updatedAt });
+      owner.threadActions.push(...actions);
+    }
+  }
+  const owners = [...ownerPlans.values()].map((owner) => ({ ...owner, tasks: owner.tasks.sort((left, right) => right.displayKey.split('.').length - left.displayKey.split('.').length || left.displayKey.localeCompare(right.displayKey)) }));
+  return { compliant: backlogCount === 0, backlogCount, ownerCount: owners.length, readyActionCount, owners, auditedAt: new Date().toISOString() };
+}
+
 async function readArtifact(filePath, expectedType) {
   const value = await readJson(filePath, expectedType === 'task_completed' ? 'EVENT_INVALID' : 'NOTIFICATION_RECEIPT_INVALID');
   if (!isObject(value) || value.schemaVersion !== 1 || value.type !== expectedType || !nonEmpty(value.projectKey) || !isSafeThreadId(value.threadId) || !isSafeThreadId(value.parentThreadId) || !isSafeThreadId(value.controllerThreadId) || !isTimestamp(value.createdAt)) fail(expectedType === 'task_completed' ? 'EVENT_INVALID' : 'NOTIFICATION_RECEIPT_INVALID', '事件身份或时间字段无效');
@@ -995,6 +1023,7 @@ export async function runCli(args = process.argv.slice(2)) {
   let result;
   if (command === 'query-parent') result = await queryParent({ ...storage, selfThreadId: required(args, '--self') });
   else if (command === 'audit-model-routing') result = await auditModelRouting(storage);
+  else if (command === 'audit-archive-backlog') result = await auditArchiveBacklog(storage);
   else if (command === 'query-self') {
     const task = (await querySelf({ ...storage, selfThreadId: required(args, '--self') })).task;
     result = { ...task, dispatchAllowed: dispatchAllowed(task) };
