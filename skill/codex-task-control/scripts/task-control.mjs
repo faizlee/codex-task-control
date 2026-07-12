@@ -23,6 +23,7 @@ const isTimestamp = (value) => typeof value === 'string' && Number.isFinite(Date
 const nonEmpty = (value) => typeof value === 'string' && value.trim().length > 0;
 const has = (value, values) => typeof value === 'string' && values.includes(value);
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const isTransientWindowsFsError = (error) => ['EACCES', 'EBUSY', 'EPERM'].includes(error?.code);
 
 function fail(code, message) {
   throw new TaskControlError(code, message);
@@ -80,13 +81,12 @@ async function readJson(filePath, code) {
 }
 
 async function replaceFileWithRetry(tempPath, filePath) {
-  const transientCodes = new Set(['EACCES', 'EBUSY', 'EPERM']);
   for (let attempt = 0; attempt < 8; attempt += 1) {
     try {
       await rename(tempPath, filePath);
       return;
     } catch (error) {
-      if (!transientCodes.has(error?.code) || attempt === 7) throw error;
+      if (!isTransientWindowsFsError(error) || attempt === 7) throw error;
       await sleep(10 * (attempt + 1));
     }
   }
@@ -137,17 +137,21 @@ async function lockExists(lockPath) {
 }
 
 async function releaseFileIfOwner(lockPath, nonce) {
-  const first = await readLockOwner(lockPath);
-  if (!first || first.nonce !== nonce) return false;
-  const second = await readLockOwner(lockPath);
-  if (!second || second.nonce !== nonce) return false;
-  try {
-    await rm(lockPath, { force: false });
-    return true;
-  } catch (error) {
-    if (error?.code === 'ENOENT') return false;
-    throw error;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const first = await readLockOwner(lockPath);
+    if (!first || first.nonce !== nonce) return false;
+    const second = await readLockOwner(lockPath);
+    if (!second || second.nonce !== nonce) return false;
+    try {
+      await rm(lockPath, { force: false });
+      return true;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return false;
+      if (!isTransientWindowsFsError(error) || attempt === 7) throw error;
+      await sleep(10 * (attempt + 1));
+    }
   }
+  return false;
 }
 
 async function reclaimStaleRecoveryMutexIfSame(recoveryPath, options = {}) {
@@ -180,9 +184,11 @@ async function acquireRecoveryMutex(lockPath, options = {}) {
         throw error;
       }
     } catch (error) {
-      const exists = error?.code === 'EEXIST' || (error?.code === 'EPERM' && await lockExists(recoveryPath));
-      if (!exists) throw error;
-      await reclaimStaleRecoveryMutexIfSame(recoveryPath, { staleMs: settings.staleMs, beforeRecoveryRecheck: options.beforeRecoveryRecheck });
+      const retryable = error?.code === 'EEXIST' || isTransientWindowsFsError(error);
+      if (!retryable) throw error;
+      if (await lockExists(recoveryPath)) {
+        await reclaimStaleRecoveryMutexIfSame(recoveryPath, { staleMs: settings.staleMs, beforeRecoveryRecheck: options.beforeRecoveryRecheck });
+      }
       await sleep(settings.retryDelayMs);
     }
   }
@@ -247,8 +253,8 @@ export async function withExclusiveLock(filePath, operation, options = {}) {
         await releaseLockIfOwner(lockPath, owner.nonce, settings);
       }
     } catch (error) {
-      const lockAlreadyExists = error?.code === 'EEXIST' || (error?.code === 'EPERM' && await lockExists(lockPath));
-      if (lockAlreadyExists) {
+      const retryable = error?.code === 'EEXIST' || isTransientWindowsFsError(error);
+      if (retryable) {
         if (!(await lockExists(`${lockPath}.recovery`))) {
           await reclaimStaleLockIfSame(lockPath, {
             ...settings,

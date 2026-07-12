@@ -48,7 +48,7 @@ The controller verifies project, parent, timestamp freshness, and lifecycle befo
 
 Registry and project-index read/modify/write operations use an exclusive `<target>.lock` file containing `{pid, createdAt, nonce}` plus an independent `<target>.lock.recovery` mutex. Main acquisition waits while recovery is held; only the recovery owner may verify and remove a stale main lock. Defaults are conservative; tests may inject `staleMs`, `maxAttempts`, and `retryDelayMs` into the exported lock helper. A lock is reclaimable only after exceeding `staleMs` and repeated owner checks still match. Recovery-mutex stale handling is also bounded and conservative. Release takes the same recovery mutex, re-reads the owner nonce before deletion, and leaves a replacement lock untouched.
 
-Atomic replacement retries only transient Windows `EACCES`, `EBUSY`, and `EPERM` rename failures with a short bounded backoff. Other filesystem errors fail immediately, and the temporary file is removed on failure.
+Lock acquisition, owner-checked release, and atomic replacement retry only transient Windows `EACCES`, `EBUSY`, and `EPERM` filesystem races with a short bounded backoff. Ownership is re-read before every release retry, non-transient errors fail immediately, and temporary registry files are removed on failure.
 
 ## Project adapters
 
