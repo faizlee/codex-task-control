@@ -1,10 +1,10 @@
 # Codex Task Control
 
-An auditable, review-gated lifecycle ledger for Codex tasks and subagents.
+An auditable, review-gated controller for user-visible Codex tasks that forbids internal subagents.
 
-GPT-5.6 can delegate aggressively. That is useful, but a large fan-out can also make model usage, ownership, and completion state hard to reason about. Codex Task Control adds a local control layer around visible tasks without replacing the rules already defined by each project.
+Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.1 preview. The ledger is local and makes zero model-provider calls.
+> Windows-first v0.2 preview. The ledger is local and makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,10 +23,12 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.1 does
+## What v0.2 does
 
 - Keeps task registries isolated by normalized project root.
-- Records direct parent, controller, model, reasoning level, and lifecycle state.
+- Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
+- Rejects internal subagent execution and requires a user-visible Codex task/thread.
+- Requires explicit delegation to an economical model with low reasoning.
 - Lets children query only themselves and emit completion or notification-failure artifacts.
 - Reserves registration, review, acceptance, and integration transitions for controllers.
 - Rejects unsafe identifiers, stale events, project mismatches, cycles, and contradictory state.
@@ -34,12 +36,12 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.1 does not do
+## What v0.2 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, or steer Codex tasks.
-- It records model policy decisions but does not yet enforce model routing at spawn time.
+- It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
 ## Install
@@ -60,7 +62,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.1 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.2 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -72,7 +74,9 @@ The installer copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-con
 
 Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into your user-level or project-level `AGENTS.md`. The essential policy is:
 
-- Register visible child tasks before they start.
+- Never use internal Codex subagents or `spawn_agent`.
+- Delegate only through a user-visible Codex task/thread.
+- Register the visible task before sending its work prompt.
 - Let a child notify only the direct parent stored in its record.
 - Let only the controller accept, request changes, or integrate.
 - Stop unregistered visible work instead of inventing lifecycle state.
@@ -91,8 +95,12 @@ node $TaskControl register `
   --thread "worker-1" `
   --parent "controller-1" `
   --title "Audit authentication flow" `
-  --model "gpt-5.6-terra" `
-  --thinking "low"
+  --model "economical-worker" `
+  --thinking "low" `
+  --delegation "explicit" `
+  --execution-surface "visible_task" `
+  --model-class "economical" `
+  --quota-reason "Mechanical work is cheaper than using the frontier controller."
 
 node $TaskControl query-self --self "worker-1"
 node $TaskControl query-parent --self "worker-1"
@@ -141,8 +149,8 @@ The test suite uses temporary `CODEX_HOME` directories and verifies that the rea
 
 - Cross-platform project-root normalization.
 - Complexity-based model and reasoning policy.
-- Spawn-time routing enforcement.
-- Fan-out, depth, and stop-point budgets.
+- Product task-surface integration that verifies visibility before dispatch.
+- Visible-task fan-out, depth, and stop-point budgets.
 - A local task/status dashboard.
 - Optional usage-window telemetry when a reliable data source is available.
 

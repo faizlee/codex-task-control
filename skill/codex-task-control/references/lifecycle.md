@@ -16,7 +16,7 @@ The project key is derived from a normalized, case-folded Windows path and a has
 
 ## Registry contract
 
-Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControllerThreadIds`, `updatedAt`, and `tasks`. Each task has `threadId`, `parentThreadId`, `directControllerThreadId`, `title`, `model`, `thinking`, `status`, `candidateCommit`, `reviewVerdict`, `integrationStatus`, `notificationStatus`, and `updatedAt`. A task's `directControllerThreadId` equals its `parentThreadId`: a root child is controlled by a root controller, while a nested child is controlled by its registered parent task.
+Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControllerThreadIds`, `updatedAt`, and `tasks`. New task records add `delegationMode`, `executionSurface`, `modelClass`, and `quotaReason` to the existing identity, model, thinking, lifecycle, and notification fields. Legacy records without all four delegation fields remain readable; partial delegation metadata fails closed. A task's `directControllerThreadId` equals its `parentThreadId`; both root children and nested visible tasks remain supported.
 
 Allowed values:
 
@@ -25,6 +25,19 @@ Allowed values:
 - `integrationStatus`: `not_integrated`, `integrated`.
 - `notificationStatus`: `pending`, `sent`, `failed`.
 - `thinking`: `low`, `medium`, `high`.
+- New delegated workers require `delegationMode: explicit`, `executionSurface: visible_task`, `modelClass: economical`, and `thinking: low`.
+
+## Delegation gate
+
+Internal Codex subagents are forbidden. Delegated work must be a user-visible Codex task/thread. A controller registration is the explicit authorization boundary and must include a non-trivial quota reason. Registration rejects:
+
+- missing explicit authorization;
+- any execution surface other than `visible_task`;
+- any model class other than `economical`;
+- any thinking value other than `low`;
+- a quota reason shorter than 12 characters;
+
+The ledger cannot intercept a host application's raw subagent tool. Skill and `AGENTS.md` policy therefore prohibit those tools outright. A visible task shell may be created to obtain its thread ID, but registration must succeed before any work prompt is sent to it.
 
 Lifecycle invariants are checked before every controller write:
 

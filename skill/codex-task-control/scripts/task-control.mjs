@@ -9,6 +9,9 @@ export const REVIEW_VERDICTS = Object.freeze(['pending', 'changes_requested', 'a
 export const INTEGRATION_STATUSES = Object.freeze(['not_integrated', 'integrated']);
 export const NOTIFICATION_STATUSES = Object.freeze(['pending', 'sent', 'failed']);
 export const THINKING_LEVELS = Object.freeze(['low', 'medium', 'high']);
+export const DELEGATION_MODES = Object.freeze(['explicit']);
+export const MODEL_CLASSES = Object.freeze(['economical']);
+export const EXECUTION_SURFACES = Object.freeze(['visible_task']);
 
 export class TaskControlError extends Error {
   constructor(code, message) {
@@ -295,6 +298,15 @@ function validateTask(value) {
   if (!has(value.integrationStatus, INTEGRATION_STATUSES)) fail('REGISTRY_INVALID', `integrationStatus 无效: ${value.integrationStatus}`);
   if (!has(value.notificationStatus, NOTIFICATION_STATUSES)) fail('REGISTRY_INVALID', `notificationStatus 无效: ${value.notificationStatus}`);
   if (value.candidateCommit !== null && !nonEmpty(value.candidateCommit)) fail('REGISTRY_INVALID', 'candidateCommit 无效');
+  const delegationFields = ['delegationMode', 'executionSurface', 'modelClass', 'quotaReason'];
+  const presentDelegationFields = delegationFields.filter((key) => key in value);
+  if (presentDelegationFields.length !== 0 && presentDelegationFields.length !== delegationFields.length) fail('REGISTRY_INVALID', '委派字段必须同时存在');
+  if (presentDelegationFields.length === delegationFields.length) {
+    if (!has(value.delegationMode, DELEGATION_MODES)) fail('REGISTRY_INVALID', `delegationMode 无效: ${value.delegationMode}`);
+    if (!has(value.executionSurface, EXECUTION_SURFACES)) fail('REGISTRY_INVALID', `executionSurface 无效: ${value.executionSurface}`);
+    if (!has(value.modelClass, MODEL_CLASSES)) fail('REGISTRY_INVALID', `modelClass 无效: ${value.modelClass}`);
+    if (!nonEmpty(value.quotaReason)) fail('REGISTRY_INVALID', 'quotaReason 无效');
+  }
   if (!isTimestamp(value.updatedAt) || !lifecycleConsistent(value)) fail('REGISTRY_INVALID', '任务生命周期或 updatedAt 无效');
   return { ...value };
 }
@@ -443,6 +455,11 @@ export async function controllerRegisterTask(input) {
   assertSafeThreadId(input.parentThreadId, 'parentThreadId');
   if (![input.title, input.model, input.thinking].every(nonEmpty)) fail('CLI_INVALID_ARGUMENTS', 'register 字段不能为空');
   if (!has(input.thinking, THINKING_LEVELS)) fail('CLI_INVALID_ARGUMENTS', `thinking 非法: ${input.thinking}`);
+  if (input.delegationMode !== 'explicit') fail('DELEGATION_NOT_AUTHORIZED', '默认禁止子智能体；必须由主控显式授权 --delegation explicit');
+  if (input.executionSurface !== 'visible_task') fail('INTERNAL_SUBAGENT_FORBIDDEN', '禁止 Codex 内部 subagent；子任务必须使用可见 task/thread');
+  if (input.modelClass !== 'economical') fail('DELEGATION_MODEL_NOT_ECONOMICAL', '子任务只能使用 economical 模型分类');
+  if (input.thinking !== 'low') fail('DELEGATION_THINKING_TOO_HIGH', '子任务必须使用 low thinking');
+  if (!nonEmpty(input.quotaReason) || input.quotaReason.trim().length < 12) fail('DELEGATION_REASON_REQUIRED', '必须提供不少于 12 个字符的 quota 节省理由');
   return withExclusiveLock(paths.registryPath, async () => {
     const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
     if (registry.tasks.some((task) => task.threadId === input.threadId)) fail('DUPLICATE_THREAD', `重复 threadId: ${input.threadId}`);
@@ -450,12 +467,12 @@ export async function controllerRegisterTask(input) {
     let rootControllers = [...registry.rootControllerThreadIds];
     const parent = registry.tasks.find((task) => task.threadId === input.parentThreadId);
     if (parent) {
-      if (parent.threadId !== input.controllerThreadId) fail('CONTROLLER_UNAUTHORIZED', 'nested child 的 controller 必须等于已登记 parent task.threadId');
+      if (parent.threadId !== input.controllerThreadId) fail('CONTROLLER_UNAUTHORIZED', 'nested visible task 的 controller 必须等于已登记 parent task.threadId');
     } else {
       if (input.parentThreadId !== input.controllerThreadId) fail('PARENT_NOT_REGISTERED', `父任务未登记: ${input.parentThreadId}`);
       if (!rootControllers.includes(input.controllerThreadId)) rootControllers.push(input.controllerThreadId);
     }
-    const task = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title, model: input.model, thinking: input.thinking, status: 'executing', candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
+    const task = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title, model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), status: 'executing', candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
     const next = validateRegistry({ ...registry, rootControllerThreadIds: rootControllers, updatedAt: new Date().toISOString(), tasks: [...registry.tasks, task] }, paths.projectKey, paths.projectRoot);
     await atomicWriteJson(paths.registryPath, next);
     return task;
@@ -614,7 +631,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'query-self') result = (await querySelf({ ...storage, selfThreadId: required(args, '--self') })).task;
   else if (command === 'complete') result = await createCompletionEvent({ ...storage, selfThreadId: required(args, '--self'), candidateCommit: required(args, '--candidate-commit'), status: option(args, '--status') });
   else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason') });
-  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking') });
+  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason') });
   else if (command === 'controller-ingest-completion') result = await controllerIngestCompletion({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-notification-failed') result = await controllerIngestNotificationFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
   else if (command === 'controller-mark-notification-sent') result = await controllerMarkNotificationSent({ ...controllerInput(args) });

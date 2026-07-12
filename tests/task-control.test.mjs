@@ -90,8 +90,12 @@ async function register(codexHome, projectRoot, threadId, overrides = {}) {
     threadId,
     parentThreadId: overrides.parentThreadId ?? (overrides.controllerThreadId ?? defaultController),
     title: overrides.title ?? 'same task',
-    model: overrides.model ?? 'gpt-5.6-luna',
-    thinking: overrides.thinking ?? 'high',
+    model: overrides.model ?? 'economical-worker',
+    thinking: overrides.thinking ?? 'low',
+    delegationMode: overrides.delegationMode ?? 'explicit',
+    executionSurface: overrides.executionSurface ?? 'visible_task',
+    modelClass: overrides.modelClass ?? 'economical',
+    quotaReason: overrides.quotaReason ?? 'Use a cheaper worker for repetitive mechanical execution.',
   });
 }
 
@@ -198,17 +202,39 @@ describe('project-isolated task control', () => {
     assert.equal(final.candidateCommit, 'candidate-2');
   });
 
-  it('allows multiple root controllers but prevents cross-review', async () => {
+  it('allows multiple root controllers and nested visible tasks but prevents cross-review', async () => {
     const codexHome = await freshCodexHome();
     const root = 'C:/work/multi-controller';
     await register(codexHome, root, 'root-child-a', { controllerThreadId: 'root-a', parentThreadId: 'root-a' });
     await register(codexHome, root, 'root-child-b', { controllerThreadId: 'root-b', parentThreadId: 'root-b' });
     await register(codexHome, root, 'nested-a', { controllerThreadId: 'root-child-a', parentThreadId: 'root-child-a' });
     await register(codexHome, root, 'nested-b', { controllerThreadId: 'root-child-b', parentThreadId: 'root-child-b' });
-
     await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-child-a', threadId: 'nested-a' });
     await expectCode(() => controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-child-a', threadId: 'nested-b' }), 'CONTROLLER_UNAUTHORIZED');
     await expectCode(() => controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: 'root-b', threadId: 'root-child-a' }), 'CONTROLLER_UNAUTHORIZED');
+  });
+
+  it('denies subagents by default and enforces economical low-thinking delegation', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/delegation-policy';
+    const base = { codexHome, projectRoot: root, controllerThreadId: defaultController, parentThreadId: defaultController, title: 'mechanical task', model: 'worker-model', thinking: 'low', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Move repetitive mechanical work off the frontier controller.' };
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'missing-auth' }), 'DELEGATION_NOT_AUTHORIZED');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'internal-subagent', delegationMode: 'explicit', executionSurface: 'internal_subagent' }), 'INTERNAL_SUBAGENT_FORBIDDEN');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'frontier-worker', delegationMode: 'explicit', modelClass: 'frontier' }), 'DELEGATION_MODEL_NOT_ECONOMICAL');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'high-thinking', delegationMode: 'explicit', thinking: 'high' }), 'DELEGATION_THINKING_TOO_HIGH');
+    await expectCode(() => controllerRegisterTask({ ...base, threadId: 'no-reason', delegationMode: 'explicit', quotaReason: 'too short' }), 'DELEGATION_REASON_REQUIRED');
+    const allowed = await controllerRegisterTask({ ...base, threadId: 'allowed-worker', delegationMode: 'explicit' });
+    assert.equal(allowed.modelClass, 'economical');
+    assert.equal(allowed.thinking, 'low');
+  });
+
+  it('allows multiple registered visible workers for model-routed work', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/active-worker-limit';
+    await register(codexHome, root, 'worker-one');
+    const second = await register(codexHome, root, 'worker-two');
+    assert.equal(second.status, 'executing');
+    assert.equal(second.executionSurface, 'visible_task');
   });
 
   it('rejects unsafe thread identifiers before any event path is created', async () => {
@@ -262,7 +288,7 @@ describe('project-isolated task control', () => {
 
   it('keeps omitted codexHome calls inside the temporary CODEX_HOME sandbox', async () => {
     const root = 'C:/work/omitted-codex-home';
-    await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'gpt-5.6-luna', thinking: 'high' });
+    await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'economical-worker', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.' });
     const eventPath = await createCompletionEvent({ selfThreadId: 'omitted', candidateCommit: 'candidate-omitted-home' });
     await controllerIngestCompletion({ projectRoot: root, controllerThreadId: defaultController, eventPath });
     assert.equal(eventPath.startsWith(join(sandboxCodexHome, 'task-control')), true);
@@ -381,8 +407,8 @@ describe('project-isolated task control', () => {
       register(codexHome, root, 'nested-a', { controllerThreadId: 'root-a', parentThreadId: 'root-a' }),
       register(codexHome, root, 'nested-b', { controllerThreadId: 'root-b', parentThreadId: 'root-b' }),
     ]);
-    assert.equal((await querySelf({ codexHome, selfThreadId: 'nested-a' })).task.directControllerThreadId, 'root-a');
-    assert.equal((await querySelf({ codexHome, selfThreadId: 'nested-b' })).task.directControllerThreadId, 'root-b');
+    assert.equal((await querySelf({ codexHome, selfThreadId: 'nested-a' })).task.executionSurface, 'visible_task');
+    assert.equal((await querySelf({ codexHome, selfThreadId: 'nested-b' })).task.executionSurface, 'visible_task');
   });
 
   it('rejects an index that points outside the standard registry path', async () => {

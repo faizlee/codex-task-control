@@ -59,9 +59,17 @@ def run_real_scenario() -> dict[str, object]:
             "--title",
             "Audit authentication flow",
             "--model",
-            "gpt-5.6-terra",
+            "economical-worker",
             "--thinking",
             "low",
+            "--delegation",
+            "explicit",
+            "--execution-surface",
+            "visible_task",
+            "--model-class",
+            "economical",
+            "--quota-reason",
+            "Mechanical audit work is cheaper than using the frontier controller.",
         )
         executing = json.loads(run_cli(home, "query-self", "--self", worker))
         event_path = run_cli(
@@ -136,7 +144,7 @@ SCENES = [
         "start": 0.0,
         "end": 3.4,
         "label": "01  REGISTER WORKER",
-        "command": "$ task-control register --thread worker-1 --model gpt-5.6-terra --thinking low",
+        "command": "$ task-control register --thread worker-1 --surface visible_task --model economical-worker",
         "output": [
             ("✓ registered", GREEN),
             ("parent: controller-1", MUTED),
@@ -149,7 +157,8 @@ SCENES = [
         "label": "02  VERIFY ASSIGNMENT",
         "command": "$ task-control query-self --self worker-1",
         "output": [
-            ('"model": "gpt-5.6-terra"', PURPLE),
+            ('"surface": "visible_task"', CYAN),
+            ('"model": "economical-worker"', PURPLE),
             ('"thinking": "low"', AMBER),
             ('"status": "executing"', CYAN),
         ],
@@ -183,7 +192,7 @@ SCENES = [
         "command": "$ controller accept worker-1 && controller integrate worker-1",
         "output": [
             ('"threadId": "worker-1"', TEXT),
-            ('"model": "gpt-5.6-terra"', PURPLE),
+            ('"model": "economical-worker"', PURPLE),
             ('"status": "integrated"', GREEN),
             ("✓ auditable lifecycle complete", GREEN),
         ],
@@ -277,7 +286,7 @@ def render_frame(t: float) -> Image.Image:
         draw = ImageDraw.Draw(image)
         rounded(draw, (190, 215, WIDTH - 190, 475), 24, PANEL, PANEL_EDGE, 2)
         draw.text((WIDTH // 2, 290), "CONTROL THE WORK. NOT JUST THE PROMPT.", font=FONT_TITLE, fill=TEXT, anchor="mm")
-        draw.text((WIDTH // 2, 355), "Open source · Windows-first v0.1", font=FONT, fill=GREEN, anchor="mm")
+        draw.text((WIDTH // 2, 355), "Visible tasks only · Internal subagents forbidden", font=FONT, fill=GREEN, anchor="mm")
         draw.text((WIDTH // 2, 415), "github.com/faizlee/codex-task-control", font=FONT_SMALL, fill=CYAN, anchor="mm")
         image = image.convert("RGB")
 

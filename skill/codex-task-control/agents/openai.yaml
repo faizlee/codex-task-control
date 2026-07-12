@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Auditable lifecycle control for Codex tasks"
-  default_prompt: "Use $codex-task-control to register this visible task and manage its review-gated lifecycle."
+  short_description: "Forbid subagents and route work to visible tasks"
+  default_prompt: "Use $codex-task-control to forbid internal subagents and route justified mechanical work only to registered visible Codex tasks."

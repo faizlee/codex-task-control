@@ -1,6 +1,6 @@
 ---
 name: codex-task-control
-description: Maintain a user-level Codex task ledger across projects, resolve a visible task's direct parent, emit child completion or notification-failure artifacts, and let only the controller apply lifecycle transitions. Use when visible Codex subtasks must be registered, reviewed, retried, or integrated without replacing project-specific AGENTS.md, SOPs, model routing, commands, tests, or acceptance rules.
+description: Forbid internal Codex subagents and require delegated work to run only in user-visible Codex tasks/threads with explicit economical-model routing, quota justification, and a review-gated ledger lifecycle. Use when Codex work must preserve premium-model quota while creating, registering, reviewing, retrying, or integrating visible child tasks without replacing project-specific rules.
 ---
 
 # Codex Task Control
@@ -12,10 +12,13 @@ Use the bundled `scripts/task-control.mjs` as the outer ledger layer. It records
 1. Resolve the project root and read its `AGENTS.md` plus the applicable SOP/workflow sources before doing project work.
 2. Use the project adapter only to locate those sources. Never copy policy text into the adapter or let the adapter override project rules.
 3. Set `CODEX_HOME` (or pass `--codex-home`) so the ledger is stored at `$CODEX_HOME/task-control/`; use `--task-control-home` only when passing the exact task-control root. The index is `projects.json`; each project has an isolated `projects/<project-key>/task-registry.json` and `events/` directory.
-4. The controller registers visible tasks with explicit `model` and `thinking`. The project adapter and model-routing source remain authoritative for the concrete values.
-5. A child may only query itself, create a completion event, or create a notification-failure receipt. It must obtain `parentThreadId` from its registered record and notify only that direct parent.
-6. The controller ingests events and is the only actor allowed to register tasks or mark `changes_requested`, `accepted`, and `integrated`.
-7. Stop at `awaiting_review` after producing the candidate; do not claim acceptance or integration.
+4. Do the work in the controller by default. Never call internal subagent, multi-agent, or `spawn_agent` capabilities. Delegated work must exist as a user-visible Codex task/thread in the sidebar.
+5. Authorize a worker only when the task is mechanical and the expected premium-quota saving exceeds the new context and coordination overhead. Keep planning, architecture, ambiguous judgment, review, and integration in the frontier controller.
+6. Create a visible task shell through the product's task/thread surface, then register it before sending any work. Require `--execution-surface visible_task`, `--delegation explicit`, `--model-class economical`, `--thinking low`, and a concrete `--quota-reason`. If registration fails, do not send the task prompt.
+7. Visible tasks may be siblings or nested visible tasks. Every visible task must be independently registered and remain directly inspectable by the user.
+8. A worker task may only query itself, create a completion event, or create a notification-failure receipt. It must obtain `parentThreadId` from its registered record and notify only that direct parent.
+9. The controller ingests events and is the only actor allowed to register tasks or mark `changes_requested`, `accepted`, and `integrated`.
+10. Stop the worker at `awaiting_review`; never let it claim acceptance or integration. It must not create an internal subagent; any further delegated visible task must independently pass the same registration gate.
 
 ## Commands
 
@@ -24,7 +27,7 @@ node scripts/task-control.mjs query-parent --self <thread-id> --codex-home <CODE
 node scripts/task-control.mjs complete --self <thread-id> --candidate-commit <candidate> --codex-home <CODEX_HOME>
 node scripts/task-control.mjs notification-failed --self <thread-id> --reason "..." --codex-home <CODEX_HOME>
 
-node scripts/task-control.mjs register --project-root <root> --controller <controller-id> --thread <thread-id> --parent <parent-id> --title "..." --model <model> --thinking <low|medium|high> --codex-home <CODEX_HOME>
+node scripts/task-control.mjs register --project-root <root> --controller <controller-id> --thread <thread-id> --parent <parent-id> --title "..." --model <economical-model> --thinking low --delegation explicit --execution-surface visible_task --model-class economical --quota-reason "Mechanical work is cheaper than using the frontier controller." --codex-home <CODEX_HOME>
 node scripts/task-control.mjs controller-ingest-completion --project-root <root> --controller <controller-id> --event <event.json> --codex-home <CODEX_HOME>
 node scripts/task-control.mjs controller-mark-notification-sent --project-root <root> --controller <controller-id> --thread <thread-id> --codex-home <CODEX_HOME>
 node scripts/task-control.mjs controller-ingest-notification-failed --project-root <root> --controller <controller-id> --receipt <receipt.json> --codex-home <CODEX_HOME>
@@ -42,5 +45,6 @@ Use `references/lifecycle.md` for the schema, state invariants, event contract, 
 - Treat duplicate self-thread IDs across projects, stale events, wrong parents/projects, cycles, invalid enums, and contradictory lifecycle records as errors.
 - Reject unsafe thread identifiers before registry reads or event path construction; never interpolate `/`, `\\`, `.`, `..`, or whitespace into an events path.
 - Keep provider calls at zero for ledger-only work; this skill records local control evidence and does not invoke a model provider.
+- Forbid internal subagents. Reject any execution surface other than `visible_task`, missing explicit authorization, frontier/high-thinking workers, and missing quota justification.
 - Use atomic registry replacement and exclusive event-file creation. Lock files contain `pid`, `createdAt`, and `nonce`; stale recovery requires a threshold check plus repeated owner verification, and release deletes only a matching nonce.
 - Run tests with a temporary `--codex-home` or `--task-control-home`; omitted storage arguments must resolve through a test-only `CODEX_HOME` sandbox.

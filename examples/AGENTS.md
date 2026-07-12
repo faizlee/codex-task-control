@@ -1,6 +1,9 @@
 # Codex task-control policy
 
-- Register every visible child task before starting it. Record the project root, direct parent, model, and reasoning level.
+- Never create Codex internal subagents or use `spawn_agent`. Keep frontier reasoning, planning, review, and integration in the controller.
+- Authorize a visible worker only for mechanical work when premium-quota savings exceed context and coordination overhead.
+- Create delegated work only as a user-visible Codex task/thread. Register it with `executionSurface: visible_task`, explicit delegation, an economical model class, low reasoning, and a concrete quota reason before sending its prompt.
+- Visible sibling and nested tasks are allowed only when each remains independently visible and registered.
 - A child task may query only its own record, emit a completion event, or emit a notification-failure receipt.
 - A child must resolve its direct parent from the ledger and notify only that parent.
 - Only the controller may register tasks, ingest events, or mark `changes_requested`, `accepted`, and `integrated`.

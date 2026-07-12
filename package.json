@@ -1,8 +1,8 @@
 {
   "name": "codex-task-control",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
-  "description": "A local, review-gated lifecycle ledger for Codex tasks and subagents.",
+  "description": "A quota-aware gate that forbids internal subagents and routes work to visible Codex tasks.",
   "type": "module",
   "scripts": {
     "check": "node --check skill/codex-task-control/scripts/task-control.mjs",
