@@ -16,6 +16,7 @@ export const TITLE_SYNC_STATUSES = Object.freeze(['pending', 'synced', 'failed']
 export const ARCHIVE_STATUSES = Object.freeze(['not_ready', 'pending', 'archived', 'failed']);
 export const WORK_CLASSES = Object.freeze(['repeatable', 'bounded_reasoning']);
 export const WORK_CLASS_MODELS = Object.freeze({ repeatable: 'gpt-5.6-luna', bounded_reasoning: 'gpt-5.6-terra' });
+export const WORK_CLASS_THINKING = Object.freeze({ repeatable: Object.freeze(['medium']), bounded_reasoning: Object.freeze(['medium', 'high']) });
 export const DECISION_STATUSES = Object.freeze(['resolved']);
 export const EXECUTION_STATUSES = Object.freeze(['running', 'stopped', 'awaiting_review', 'terminal']);
 export const NEXT_OWNERS = Object.freeze(['worker', 'controller', 'undecided', 'none']);
@@ -672,12 +673,14 @@ export async function controllerRegisterTask(input) {
   if (input.delegationMode !== 'explicit') fail('DELEGATION_NOT_AUTHORIZED', '默认禁止子智能体；必须由主控显式授权 --delegation explicit');
   if (input.executionSurface !== 'visible_task') fail('INTERNAL_SUBAGENT_FORBIDDEN', '禁止 Codex 内部 subagent；子任务必须使用可见 task/thread');
   if (input.modelClass !== 'economical') fail('DELEGATION_MODEL_NOT_ECONOMICAL', '子任务只能使用 economical 模型分类');
-  if (input.thinking !== 'low') fail('DELEGATION_THINKING_TOO_HIGH', '子任务必须使用 low thinking');
+  if (input.thinking === 'low') fail('DELEGATION_THINKING_TOO_LOW', '可见子任务至少必须使用 medium thinking');
   if (!nonEmpty(input.quotaReason) || input.quotaReason.trim().length < 12) fail('DELEGATION_REASON_REQUIRED', '必须提供不少于 12 个字符的 quota 节省理由');
   if (input.workClass === 'controller_only') fail('DELEGATION_CONTROLLER_ONLY', 'controller_only 工作必须由前沿主控完成');
   if (!has(input.workClass, WORK_CLASSES)) fail('DELEGATION_WORK_CLASS_REQUIRED', '必须将可委派工作分类为 repeatable 或 bounded_reasoning');
   const expectedModel = WORK_CLASS_MODELS[input.workClass];
   if (input.model !== expectedModel) fail('DELEGATION_MODEL_WORK_CLASS_MISMATCH', `${input.workClass} 必须使用 ${expectedModel}，不能使用 ${input.model}`);
+  const allowedThinking = WORK_CLASS_THINKING[input.workClass];
+  if (!allowedThinking.includes(input.thinking)) fail('DELEGATION_THINKING_WORK_CLASS_MISMATCH', `${input.workClass} 的 thinking 必须是 ${allowedThinking.join(' 或 ')}，不能使用 ${input.thinking}`);
   if (input.decisionStatus !== 'resolved') fail('DELEGATION_DECISIONS_UNRESOLVED', '架构、合同、信任源、错误策略和验收预期必须在委派前已确定');
   if (![input.scope, input.acceptance, input.forbiddenDecisions].every(nonEmpty)) fail('DELEGATION_EVIDENCE_REQUIRED', '必须提供明确 scope、acceptance 和 forbiddenDecisions');
   return withExclusiveLock(paths.registryPath, async () => {
@@ -718,6 +721,27 @@ export async function auditModelRouting(input = {}) {
       }
       const expectedModel = WORK_CLASS_MODELS[task.workClass];
       if (task.model !== expectedModel) violations.push({ projectKey: registry.projectKey, projectRoot: registry.projectRoot, threadId: task.threadId, directControllerThreadId: task.directControllerThreadId, title: task.title, status: task.status, workClass: task.workClass, currentModel: task.model, expectedModel, reason: 'model_work_class_mismatch' });
+    }
+  }
+  return { compliant: violations.length === 0, activeTaskCount, violationCount: violations.length, violations, auditedAt: new Date().toISOString() };
+}
+
+export async function auditThinkingRouting(input = {}) {
+  const home = resolveTaskControlHome(input);
+  const index = await readIndex(home);
+  const violations = [];
+  let activeTaskCount = 0;
+  for (const project of index.projects) {
+    const { registry } = await readProjectRegistry(home, project);
+    for (const task of registry.tasks) {
+      if (isTerminalTask(task)) continue;
+      activeTaskCount += 1;
+      if (!has(task.workClass, WORK_CLASSES)) {
+        violations.push({ projectKey: registry.projectKey, projectRoot: registry.projectRoot, threadId: task.threadId, directControllerThreadId: task.directControllerThreadId, title: task.title, status: task.status, workClass: task.workClass ?? null, currentThinking: task.thinking, allowedThinking: null, reason: 'legacy_missing_routing_evidence' });
+        continue;
+      }
+      const allowedThinking = WORK_CLASS_THINKING[task.workClass];
+      if (!allowedThinking.includes(task.thinking)) violations.push({ projectKey: registry.projectKey, projectRoot: registry.projectRoot, threadId: task.threadId, directControllerThreadId: task.directControllerThreadId, title: task.title, status: task.status, workClass: task.workClass, currentThinking: task.thinking, allowedThinking, reason: 'thinking_work_class_mismatch' });
     }
   }
   return { compliant: violations.length === 0, activeTaskCount, violationCount: violations.length, violations, auditedAt: new Date().toISOString() };
@@ -1023,6 +1047,7 @@ export async function runCli(args = process.argv.slice(2)) {
   let result;
   if (command === 'query-parent') result = await queryParent({ ...storage, selfThreadId: required(args, '--self') });
   else if (command === 'audit-model-routing') result = await auditModelRouting(storage);
+  else if (command === 'audit-thinking-routing') result = await auditThinkingRouting(storage);
   else if (command === 'audit-archive-backlog') result = await auditArchiveBacklog(storage);
   else if (command === 'query-self') {
     const task = (await querySelf({ ...storage, selfThreadId: required(args, '--self') })).task;
