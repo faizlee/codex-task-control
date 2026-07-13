@@ -32,6 +32,50 @@ import {
 
 const delay = () => new Promise((resolve) => setTimeout(resolve, 5));
 
+function implementationManifest({ visual = false } = {}) {
+  return {
+    schemaVersion: 1,
+    contractRevision: 'contract-r1',
+    reuseRequirements: ['Reuse the existing parser and test fixture.'],
+    forbiddenNewPaths: ['src/replacement/**'],
+    forbiddenReimplementations: ['Do not reimplement the existing parser.'],
+    stageGates: [
+      { id: 'reuse-check', required: true, description: 'Confirm the existing path is reused.', requiredEvidence: ['inspection'] },
+      { id: 'verification', required: true, description: 'Run the fixed verification command.', requiredEvidence: ['targeted-test'] },
+    ],
+    evidenceCommands: [
+      { id: 'inspection', command: 'git diff --check' },
+      { id: 'targeted-test', command: 'npm test -- contract' },
+    ],
+    errorPolicy: { mode: 'stop_on_error', rules: ['Stop on any ERROR output.', 'Do not weaken acceptance criteria.'] },
+    ...(visual ? { visualOracle: { stageId: 'verification', reference: 'docs/oracle.png', criteria: ['No overlap.', 'No ERROR banner.'] } } : {}),
+  };
+}
+
+function implementationInput(taskControlHome, projectRoot, overrides = {}) {
+  return {
+    taskControlHome,
+    projectRoot,
+    controllerThreadId: 'contract-controller',
+    parentThreadId: 'contract-controller',
+    threadId: overrides.threadId ?? 'contract-worker',
+    title: 'Implement fixed contract',
+    model: 'gpt-5.6-terra',
+    thinking: 'medium',
+    delegationMode: 'explicit',
+    executionSurface: 'visible_task',
+    modelClass: 'economical',
+    quotaReason: 'Bounded implementation saves meaningful frontier quota.',
+    workClass: 'bounded_reasoning',
+    decisionStatus: 'resolved',
+    scope: 'Only implement the paths named by the bound contract.',
+    acceptance: 'Complete every required stage with the named evidence.',
+    forbiddenDecisions: 'Do not change the contract, error policy, or acceptance oracle.',
+    taskMode: overrides.taskMode ?? 'implementation',
+    implementationContractPath: overrides.implementationContractPath,
+  };
+}
+
 async function invokeCli(args) {
   let output = '';
   const originalWrite = process.stdout.write;
@@ -45,7 +89,8 @@ async function invokeCli(args) {
 }
 
 async function register(input) {
-  const task = await controllerRegisterTask(input);
+  const registrationInput = { taskMode: 'control_only', ...input };
+  const task = await controllerRegisterTask(registrationInput);
   const synced = await controllerRecordTitleSynced({ ...input, title: task.desiredThreadTitle });
   const dispatched = await controllerRecordDispatched(input);
   return { task, synced, dispatched };
@@ -166,6 +211,92 @@ test('project adapter supports ordinary project policy references and rejects le
   }
 });
 
+test('implementation registration fails closed without a complete bound contract', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-contract-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-contract-project-'));
+  try {
+    const input = implementationInput(taskControlHome, projectRoot);
+    await assert.rejects(controllerRegisterTask(input), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_CONTRACT_REQUIRED');
+    await assert.rejects(controllerRegisterTask({ ...input, taskMode: undefined }), (error) => error instanceof TaskControlError && error.code === 'TASK_MODE_REQUIRED');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('visual implementation requires a visual oracle', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-visual-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-visual-project-'));
+  const contractPath = join(projectRoot, 'visual-contract.json');
+  try {
+    await writeFile(contractPath, `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerRegisterTask(implementationInput(taskControlHome, projectRoot, { taskMode: 'visual_implementation', implementationContractPath: 'visual-contract.json' })), (error) => error instanceof TaskControlError && error.code === 'VISUAL_ORACLE_REQUIRED');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('implementation progress enforces staged evidence before completion', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-stages-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-stages-project-'));
+  const contractPath = join(projectRoot, 'implementation-contract.json');
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  try {
+    await writeFile(contractPath, `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    assert.equal(registered.taskMode, 'implementation');
+    assert.equal(registered.dispatchAllowed, false);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    const dispatched = await controllerRecordDispatched(input);
+    assert.equal(dispatched.dispatchAllowed, true);
+
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'too-early' }), (error) => error instanceof TaskControlError && error.code === 'REQUIRED_STAGE_INCOMPLETE');
+    await assert.rejects(createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'missing evidence', stageId: 'reuse-check', evidence: [] }), (error) => error instanceof TaskControlError && error.code === 'STAGE_EVIDENCE_MISSING');
+
+    await delay();
+    const reuseEvent = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Existing path inspected and retained.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'git-diff-check.txt' }] });
+    let progressed = await controllerIngestProgress({ ...input, eventPath: reuseEvent });
+    assert.deepEqual(progressed.completedStages, ['reuse-check']);
+    assert.deepEqual(progressed.missingStages, ['verification']);
+
+    await delay();
+    const verificationEvent = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Targeted verification passed.', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'test-output.txt' }] });
+    progressed = await controllerIngestProgress({ ...input, eventPath: verificationEvent });
+    assert.deepEqual(progressed.completedStages, ['reuse-check', 'verification']);
+    assert.deepEqual(progressed.missingStages, []);
+
+    await delay();
+    const completionEvent = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'candidate-contract-1' });
+    const completed = await controllerIngestCompletion({ ...input, eventPath: completionEvent });
+    assert.equal(completed.status, 'awaiting_review');
+    assert.equal(completed.contractVersion, 'contract-r1');
+    assert.deepEqual(completed.missingStages, []);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('a worker cannot change the controller-fixed contract or error policy', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-drift-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-drift-project-'));
+  const contractPath = join(projectRoot, 'implementation-contract.json');
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  try {
+    const manifest = implementationManifest();
+    await writeFile(contractPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    manifest.errorPolicy.rules = ['Continue after ERROR and weaken acceptance.'];
+    await writeFile(contractPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerRecordDispatched(input), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_CONTRACT_DRIFT');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 async function withFixture(run) {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-'));
   const projectRoot = `E:\\work\\project\\scan-${Date.now()}`;
@@ -219,6 +350,7 @@ test('registration allocates readable hierarchy and blocks dispatch until title 
     scope: 'Only inspect and update the named provider call sites.',
     acceptance: 'Run the targeted unit test and require a zero exit code.',
     forbiddenDecisions: 'Do not change provider contracts or routing policy.',
+    taskMode: 'control_only',
   };
   try {
     const root = await controllerRegisterTask(rootInput);
@@ -272,6 +404,7 @@ test('adaptive heartbeat starts on real dispatch, renews on progress, and reorde
     scope: 'Only run the named mechanical verification.',
     acceptance: 'The named verification exits with code zero.',
     forbiddenDecisions: 'Do not change contracts or test expectations.',
+    taskMode: 'control_only',
   };
   try {
     const registered = await controllerRegisterTask(input);
@@ -376,7 +509,7 @@ test('v0.3 changes-requested titles migrate safely to a stopped pending decision
     const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const task = registry.tasks[0];
-    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason']) delete task[key];
+    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason', 'taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'stageProgress']) delete task[key];
     task.status = 'changes_requested';
     task.reviewVerdict = 'changes_requested';
     task.desiredThreadTitle = '返工｜01 审计 Provider 调用';
@@ -389,6 +522,8 @@ test('v0.3 changes-requested titles migrate safely to a stopped pending decision
     const scan = await controllerScanPendingEvents(fixture);
     assert.deepEqual(scan.routingQueue, [{ threadId: fixture.threadId, displayKey: '01', status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: 'unclassified' }]);
     assert.deepEqual(scan.threadActions, [{ type: 'set_thread_title', threadId: fixture.threadId, title: '待决｜01 审计 Provider 调用' }]);
+    const unchanged = JSON.parse(await readFile(registryPath, 'utf8'));
+    assert.equal('taskMode' in unchanged.tasks[0], false, 'read-only migration must not rewrite the old registry');
   });
 });
 
@@ -397,7 +532,7 @@ test('CLI enforces readiness and drives an explicit controller reclaim flow', as
   const projectRoot = 'E:\\work\\project\\cli-routing';
   const common = ['--task-control-home', taskControlHome, '--project-root', projectRoot, '--controller', 'controller-cli', '--thread', 'worker-cli'];
   try {
-    const registered = await invokeCli(['register', ...common, '--parent', 'controller-cli', '--title', 'Implement bounded validator', '--model', 'gpt-5.6-terra', '--thinking', 'high', '--delegation', 'explicit', '--execution-surface', 'visible_task', '--model-class', 'economical', '--quota-reason', 'A bounded validator implementation saves frontier quota.', '--work-class', 'bounded_reasoning', '--decision-status', 'resolved', '--scope', 'Only modify the named validator module.', '--acceptance', 'Run the validator unit test with a zero exit code.', '--forbidden-decisions', 'Do not change persistence trust or error policy.']);
+    const registered = await invokeCli(['register', ...common, '--parent', 'controller-cli', '--title', 'Implement bounded validator', '--model', 'gpt-5.6-terra', '--thinking', 'high', '--delegation', 'explicit', '--execution-surface', 'visible_task', '--model-class', 'economical', '--quota-reason', 'A bounded validator implementation saves frontier quota.', '--work-class', 'bounded_reasoning', '--decision-status', 'resolved', '--scope', 'Only modify the named validator module.', '--acceptance', 'Run the validator unit test with a zero exit code.', '--forbidden-decisions', 'Do not change persistence trust or error policy.', '--task-mode', 'control_only']);
     assert.equal(registered.dispatchAllowed, false);
     await invokeCli(['controller-record-title-synced', ...common, '--title', registered.desiredThreadTitle]);
     await invokeCli(['controller-record-dispatched', ...common]);

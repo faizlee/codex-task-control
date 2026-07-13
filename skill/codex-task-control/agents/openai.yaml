@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Route visible tasks with adaptive heartbeat recovery"
-  default_prompt: "Use $codex-task-control to preflight Sol reasoning, route economical work only to registered visible tasks, synchronize sidebar titles, renew adaptive heartbeat leases from real progress, and keep failed sidebar actions auditable without polling them forever."
+  short_description: "Route visible tasks with contract and review gates"
+  default_prompt: "Use $codex-task-control to preflight Sol reasoning, bind implementation work to a versioned contract, route economical work only to registered visible tasks, require staged evidence, synchronize sidebar titles, and renew adaptive heartbeat leases from real progress."

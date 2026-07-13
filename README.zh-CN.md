@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.5.2 是 Windows-first preview。台账与路由预检完全保存在本地，不会调用模型 provider。
+> v0.6.0 是 Windows-first preview。台账、合同校验与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,13 +12,17 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.5.2 已经解决什么
+## v0.6.0 已经解决什么
 
 - 按项目根目录隔离任务注册表。
 - 记录直接父任务、controller、执行界面、模型等级、reasoning、额度理由和生命周期状态。
 - 拒绝内部 subagent，只接受用户可见的 Codex task/thread。
 - 委派必须显式授权，并使用 economical 模型与至少 medium reasoning；low 直接 fail closed。
 - 架构/合同/错误策略未决、scope 或验收证据不明确时，登记直接 fail closed。
+- 新登记必须显式分类为 `control_only`、`implementation` 或 `visual_implementation`；代码、资源、UI、测试和截图 runner 修改必须绑定项目根目录内的版本化 JSON 实施合同。
+- 台账保存合同快照与 SHA-256 摘要；worker 改动复用要求、禁建路径、阶段、证据命令、错误策略或视觉预言时，派发、进度或完成都会 fail closed。
+- 实施任务必须按顺序提交命名阶段与证据引用；当前轮次所有 required stage 入账前不能 complete。
+- completion 与 review 输出明确返回合同版本/摘要以及已完成、缺失阶段；旧台账只读时安全识别为 `legacy_unclassified`，不会因扫描被重写。
 - 将 `repeatable` 硬绑定到 `gpt-5.6-luna`，将 `bounded_reasoning` 硬绑定到 `gpt-5.6-terra`；旧模型或错配模型在登记时直接 fail closed。
 - 将 `repeatable` 的 reasoning 固定为 medium，允许 `bounded_reasoning` 使用 medium 或 high。
 - Sol 主控默认使用 high；边界明确的短主控工作允许 medium；xhigh/max 必须先通过零 provider 调用的 `audit-controller-routing`，并留下明确升级证据。
@@ -32,14 +36,14 @@
 - 把可执行清理与历史债务分开：标题/归档工具调用一旦记录失败，仍可审计，但不会反复生成动作或单独维持 heartbeat。
 - 只有登记的直接主控可以带原因显式重新排队失败的侧边栏动作。
 - `integrated`、`blocked` 或 `reclaimed` 的可见任务按后代优先顺序归档，但完整台账历史永久保留。
-- 子任务只能查询自己、生成 completion event 或通知失败回执。
+- 子任务只能查询自己、生成带阶段证据的 progress event、completion event 或通知失败回执。
 - 只有 controller 可以登记、要求返工、接受和集成。
 - 拒绝不安全 task ID、旧事件、项目错配、父子环和矛盾状态。
 - 使用原子写入和保守的 stale-lock 恢复协议。
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.5.2 不做什么
+## v0.6.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
@@ -73,6 +77,8 @@ Sol 主控默认使用 high；medium 只用于边界明确的短控制工作。x
 
 ## 快速开始
 
+实施任务先把 [`implementation-contract.example.json`](skill/codex-task-control/assets/implementation-contract.example.json) 复制到项目内，替换成项目自己的路径、阶段、命令和错误策略，并赋予明确 revision 或 commit。视觉任务可以直接从 [`visual-implementation-contract.example.json`](skill/codex-task-control/assets/visual-implementation-contract.example.json) 开始。控制面只校验结构与摘要身份，具体实施规则仍由项目文档负责。
+
 ```powershell
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $TaskControl = "$CodexHome\skills\codex-task-control\scripts\task-control.mjs"
@@ -100,7 +106,9 @@ $Registration = node $TaskControl register `
   --decision-status "resolved" `
   --scope "Only update the named authentication tests." `
   --acceptance "Run the targeted authentication test successfully." `
-  --forbidden-decisions "Do not change authentication contracts or error policy."
+  --forbidden-decisions "Do not change authentication contracts or error policy." `
+  --task-mode "implementation" `
+  --implementation-contract "docs/codex-task-contract.json"
 
 $Registration = $Registration | ConvertFrom-Json
 ```
@@ -142,7 +150,11 @@ node $TaskControl controller-retry-thread-action `
 子任务到达真实检查点时可以发送进度；主控成功入账后才会续租：
 
 ```powershell
-node $TaskControl progress --self "worker-1" --summary "Targeted tests are running."
+node $TaskControl progress `
+  --self "worker-1" `
+  --summary "已复用并检查现有认证路径。" `
+  --stage "reuse-check" `
+  --evidence-ref "diff-check=artifacts/diff-check.txt"
 node $TaskControl controller-ingest-progress `
   --project-root "C:\work\example" `
   --controller "controller-1" `

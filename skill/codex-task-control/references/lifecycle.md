@@ -20,7 +20,7 @@ Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControll
 
 Each `controllerHeartbeats` entry stores one direct controller's `generation`, `status`, `dueAt`, `intervalMs`, `reason`, optional triggering task, and `updatedAt`. It is a durable lease description, not the host automation itself. `armed` requires a positive interval and timestamp; `cancelled` requires both to be null. Every rearm increments the generation so a delayed replaced automation can prove it is stale.
 
-New registrations also store routing evidence: `workClass`, `decisionStatus`, `scope`, `acceptance`, and `forbiddenDecisions`. Execution truth is separate from review truth through `executionStatus`, `nextOwner`, `attemptCount`, `failureClass`, `changesRequestedReason`, and `reclaimedReason`. Legacy records without these complete field groups remain readable and gain deterministic execution defaults during the next controller mutation.
+New registrations also store routing evidence: `workClass`, `decisionStatus`, `scope`, `acceptance`, and `forbiddenDecisions`, plus an explicit `taskMode`. Execution truth is separate from review truth through `executionStatus`, `nextOwner`, `attemptCount`, `failureClass`, `changesRequestedReason`, and `reclaimedReason`. Legacy records without these complete field groups remain readable and gain deterministic execution defaults during the next controller mutation. Records created before v0.6.0 that lack the complete implementation-control field group are read in memory as `taskMode: legacy_unclassified`; a read-only scan does not rewrite the registry. New registrations missing `taskMode` fail with `TASK_MODE_REQUIRED`.
 
 Allowed values:
 
@@ -38,6 +38,7 @@ Allowed values:
 - `executionStatus`: `running`, `stopped`, `awaiting_review`, `terminal`.
 - `nextOwner`: `worker`, `controller`, `undecided`, `none`.
 - `failureClass`: `mechanical`, `comprehension`, `judgment`, `spec_missing`; `unclassified` is migration-only.
+- `taskMode`: migration-only `legacy_unclassified`, or new-registration values `control_only`, `implementation`, `visual_implementation`.
 - New delegated workers require `delegationMode: explicit`, `executionSurface: visible_task`, `modelClass: economical`, and work-class-compatible `medium` or `high` thinking.
 
 ## Delegation gate
@@ -45,6 +46,24 @@ Allowed values:
 Internal Codex subagents are forbidden. Delegated work must be a user-visible Codex task/thread. Registration rejects missing explicit authorization, any execution surface other than `visible_task`, any model class other than `economical`, low or work-class-incompatible thinking, a quota reason shorter than 12 characters, unresolved decisions, `controller_only` work, missing scope/acceptance/forbidden-decision evidence, and the placeholder title `等待主控登记`.
 
 Use `repeatable` only when the worker can follow explicit rules and a fixed test oracle. Use `bounded_reasoning` only after the controller has resolved contracts and policy choices. Architecture, contract conflicts, persistence-trust selection, stop/continue policy, ambiguous fixtures, planning, review, and integration are controller-only even when a stronger worker might succeed.
+
+## Implementation contract gate
+
+`control_only` is limited to ledger, audit, inspection, or other work that does not change project code, resources, UI, tests, or screenshot runners. Any such implementation uses `implementation`; work with a visual acceptance surface uses `visual_implementation`. The controller cannot use `control_only` as an escape hatch for implementation work.
+
+An implementation registration binds `implementationContractPath` to a JSON file inside the normalized project root. Schema version 1 allows only these fields:
+
+- at least one of non-empty `contractRevision` or `contractCommit`;
+- non-empty `reuseRequirements`;
+- `forbiddenNewPaths` and `forbiddenReimplementations` arrays;
+- ordered `stageGates`, each with unique `id`, `required`, `description`, and non-empty `requiredEvidence` references;
+- unique named `evidenceCommands` with `id` and `command`;
+- controller-fixed `errorPolicy` with non-empty `mode` and `rules`;
+- for `visual_implementation`, a `visualOracle` whose `stageId` points to a required gate and which includes a reference plus non-empty criteria.
+
+Registration stores the normalized manifest fields, absolute path, schema version, and SHA-256 digest. Dispatch, progress creation/ingestion, and completion creation/ingestion reread the file and compare the digest. Any change—including a worker changing `errorPolicy`, command text, stage gates, or oracle—fails with `IMPLEMENTATION_CONTRACT_DRIFT`; the direct controller must reclaim the task and explicitly bind a new revision rather than silently updating the ledger. The control plane validates structure and evidence references but never interprets project source code or decides whether command output is semantically correct.
+
+Each accepted implementation progress event appends a `stageProgress` record containing stage ID, summary, named evidence references, `attemptCount`, timestamp, contract digest, and contract version. Required predecessor stages must already be ingested, every required evidence ID must be present, and a stage can be completed only once per attempt. Mechanical rework keeps the contract snapshot but increments `attemptCount`, so all required stages must be completed again for the new attempt. Completion fails with `REQUIRED_STAGE_INCOMPLETE` until the current attempt has every required stage.
 
 `audit-model-routing` scans only non-terminal tasks across project registries. It reports legacy records without routing evidence and records whose actual model does not match their `workClass`. The audit is read-only; remediation belongs to the recorded direct controller, which must stop or reclaim the old task and register a replacement rather than mutating model identity in place.
 
@@ -76,9 +95,9 @@ Only the task's `directControllerThreadId` may perform register/ingest for that 
 
 Self lookup scans the project index. Exactly one matching task is required; zero matches and matches in multiple projects both fail closed. Parent identity always comes from that task's `parentThreadId`. Thread IDs are path-safe identifiers containing only letters, digits, colon, underscore, and hyphen.
 
-Progress artifacts are independently created JSON files with `schemaVersion: 1`, `type: "task_progress"`, the task's identity, current `attemptCount`, a non-empty checkpoint `summary`, and an ISO `createdAt`. Completion artifacts use `type: "task_completed"`, the same identity, `status: "awaiting_review"`, non-empty `candidateCommit`, and `createdAt`. Notification failure receipts have `type: "notification_failed"`, the same identity fields, a non-empty `reason`, and `createdAt`.
+Progress artifacts are independently created JSON files with `schemaVersion: 1`, `type: "task_progress"`, the task's identity, current `attemptCount`, a non-empty checkpoint `summary`, and an ISO `createdAt`. Implementation progress also carries `stageId`, named evidence references, task mode, contract version/digest, and the current completed/missing-stage summary. Completion artifacts use `type: "task_completed"`, the same identity, `status: "awaiting_review"`, non-empty `candidateCommit`, contract summary, and `createdAt`. Notification failure receipts have `type: "notification_failed"`, the same identity fields, a non-empty `reason`, and `createdAt`.
 
-The controller verifies project, parent, attempt, timestamp freshness, and lifecycle before ingesting. Progress and completion are accepted only after `controller-record-dispatched` has recorded the current attempt and while `status=executing`; a stopped `changes_requested` task cannot submit. Explicit rework must be title-synced, really sent, and separately recorded before the second attempt can emit artifacts. Old or repeated artifacts are rejected.
+The controller verifies project, parent, attempt, timestamp freshness, lifecycle, and implementation-contract identity before ingesting. Progress and completion are accepted only after `controller-record-dispatched` has recorded the current attempt and while `status=executing`; a stopped `changes_requested` task cannot submit. Explicit rework must be title-synced, really sent, and separately recorded before the second attempt can emit artifacts. Old, repeated, contract-mismatched, or stage-incomplete artifacts are rejected. `controller-scan-events`, completion command output, notifications, and review queues expose contract version, digest, completed stages, and missing stages so the direct controller does not have to infer them from prose.
 
 Only the direct controller may mark a non-terminal task `blocked`, and it must persist a non-empty `blockedReason`. Use this for genuinely superseded or impossible work; never delete history merely to stop a heartbeat.
 

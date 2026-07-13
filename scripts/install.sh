@@ -11,25 +11,6 @@ if [[ ! -d "$source_dir" ]]; then
   exit 1
 fi
 
-if archive_json="$(node "$target/scripts/task-control.mjs" audit-archive-backlog --codex-home "$codex_home")"; then
-  printf '%s' "$archive_json" | node -e '
-    let raw = "";
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (chunk) => { raw += chunk; });
-    process.stdin.on("end", () => {
-      const audit = JSON.parse(raw);
-      if (audit.backlogCount === 0) {
-        console.log("Archive backlog audit: compliant (no terminal sidebar cleanup pending)");
-        return;
-      }
-      console.error(`WARNING: Archive backlog audit found ${audit.backlogCount} terminal debt item(s) across ${audit.ownerCount} direct-controller plan(s); ${audit.readyActionCount} thread action(s) are ready now. Each recorded direct controller applies only returned actions. Failed or descendant-blocked debt stays auditable without keeping a heartbeat and requires an explicit owner retry when appropriate.`);
-      for (const owner of audit.owners) console.error(`WARNING: [${owner.projectRoot}] controller=${owner.controllerThreadId} backlog=${owner.tasks.length} readyActions=${owner.threadActions.length}`);
-    });
-  '
-else
-  echo "WARNING: Skill installed, but archive backlog audit could not run." >&2
-fi
-
 if [[ -e "$target" && "${FORCE:-0}" != "1" ]]; then
   echo "Target already exists: $target. Re-run with FORCE=1 to replace it." >&2
   exit 1
@@ -76,4 +57,23 @@ if thinking_json="$(node "$target/scripts/task-control.mjs" audit-thinking-routi
   '
 else
   echo "WARNING: Skill installed, but thinking routing audit could not run." >&2
+fi
+
+if archive_json="$(node "$target/scripts/task-control.mjs" audit-archive-backlog --codex-home "$codex_home")"; then
+  printf '%s' "$archive_json" | node -e '
+    let raw = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { raw += chunk; });
+    process.stdin.on("end", () => {
+      const audit = JSON.parse(raw);
+      if (audit.backlogCount === 0) {
+        console.log("Archive backlog audit: compliant (no terminal sidebar cleanup pending)");
+        return;
+      }
+      console.error(`WARNING: Archive backlog audit found ${audit.backlogCount} terminal debt item(s) across ${audit.ownerCount} direct-controller plan(s); ${audit.readyActionCount} thread action(s) are ready now. Each recorded direct controller applies only returned actions. Failed or descendant-blocked debt stays auditable without keeping a heartbeat and requires an explicit owner retry when appropriate.`);
+      for (const owner of audit.owners) console.error(`WARNING: [${owner.projectRoot}] controller=${owner.controllerThreadId} backlog=${owner.tasks.length} readyActions=${owner.threadActions.length}`);
+    });
+  '
+else
+  echo "WARNING: Skill installed, but archive backlog audit could not run." >&2
 fi

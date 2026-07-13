@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "contractRevision": "example-r1",
+  "reuseRequirements": [
+    "Reuse the existing implementation path and named project fixtures."
+  ],
+  "forbiddenNewPaths": [
+    "src/replacement/**"
+  ],
+  "forbiddenReimplementations": [
+    "Do not rebuild an existing module under a new path."
+  ],
+  "stageGates": [
+    {
+      "id": "reuse-check",
+      "required": true,
+      "description": "Confirm the existing implementation path and fixtures are reused.",
+      "requiredEvidence": [
+        "diff-check"
+      ]
+    },
+    {
+      "id": "verification",
+      "required": true,
+      "description": "Run the project-fixed targeted verification.",
+      "requiredEvidence": [
+        "targeted-test"
+      ]
+    }
+  ],
+  "evidenceCommands": [
+    {
+      "id": "diff-check",
+      "command": "git diff --check"
+    },
+    {
+      "id": "targeted-test",
+      "command": "replace-with-project-command"
+    }
+  ],
+  "errorPolicy": {
+    "mode": "stop_on_error",
+    "rules": [
+      "Stop on any command failure or ERROR output.",
+      "Do not weaken the acceptance criteria or change this policy."
+    ]
+  }
+}

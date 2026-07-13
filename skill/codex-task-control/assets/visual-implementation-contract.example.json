@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "contractRevision": "visual-example-r1",
+  "reuseRequirements": [
+    "Reuse the existing UI component and screenshot runner."
+  ],
+  "forbiddenNewPaths": [
+    "src/replacement-ui/**"
+  ],
+  "forbiddenReimplementations": [
+    "Do not recreate the existing component under a new name."
+  ],
+  "stageGates": [
+    {
+      "id": "reuse-check",
+      "required": true,
+      "description": "Confirm the existing component and runner are reused.",
+      "requiredEvidence": [
+        "diff-check"
+      ]
+    },
+    {
+      "id": "visual-verification",
+      "required": true,
+      "description": "Render and compare the fixed visual state.",
+      "requiredEvidence": [
+        "screenshot"
+      ]
+    }
+  ],
+  "evidenceCommands": [
+    {
+      "id": "diff-check",
+      "command": "git diff --check"
+    },
+    {
+      "id": "screenshot",
+      "command": "replace-with-project-screenshot-command"
+    }
+  ],
+  "errorPolicy": {
+    "mode": "stop_on_error",
+    "rules": [
+      "Stop when the runner emits ERROR or omits the required screenshot.",
+      "Do not change the visual oracle or acceptance criteria."
+    ]
+  },
+  "visualOracle": {
+    "stageId": "visual-verification",
+    "reference": "docs/reference.png",
+    "criteria": [
+      "Required content is visible without overlap.",
+      "No ERROR banner or missing asset is present."
+    ]
+  }
+}
