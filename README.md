@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.4.4 preview. The ledger and routing preflights are local and make zero model-provider calls.
+> Windows-first v0.5.2 preview. The ledger and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,7 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.4.4 does
+## What v0.5.2 does
 
 - Keeps task registries isolated by normalized project root.
 - Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
@@ -38,16 +38,19 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Adds a read-only terminal archive-backlog audit grouped by registered direct controller, with descendant-first ready actions and legacy metadata detection.
 - Treats failed review as a stopped routing decision, not as running rework; permits one explicit mechanical retry and supports controller reclaim.
 - Assigns readable hierarchical keys such as `01` and `01.1`, then synchronizes lifecycle titles in the Codex sidebar.
-- Keeps a heartbeat until pending events, reviews, title changes, and terminal archives are resolved.
+- Starts one replaceable heartbeat only after a real prompt dispatch, renews it from ingested progress, and recalculates it after completion/review work.
+- Uses adaptive one-shot cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval and stale generations no-op.
+- Separates actionable cleanup from historical debt: a failed title/archive tool action stays auditable but no longer re-emits itself or keeps a heartbeat alive.
+- Lets only the registered direct controller explicitly requeue a failed sidebar action with a recorded reason.
 - Archives `integrated`, `blocked`, and `reclaimed` visible tasks after their descendants while retaining the complete ledger history.
-- Lets children query only themselves and emit completion or notification-failure artifacts.
+- Lets children query only themselves and emit progress, completion, or notification-failure artifacts.
 - Reserves registration, review, acceptance, and integration transitions for controllers.
 - Rejects unsafe identifiers, stale events, project mismatches, cycles, and contradictory state.
 - Uses atomic registry replacement and conservative lock recovery.
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.4.4 does not do
+## What v0.5.2 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
@@ -73,7 +76,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.4.4 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.5.2 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -87,7 +90,7 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 
 - Never use internal Codex subagents or `spawn_agent`.
 - Delegate only through a user-visible Codex task/thread.
-- Register the visible task with a semantic title, synchronize the returned title action, and only then send its work prompt.
+- Register the visible task with a semantic title, synchronize the returned title action, send its work prompt, and record the successful dispatch to start the heartbeat.
 - Apply lifecycle title and archive actions returned by the controller heartbeat.
 - Let a child notify only the direct parent stored in its record.
 - Let only the controller accept, request changes, or integrate.
@@ -139,11 +142,39 @@ node $TaskControl controller-record-title-synced `
   --thread "worker-1" `
   --title $Registration.desiredThreadTitle
 
+# Run only after the real work prompt was sent successfully. Apply the returned
+# replace_controller_heartbeat action as a one-shot controller automation.
+node $TaskControl controller-record-dispatched `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --thread "worker-1"
+
 node $TaskControl query-self --self "worker-1"
 node $TaskControl query-parent --self "worker-1"
 ```
 
-Do not record title success unless the Codex sidebar was actually renamed. The worker may start only after `query-self` reports `dispatchAllowed: true`. The controller heartbeat later applies returned title and archive actions; terminal descendants archive before their parent while audit records remain on disk.
+Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. The worker may start only after `query-self` reports `dispatchAllowed: true`. Every returned heartbeat action replaces the controller's one-shot automation; terminal descendants archive before their parent while audit records remain on disk.
+
+If a sidebar title/archive tool call fails, record the failure once. It becomes non-actionable audit debt and the heartbeat stops when no other work remains. The registered direct controller can deliberately requeue it later:
+
+```powershell
+node $TaskControl controller-retry-thread-action `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --thread "worker-1" `
+  --action "set_thread_archived" `
+  --reason "The Codex archive API is available again."
+```
+
+For a meaningful checkpoint, the child can emit progress and notify its direct parent. Successful ingestion renews the lease and invalidates the old generation:
+
+```powershell
+node $TaskControl progress --self "worker-1" --summary "Targeted tests are running."
+node $TaskControl controller-ingest-progress `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --event "<returned-event-path>"
+```
 
 When the child has a candidate:
 

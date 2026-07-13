@@ -8,6 +8,7 @@ import {
   TaskControlError,
   auditControllerRouting,
   controllerIngestCompletion,
+  controllerIngestProgress,
   controllerIngestNotificationFailed,
   controllerMarkChangesRequested,
   controllerMarkAccepted,
@@ -15,11 +16,14 @@ import {
   controllerMarkIntegrated,
   controllerRecordArchiveFailed,
   controllerRecordArchiveSucceeded,
+  controllerRecordDispatched,
   controllerRecordTitleFailed,
   controllerRecordTitleSynced,
   controllerRegisterTask,
+  controllerRetryThreadAction,
   controllerScanPendingEvents,
   createCompletionEvent,
+  createProgressEvent,
   createNotificationFailureReceipt,
   loadProjectAdapter,
   projectKeyForRoot,
@@ -42,7 +46,9 @@ async function invokeCli(args) {
 
 async function register(input) {
   const task = await controllerRegisterTask(input);
-  return { task, synced: await controllerRecordTitleSynced({ ...input, title: task.desiredThreadTitle }) };
+  const synced = await controllerRecordTitleSynced({ ...input, title: task.desiredThreadTitle });
+  const dispatched = await controllerRecordDispatched(input);
+  return { task, synced, dispatched };
 }
 
 test('Sol controller routing defaults to high and allows evidence-gated escalation', async () => {
@@ -245,6 +251,110 @@ test('controller scan discovers a fresh completion and keeps the heartbeat', asy
   });
 });
 
+test('adaptive heartbeat starts on real dispatch, renews on progress, and reorders after completion', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-'));
+  const projectRoot = 'E:\\work\\project\\adaptive-heartbeat';
+  const input = {
+    taskControlHome,
+    projectRoot,
+    controllerThreadId: 'heartbeat-controller',
+    parentThreadId: 'heartbeat-controller',
+    threadId: 'heartbeat-worker',
+    title: '执行机械验证',
+    model: 'gpt-5.6-luna',
+    thinking: 'medium',
+    delegationMode: 'explicit',
+    executionSurface: 'visible_task',
+    modelClass: 'economical',
+    quotaReason: 'repeatable verification saves premium controller quota',
+    workClass: 'repeatable',
+    decisionStatus: 'resolved',
+    scope: 'Only run the named mechanical verification.',
+    acceptance: 'The named verification exits with code zero.',
+    forbiddenDecisions: 'Do not change contracts or test expectations.',
+  };
+  try {
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    let scan = await controllerScanPendingEvents(input);
+    assert.equal(scan.heartbeatState, null);
+    assert.equal(scan.shouldKeepHeartbeat, false);
+    await assert.rejects(createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'not actually dispatched' }), (error) => error instanceof TaskControlError && error.code === 'TASK_DISPATCH_NOT_AUTHORIZED');
+
+    const dispatched = await controllerRecordDispatched(input);
+    assert.equal(dispatched.heartbeatAction.type, 'replace_controller_heartbeat');
+    assert.equal(dispatched.heartbeatAction.intervalMs, 3 * 60 * 1000);
+    assert.equal(dispatched.heartbeatAction.mode, 'one_shot');
+    const dispatchGeneration = dispatched.heartbeatState.generation;
+    const dispatchDueAt = dispatched.heartbeatState.dueAt;
+
+    await delay();
+    const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'targeted tests are running' });
+    scan = await controllerScanPendingEvents(input);
+    assert.deepEqual(scan.pendingEvents.map((event) => event.type), ['task_progress']);
+    const progressed = await controllerIngestProgress({ ...input, eventPath: progressPath });
+    assert.equal(progressed.heartbeatState.reason, 'progress');
+    assert.ok(progressed.heartbeatState.generation > dispatchGeneration);
+    assert.ok(Date.parse(progressed.heartbeatState.dueAt) > Date.parse(dispatchDueAt));
+
+    const stale = await controllerScanPendingEvents({ ...input, heartbeatGeneration: dispatchGeneration });
+    assert.equal(stale.staleHeartbeat, true);
+    assert.equal(stale.needsControllerAttention, false);
+
+    await delay();
+    const completionPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'adaptive-candidate-1' });
+    const completed = await controllerIngestCompletion({ ...input, eventPath: completionPath });
+    assert.equal(completed.heartbeatState.reason, 'completion');
+    assert.equal(completed.heartbeatAction.intervalMs, 5 * 60 * 1000);
+    assert.ok(completed.heartbeatState.generation > progressed.heartbeatState.generation);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
+test('adaptive heartbeat cadence follows the active work class and thinking level', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-routing-'));
+  const projectRoot = 'E:\\work\\project\\adaptive-heartbeat-routing';
+  const input = {
+    taskControlHome,
+    projectRoot,
+    controllerThreadId: 'routing-controller',
+    parentThreadId: 'routing-controller',
+    threadId: 'terra-high-worker',
+    title: '理解局部实现',
+    model: 'gpt-5.6-terra',
+    thinking: 'high',
+    delegationMode: 'explicit',
+    executionSurface: 'visible_task',
+    modelClass: 'economical',
+    quotaReason: 'bounded implementation saves premium controller quota',
+    workClass: 'bounded_reasoning',
+    decisionStatus: 'resolved',
+    scope: 'Only implement the decided local contract.',
+    acceptance: 'The targeted bounded test exits with code zero.',
+    forbiddenDecisions: 'Do not reinterpret architecture or error policy.',
+  };
+  try {
+    const { dispatched } = await register(input);
+    assert.equal(dispatched.heartbeatAction.intervalMs, 10 * 60 * 1000);
+
+    const cleanupInput = {
+      ...input,
+      threadId: 'terminal-cleanup-worker',
+      title: '清理终态任务',
+      model: 'gpt-5.6-luna',
+      thinking: 'medium',
+      workClass: 'repeatable',
+      quotaReason: 'repeatable cleanup setup saves premium controller quota',
+    };
+    await register(cleanupInput);
+    const blocked = await controllerMarkBlocked({ ...cleanupInput, reason: 'superseded test task' });
+    assert.equal(blocked.heartbeatAction.intervalMs, 5 * 60 * 1000);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
 test('changes requested enters a stopped routing queue instead of pretending to run', async () => {
   await withFixture(async (fixture) => {
     await delay();
@@ -290,6 +400,7 @@ test('CLI enforces readiness and drives an explicit controller reclaim flow', as
     const registered = await invokeCli(['register', ...common, '--parent', 'controller-cli', '--title', 'Implement bounded validator', '--model', 'gpt-5.6-terra', '--thinking', 'high', '--delegation', 'explicit', '--execution-surface', 'visible_task', '--model-class', 'economical', '--quota-reason', 'A bounded validator implementation saves frontier quota.', '--work-class', 'bounded_reasoning', '--decision-status', 'resolved', '--scope', 'Only modify the named validator module.', '--acceptance', 'Run the validator unit test with a zero exit code.', '--forbidden-decisions', 'Do not change persistence trust or error policy.']);
     assert.equal(registered.dispatchAllowed, false);
     await invokeCli(['controller-record-title-synced', ...common, '--title', registered.desiredThreadTitle]);
+    await invokeCli(['controller-record-dispatched', ...common]);
     const self = await invokeCli(['query-self', '--task-control-home', taskControlHome, '--self', 'worker-cli']);
     assert.equal(self.dispatchAllowed, true);
 
@@ -337,7 +448,7 @@ test('lifecycle titles synchronize before terminal archive and heartbeat cleanup
   });
 });
 
-test('archive waits for visible descendants and failed thread actions remain retryable', async () => {
+test('failed thread actions become deferred debt until the direct controller explicitly retries them', async () => {
   await withFixture(async (fixture) => {
     const nestedInput = { ...fixture, controllerThreadId: fixture.threadId, parentThreadId: fixture.threadId, threadId: 'nested-child', title: '补充超时测试', model: 'gpt-5.6-luna', thinking: 'medium', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'mechanical nested verification saves controller quota' };
     await register(nestedInput);
@@ -345,17 +456,34 @@ test('archive waits for visible descendants and failed thread actions remain ret
     const blockedParent = await controllerMarkBlocked({ ...fixture, reason: 'superseded' });
     await controllerRecordTitleFailed({ ...fixture, title: blockedParent.desiredThreadTitle, reason: 'temporary title API failure' });
     let rootScan = await controllerScanPendingEvents(fixture);
-    assert.deepEqual(rootScan.threadActions, [{ type: 'set_thread_title', threadId: fixture.threadId, title: blockedParent.desiredThreadTitle }]);
+    assert.deepEqual(rootScan.threadActions, []);
+    assert.deepEqual(rootScan.pendingCleanupTasks, []);
+    assert.equal(rootScan.deferredCleanupTasks[0].actionability, 'title_failed');
+    assert.equal(rootScan.shouldKeepHeartbeat, false);
+    await assert.rejects(controllerRecordTitleSynced({ ...fixture, title: blockedParent.desiredThreadTitle }), (error) => error instanceof TaskControlError && error.code === 'THREAD_ACTION_NOT_PENDING');
+    const titleRetry = await invokeCli(['controller-retry-thread-action', '--task-control-home', fixture.taskControlHome, '--project-root', fixture.projectRoot, '--controller', fixture.controllerThreadId, '--thread', fixture.threadId, '--action', 'set_thread_title', '--reason', 'The title API is available again.']);
+    assert.deepEqual(titleRetry.requiredThreadActions, [{ type: 'set_thread_title', threadId: fixture.threadId, title: blockedParent.desiredThreadTitle }]);
+    assert.equal(titleRetry.heartbeatAction.type, 'replace_controller_heartbeat');
     await controllerRecordTitleSynced({ ...fixture, title: blockedParent.desiredThreadTitle });
     rootScan = await controllerScanPendingEvents(fixture);
     assert.equal(rootScan.threadActions.length, 0);
-    assert.equal(rootScan.shouldKeepHeartbeat, true);
+    assert.equal(rootScan.deferredCleanupTasks[0].actionability, 'waiting_descendants');
+    assert.equal(rootScan.shouldKeepHeartbeat, false);
 
     const blockedChild = await controllerMarkBlocked({ ...nestedInput, reason: 'superseded' });
     await controllerRecordTitleSynced({ ...nestedInput, title: blockedChild.desiredThreadTitle });
-    await controllerRecordArchiveFailed({ ...nestedInput, reason: 'temporary archive API failure' });
-    const childScan = await controllerScanPendingEvents({ ...nestedInput, controllerThreadId: fixture.threadId });
-    assert.deepEqual(childScan.threadActions, [{ type: 'set_thread_archived', threadId: 'nested-child', archived: true }]);
+    const failedArchive = await controllerRecordArchiveFailed({ ...nestedInput, reason: 'Inactive thread archive did not persist' });
+    assert.equal(failedArchive.heartbeatAction.type, 'delete_controller_heartbeat');
+    let childScan = await controllerScanPendingEvents({ ...nestedInput, controllerThreadId: fixture.threadId });
+    assert.deepEqual(childScan.threadActions, []);
+    assert.deepEqual(childScan.pendingCleanupTasks, []);
+    assert.equal(childScan.deferredCleanupTasks[0].actionability, 'archive_failed');
+    assert.equal(childScan.shouldKeepHeartbeat, false);
+    await assert.rejects(controllerRecordArchiveSucceeded(nestedInput), (error) => error instanceof TaskControlError && error.code === 'THREAD_ACTION_NOT_PENDING');
+    const archiveRetry = await controllerRetryThreadAction({ ...nestedInput, action: 'set_thread_archived', reason: 'User requested one explicit retry.' });
+    assert.deepEqual(archiveRetry.requiredThreadActions, [{ type: 'set_thread_archived', threadId: 'nested-child', archived: true }]);
+    assert.equal(archiveRetry.threadActionHistory.at(-2).outcome, 'failed');
+    assert.equal(archiveRetry.threadActionHistory.at(-1).outcome, 'retry_requested');
     await controllerRecordArchiveSucceeded(nestedInput);
 
     rootScan = await controllerScanPendingEvents(fixture);

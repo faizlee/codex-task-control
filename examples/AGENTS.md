@@ -11,7 +11,8 @@
 - A child must resolve its direct parent from the ledger and notify only that parent.
 - Only the controller may register tasks, ingest events, request changes, explicitly dispatch one mechanical rework, reclaim work, accept, or integrate.
 - Treat `changes_requested` as stopped and undecided, not as running. Reclaim comprehension, judgment, and missing-spec failures immediately; after a second failed review, reclaim instead of looping.
-- The controller heartbeat applies pending title and archive actions. Archive `integrated`, `blocked`, or `reclaimed` descendants before their parent, but retain all ledger history.
+- Start the controller's replaceable one-shot heartbeat only after a work prompt is really sent and `controller-record-dispatched` succeeds. Renew from ingested progress, reorder after completion/reconciliation, and ignore stale generations.
+- The controller heartbeat applies only pending, currently actionable title and archive actions. A recorded tool failure becomes audit debt and must not keep the heartbeat or retry automatically; only the registered direct controller may explicitly requeue it. Archive `integrated`, `blocked`, or `reclaimed` descendants before their parent, but retain all ledger history.
 - After install or upgrade, run `audit-model-routing`, `audit-thinking-routing`, and `audit-archive-backlog`. Treat active legacy low-thinking tasks as direct-controller reclaim work and missing legacy archive metadata as pending cleanup in memory; only the recorded direct controller may apply actions and record their results.
 - Project-local `AGENTS.md`, workflows, tests, and acceptance rules remain authoritative.
 - If a visible task is not registered, stop and report that it is waiting for controller registration.

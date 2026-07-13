@@ -22,7 +22,7 @@ if archive_json="$(node "$target/scripts/task-control.mjs" audit-archive-backlog
         console.log("Archive backlog audit: compliant (no terminal sidebar cleanup pending)");
         return;
       }
-      console.error(`WARNING: Archive backlog audit found ${audit.backlogCount} terminal task(s) across ${audit.ownerCount} direct-controller plan(s); ${audit.readyActionCount} thread action(s) are ready now. Each recorded direct controller must apply descendant-first title/archive actions and record the result.`);
+      console.error(`WARNING: Archive backlog audit found ${audit.backlogCount} terminal debt item(s) across ${audit.ownerCount} direct-controller plan(s); ${audit.readyActionCount} thread action(s) are ready now. Each recorded direct controller applies only returned actions. Failed or descendant-blocked debt stays auditable without keeping a heartbeat and requires an explicit owner retry when appropriate.`);
       for (const owner of audit.owners) console.error(`WARNING: [${owner.projectRoot}] controller=${owner.controllerThreadId} backlog=${owner.tasks.length} readyActions=${owner.threadActions.length}`);
     });
   '

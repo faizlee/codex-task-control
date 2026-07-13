@@ -21,8 +21,11 @@ import {
   controllerMarkIntegrated,
   controllerMarkNotificationSent,
   controllerReclaimTask,
+  controllerRecordArchiveFailed,
+  controllerRecordDispatched,
   controllerRecordTitleSynced,
   controllerRegisterTask,
+  controllerScanPendingEvents,
   createCompletionEvent,
   createNotificationFailureReceipt,
   loadProjectAdapter,
@@ -110,12 +113,19 @@ async function register(codexHome, projectRoot, threadId, overrides = {}) {
     forbiddenDecisions: overrides.forbiddenDecisions ?? 'Do not change contracts, architecture, or error policy.',
   });
   if (overrides.syncTitle === false) return task;
-  return controllerRecordTitleSynced({
+  const synced = await controllerRecordTitleSynced({
     codexHome,
     projectRoot,
     controllerThreadId: overrides.controllerThreadId ?? defaultController,
     threadId,
     title: task.desiredThreadTitle,
+  });
+  if (overrides.recordDispatch === false) return synced;
+  return controllerRecordDispatched({
+    codexHome,
+    projectRoot,
+    controllerThreadId: overrides.controllerThreadId ?? defaultController,
+    threadId,
   });
 }
 
@@ -216,6 +226,7 @@ describe('project-isolated task control', () => {
     assert.equal(pendingDecision.desiredThreadTitle, '待决｜01 same task');
     const rework = await controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
     await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', title: rework.desiredThreadTitle });
+    await controllerRecordDispatched({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
     const secondEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-2' });
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: secondEvent });
     await controllerMarkNotificationSent({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
@@ -362,6 +373,30 @@ describe('project-isolated task control', () => {
     assert.equal(after, before);
   });
 
+  it('keeps failed archive debt auditable without treating it as heartbeat work', async () => {
+    const codexHome = await freshCodexHome();
+    const root = 'C:/work/deferred-archive-debt';
+    await register(codexHome, root, 'failed-archive');
+    const blocked = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'failed-archive', reason: 'superseded task' });
+    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'failed-archive', title: blocked.desiredThreadTitle });
+    const failed = await controllerRecordArchiveFailed({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'failed-archive', reason: 'Inactive thread archive did not persist' });
+    assert.equal(failed.heartbeatAction.type, 'delete_controller_heartbeat');
+
+    const audit = await auditArchiveBacklog({ codexHome });
+    assert.equal(audit.compliant, false);
+    assert.equal(audit.backlogCount, 1);
+    assert.equal(audit.readyActionCount, 0);
+    assert.equal(audit.owners[0].tasks[0].actionability, 'archive_failed');
+    assert.equal(audit.owners[0].tasks[0].actionable, false);
+    assert.deepEqual(audit.owners[0].threadActions, []);
+
+    const scan = await controllerScanPendingEvents({ codexHome, projectRoot: root, controllerThreadId: defaultController });
+    assert.deepEqual(scan.pendingCleanupTasks, []);
+    assert.equal(scan.deferredCleanupTasks[0].actionability, 'archive_failed');
+    assert.equal(scan.needsControllerAttention, false);
+    assert.equal(scan.shouldKeepHeartbeat, false);
+  });
+
   it('fails closed unless delegated work is decision-complete and testable', async () => {
     const codexHome = await freshCodexHome();
     const root = 'C:/work/readiness-gate';
@@ -415,6 +450,7 @@ describe('project-isolated task control', () => {
     assert.equal(rework.attemptCount, 2);
     assert.equal(rework.desiredThreadTitle, '返工｜01 same task');
     await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', title: rework.desiredThreadTitle });
+    await controllerRecordDispatched({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker' });
 
     completion = await createCompletionEvent({ codexHome, selfThreadId: 'worker', candidateCommit: 'candidate-2' });
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: completion });
@@ -484,6 +520,7 @@ describe('project-isolated task control', () => {
     const root = 'C:/work/omitted-codex-home';
     const registered = await controllerRegisterTask({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', parentThreadId: defaultController, title: 'omitted home', model: 'gpt-5.6-luna', thinking: 'medium', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Use a cheaper worker for repetitive mechanical execution.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only update the named files and fields.', acceptance: 'Run the named targeted test and require a zero exit code.', forbiddenDecisions: 'Do not change contracts, architecture, or error policy.' });
     await controllerRecordTitleSynced({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted', title: registered.desiredThreadTitle });
+    await controllerRecordDispatched({ projectRoot: root, controllerThreadId: defaultController, threadId: 'omitted' });
     const eventPath = await createCompletionEvent({ selfThreadId: 'omitted', candidateCommit: 'candidate-omitted-home' });
     await controllerIngestCompletion({ projectRoot: root, controllerThreadId: defaultController, eventPath });
     assert.equal(eventPath.startsWith(join(sandboxCodexHome, 'task-control')), true);

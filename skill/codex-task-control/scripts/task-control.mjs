@@ -26,6 +26,16 @@ export const DECISION_STATUSES = Object.freeze(['resolved']);
 export const EXECUTION_STATUSES = Object.freeze(['running', 'stopped', 'awaiting_review', 'terminal']);
 export const NEXT_OWNERS = Object.freeze(['worker', 'controller', 'undecided', 'none']);
 export const FAILURE_CLASSES = Object.freeze(['mechanical', 'comprehension', 'judgment', 'spec_missing', 'unclassified']);
+export const HEARTBEAT_STATUSES = Object.freeze(['armed', 'cancelled']);
+export const HEARTBEAT_REASONS = Object.freeze(['dispatch', 'progress', 'completion', 'reconcile']);
+export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
+export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
+export const HEARTBEAT_INTERVALS_MS = Object.freeze({
+  repeatable: 3 * 60 * 1000,
+  bounded_reasoning_medium: 5 * 60 * 1000,
+  bounded_reasoning_high: 10 * 60 * 1000,
+  controller_queue: 5 * 60 * 1000,
+});
 
 export class TaskControlError extends Error {
   constructor(code, message) {
@@ -37,6 +47,7 @@ export class TaskControlError extends Error {
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isTimestamp = (value) => typeof value === 'string' && Number.isFinite(Date.parse(value));
+const latestTimestamp = (...values) => values.filter(isTimestamp).sort((left, right) => Date.parse(right) - Date.parse(left))[0];
 const nonEmpty = (value) => typeof value === 'string' && value.trim().length > 0;
 const has = (value, values) => typeof value === 'string' && values.includes(value);
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -311,6 +322,7 @@ const TITLE_STATUS_LABELS = Object.freeze({
 const hasThreadControl = (task) => 'displayKey' in task;
 const isTerminalTask = (task) => TERMINAL_STATUSES.has(task.status);
 const dispatchAllowed = (task) => task.status === 'executing' && (!hasThreadControl(task) || task.titleSyncStatus === 'synced');
+const currentAttemptDispatched = (task) => Number.isInteger(task.lastDispatchedAttempt) && task.lastDispatchedAttempt === (task.attemptCount ?? 1) && isTimestamp(task.lastDispatchedAt);
 
 function compactBaseTitle(value) {
   const normalized = value.trim().replace(/\s+/g, ' ');
@@ -339,6 +351,18 @@ function executionDefaults(task) {
 
 function ensureExecutionControl(tasks) {
   return tasks.map((task) => 'executionStatus' in task ? task : { ...task, ...executionDefaults(task) });
+}
+
+function ensureDispatchControl(tasks) {
+  return tasks.map((task) => {
+    if ('lastDispatchedAttempt' in task || 'lastDispatchedAt' in task) return task;
+    const attemptCount = task.attemptCount ?? 1;
+    return {
+      ...task,
+      lastDispatchedAttempt: attemptCount,
+      lastDispatchedAt: task.updatedAt,
+    };
+  });
 }
 
 function nextNumericSegment(used, width = 0) {
@@ -380,6 +404,7 @@ function ensureThreadControl(tasks, rootControllers) {
   return ensureDisplayKeys(tasks, rootControllers).map((task) => {
     if (hasThreadControl(task) && 'titleSyncStatus' in task) {
       const controlled = { ...task };
+      if (!Array.isArray(controlled.threadActionHistory)) controlled.threadActionHistory = [];
       const desired = desiredThreadTitle(controlled);
       if (controlled.desiredThreadTitle !== desired) {
         controlled.desiredThreadTitle = desired;
@@ -396,12 +421,13 @@ function ensureThreadControl(tasks, rootControllers) {
     controlled.archiveStatus = isTerminalTask(controlled) ? 'pending' : 'not_ready';
     controlled.archivedAt = null;
     controlled.archiveError = null;
+    controlled.threadActionHistory = [];
     return controlled;
   });
 }
 
 function ensureTaskControls(tasks, rootControllers) {
-  return ensureExecutionControl(ensureThreadControl(tasks, rootControllers));
+  return ensureDispatchControl(ensureExecutionControl(ensureThreadControl(tasks, rootControllers)));
 }
 
 function refreshThreadControl(task, previousTask) {
@@ -437,16 +463,90 @@ function descendantsOf(tasks, threadId) {
 
 function threadActionsForTask(task, tasks) {
   const actions = [];
-  if (task.titleSyncStatus !== 'synced') actions.push({ type: 'set_thread_title', threadId: task.threadId, title: task.desiredThreadTitle });
+  if (task.titleSyncStatus === 'pending') actions.push({ type: 'set_thread_title', threadId: task.threadId, title: task.desiredThreadTitle });
   const descendantsArchived = descendantsOf(tasks, task.threadId).every((descendant) => descendant.archiveStatus === 'archived');
-  if (isTerminalTask(task) && task.titleSyncStatus === 'synced' && task.archiveStatus !== 'archived' && descendantsArchived) {
+  if (isTerminalTask(task) && task.titleSyncStatus === 'synced' && task.archiveStatus === 'pending' && descendantsArchived) {
     actions.push({ type: 'set_thread_archived', threadId: task.threadId, archived: true });
   }
   return actions;
 }
 
-function controllerMutationResult(task, tasks) {
-  return { ...task, dispatchAllowed: dispatchAllowed(task), requiredThreadActions: threadActionsForTask(task, tasks) };
+function cleanupActionability(task, tasks) {
+  if (!isTerminalTask(task) || task.archiveStatus === 'archived') return 'none';
+  if (threadActionsForTask(task, tasks).length > 0) return 'actionable';
+  if (task.titleSyncStatus === 'failed') return 'title_failed';
+  if (task.archiveStatus === 'failed') return 'archive_failed';
+  if (descendantsOf(tasks, task.threadId).some((descendant) => descendant.archiveStatus !== 'archived')) return 'waiting_descendants';
+  return 'none';
+}
+
+function appendThreadActionHistory(task, action, outcome, detail, recordedAt = new Date().toISOString()) {
+  return { ...task, threadActionHistory: [...(task.threadActionHistory ?? []), { action, outcome, detail, recordedAt }] };
+}
+
+function preserveLegacyFailure(task, action, detail) {
+  const history = task.threadActionHistory ?? [];
+  if (history.some((entry) => entry.action === action && entry.outcome === 'failed' && entry.detail === detail)) return task;
+  return appendThreadActionHistory(task, action, 'failed', detail, task.updatedAt);
+}
+
+export function heartbeatIntervalForTask(task) {
+  if (task.workClass === 'repeatable') return HEARTBEAT_INTERVALS_MS.repeatable;
+  if (task.workClass === 'bounded_reasoning' && task.thinking === 'high') return HEARTBEAT_INTERVALS_MS.bounded_reasoning_high;
+  if (task.workClass === 'bounded_reasoning') return HEARTBEAT_INTERVALS_MS.bounded_reasoning_medium;
+  return HEARTBEAT_INTERVALS_MS.controller_queue;
+}
+
+function controllerWorkQueues(tasks, controllerThreadId) {
+  const directTasks = tasks.filter((task) => task.directControllerThreadId === controllerThreadId);
+  const activeTasks = directTasks.filter((task) => task.status === 'executing' && currentAttemptDispatched(task));
+  const queuedTasks = directTasks.filter((task) => ['awaiting_review', 'accepted', 'changes_requested'].includes(task.status));
+  const cleanupTasks = directTasks.filter((task) => cleanupActionability(task, tasks) === 'actionable');
+  return { directTasks, activeTasks, queuedTasks, cleanupTasks, shouldKeepHeartbeat: activeTasks.length > 0 || queuedTasks.length > 0 || cleanupTasks.length > 0 };
+}
+
+function heartbeatActionForState(state) {
+  if (state.status === 'cancelled') return { type: 'delete_controller_heartbeat', controllerThreadId: state.controllerThreadId, generation: state.generation };
+  return { type: 'replace_controller_heartbeat', controllerThreadId: state.controllerThreadId, generation: state.generation, dueAt: state.dueAt, intervalMs: state.intervalMs, mode: 'one_shot' };
+}
+
+function rearmControllerHeartbeatInRegistry(registry, controllerThreadId, reason, triggerTaskThreadId = null, now = new Date()) {
+  if (!has(reason, HEARTBEAT_REASONS)) fail('CLI_INVALID_ARGUMENTS', `heartbeat reason 无效: ${reason}`);
+  const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const previous = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId);
+  const generation = (previous?.generation ?? 0) + 1;
+  const updatedAt = now.toISOString();
+  const intervalCandidates = queues.activeTasks.map(heartbeatIntervalForTask);
+  if (queues.queuedTasks.length > 0 || queues.cleanupTasks.length > 0) intervalCandidates.push(HEARTBEAT_INTERVALS_MS.controller_queue);
+  const intervalMs = intervalCandidates.length > 0 ? Math.min(...intervalCandidates) : HEARTBEAT_INTERVALS_MS.controller_queue;
+  const state = queues.shouldKeepHeartbeat
+    ? { controllerThreadId, generation, status: 'armed', dueAt: new Date(now.getTime() + intervalMs).toISOString(), intervalMs, reason, triggerTaskThreadId, updatedAt }
+    : { controllerThreadId, generation, status: 'cancelled', dueAt: null, intervalMs: null, reason, triggerTaskThreadId, updatedAt };
+  const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
+  return { registry: { ...registry, controllerHeartbeats, updatedAt }, state, heartbeatAction: heartbeatActionForState(state) };
+}
+
+function controllerMutationResult(task, tasks, heartbeat = null) {
+  return { ...task, dispatchAllowed: dispatchAllowed(task), requiredThreadActions: threadActionsForTask(task, tasks), ...(heartbeat ? { heartbeatState: heartbeat.state, heartbeatAction: heartbeat.heartbeatAction } : {}) };
+}
+
+function validateControllerHeartbeat(value, knownControllers) {
+  if (!isObject(value)) fail('REGISTRY_INVALID', 'controller heartbeat 必须是对象');
+  const required = ['controllerThreadId', 'generation', 'status', 'dueAt', 'intervalMs', 'reason', 'triggerTaskThreadId', 'updatedAt'];
+  if (!required.every((key) => key in value)) fail('REGISTRY_INVALID', 'controller heartbeat 缺少字段');
+  assertSafeThreadId(value.controllerThreadId, 'heartbeat.controllerThreadId');
+  if (!knownControllers.has(value.controllerThreadId)) fail('REGISTRY_INVALID', `heartbeat controller 未登记: ${value.controllerThreadId}`);
+  if (!Number.isInteger(value.generation) || value.generation < 1) fail('REGISTRY_INVALID', 'heartbeat generation 无效');
+  if (!has(value.status, HEARTBEAT_STATUSES)) fail('REGISTRY_INVALID', `heartbeat status 无效: ${value.status}`);
+  if (!has(value.reason, HEARTBEAT_REASONS)) fail('REGISTRY_INVALID', `heartbeat reason 无效: ${value.reason}`);
+  if (value.triggerTaskThreadId !== null) assertSafeThreadId(value.triggerTaskThreadId, 'heartbeat.triggerTaskThreadId');
+  if (!isTimestamp(value.updatedAt)) fail('REGISTRY_INVALID', 'heartbeat updatedAt 无效');
+  if (value.status === 'armed') {
+    if (!isTimestamp(value.dueAt) || !Number.isInteger(value.intervalMs) || value.intervalMs <= 0) fail('REGISTRY_INVALID', 'armed heartbeat 必须有 dueAt 和正 intervalMs');
+  } else if (value.dueAt !== null || value.intervalMs !== null) {
+    fail('REGISTRY_INVALID', 'cancelled heartbeat 不能保留 dueAt 或 intervalMs');
+  }
+  return { ...value };
 }
 
 function validateTask(value) {
@@ -497,6 +597,19 @@ function validateTask(value) {
     if (value.status === 'changes_requested' && (value.failureClass === null || !nonEmpty(value.changesRequestedReason))) fail('REGISTRY_INVALID', 'changes_requested 必须记录失败分类和原因');
     if (value.status === 'reclaimed' && !nonEmpty(value.reclaimedReason)) fail('REGISTRY_INVALID', 'reclaimed 必须记录主控收回原因');
   }
+  const dispatchFields = ['lastDispatchedAttempt', 'lastDispatchedAt'];
+  const presentDispatchFields = dispatchFields.filter((key) => key in value);
+  if (presentDispatchFields.length !== 0 && presentDispatchFields.length !== dispatchFields.length) fail('REGISTRY_INVALID', '派发字段必须同时存在');
+  if (presentDispatchFields.length === dispatchFields.length) {
+    if (!Number.isInteger(value.lastDispatchedAttempt) || value.lastDispatchedAttempt < 0 || value.lastDispatchedAttempt > (value.attemptCount ?? 1)) fail('REGISTRY_INVALID', 'lastDispatchedAttempt 无效');
+    if (value.lastDispatchedAttempt === 0 && value.lastDispatchedAt !== null) fail('REGISTRY_INVALID', '未派发任务不能有 lastDispatchedAt');
+    if (value.lastDispatchedAttempt > 0 && !isTimestamp(value.lastDispatchedAt)) fail('REGISTRY_INVALID', '已派发任务必须有 lastDispatchedAt');
+    if (value.status !== 'executing' && value.lastDispatchedAttempt !== (value.attemptCount ?? 1)) fail('REGISTRY_INVALID', '非 executing 任务必须已登记当前轮派发');
+  }
+  const progressFields = ['progressEventCreatedAt', 'lastProgressSummary'];
+  const presentProgressFields = progressFields.filter((key) => key in value);
+  if (presentProgressFields.length !== 0 && presentProgressFields.length !== progressFields.length) fail('REGISTRY_INVALID', '进度字段必须同时存在');
+  if (presentProgressFields.length === progressFields.length && (!isTimestamp(value.progressEventCreatedAt) || !nonEmpty(value.lastProgressSummary))) fail('REGISTRY_INVALID', 'progressEventCreatedAt 或 lastProgressSummary 无效');
   const threadControlFields = ['displayKey', 'desiredThreadTitle', 'titleSyncStatus', 'lastSyncedTitle', 'titleSyncError', 'archiveStatus', 'archivedAt', 'archiveError'];
   const presentThreadControlFields = threadControlFields.filter((key) => key in value);
   if (presentThreadControlFields.length !== 0 && presentThreadControlFields.length !== threadControlFields.length) fail('REGISTRY_INVALID', 'thread control 字段必须同时存在');
@@ -515,6 +628,12 @@ function validateTask(value) {
     if (value.archiveStatus !== 'archived' && value.archivedAt !== null) fail('REGISTRY_INVALID', '未归档任务不能有 archivedAt');
     if (value.archiveStatus === 'failed' && !nonEmpty(value.archiveError)) fail('REGISTRY_INVALID', 'archive failed 必须记录原因');
     if (value.archiveStatus !== 'failed' && value.archiveError !== null) fail('REGISTRY_INVALID', '非失败归档不能有 archiveError');
+  }
+  if ('threadActionHistory' in value) {
+    if (!Array.isArray(value.threadActionHistory)) fail('REGISTRY_INVALID', 'threadActionHistory 必须是数组');
+    for (const entry of value.threadActionHistory) {
+      if (!isObject(entry) || !has(entry.action, THREAD_ACTION_TYPES) || !has(entry.outcome, THREAD_ACTION_OUTCOMES) || !nonEmpty(entry.detail) || !isTimestamp(entry.recordedAt)) fail('REGISTRY_INVALID', 'threadActionHistory 记录无效');
+    }
   }
   if (!isTimestamp(value.updatedAt) || !lifecycleConsistent(value)) fail('REGISTRY_INVALID', '任务生命周期或 updatedAt 无效');
   return { ...value };
@@ -561,7 +680,17 @@ export function validateRegistry(value, expectedProjectKey, expectedProjectRoot)
       if (parent && hasThreadControl(parent) && !task.displayKey.startsWith(`${parent.displayKey}.`)) fail('REGISTRY_INVALID', `nested displayKey 未继承 parent: ${task.displayKey}`);
     }
   }
-  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], updatedAt: value.updatedAt, tasks };
+  const knownControllers = new Set([...roots, ...tasks.map((task) => task.threadId)]);
+  const heartbeatValues = value.controllerHeartbeats ?? [];
+  if (!Array.isArray(heartbeatValues)) fail('REGISTRY_INVALID', 'controllerHeartbeats 必须是数组');
+  const heartbeatControllers = new Set();
+  const controllerHeartbeats = heartbeatValues.map((heartbeat) => {
+    const validated = validateControllerHeartbeat(heartbeat, knownControllers);
+    if (heartbeatControllers.has(validated.controllerThreadId)) fail('REGISTRY_INVALID', `重复 controller heartbeat: ${validated.controllerThreadId}`);
+    heartbeatControllers.add(validated.controllerThreadId);
+    return validated;
+  });
+  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, updatedAt: value.updatedAt, tasks };
 }
 
 async function readIndex(home) {
@@ -605,7 +734,7 @@ async function ensureProject(home, projectRoot, controllerThreadId) {
   } catch (error) {
     if (!(error instanceof TaskControlError) || !/ENOENT/.test(error.message)) throw error;
     if (!controllerThreadId) fail('TASK_NOT_REGISTERED', '项目注册表不存在');
-    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], updatedAt: new Date().toISOString(), tasks: [] };
+    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], updatedAt: new Date().toISOString(), tasks: [] };
     return { paths, registry: await withExclusiveLock(paths.registryPath, async () => {
       try {
         return validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
@@ -650,7 +779,7 @@ function assertTaskController(task, controllerThreadId) {
   if (task.directControllerThreadId !== controllerThreadId) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 不是该 task 的 direct controller');
 }
 
-async function mutateController({ codexHome, taskControlHome, projectRoot, controllerThreadId, threadId, mutate }) {
+async function mutateController({ codexHome, taskControlHome, projectRoot, controllerThreadId, threadId, mutate, heartbeatReason = null }) {
   const resolvedHome = resolveTaskControlHome({ codexHome, taskControlHome });
   const { paths } = await ensureProject(resolvedHome, projectRoot);
   return withExclusiveLock(paths.registryPath, async () => {
@@ -660,10 +789,42 @@ async function mutateController({ codexHome, taskControlHome, projectRoot, contr
     assertTaskController(current, controllerThreadId);
     const mutatedTask = mutate(current, controlledRegistry);
     const nextTask = refreshThreadControl(mutatedTask, current);
-    const next = validateRegistry({ ...controlledRegistry, updatedAt: new Date().toISOString(), tasks: controlledRegistry.tasks.map((task) => task.threadId === threadId ? nextTask : task) }, paths.projectKey, paths.projectRoot);
+    let next = validateRegistry({ ...controlledRegistry, updatedAt: new Date().toISOString(), tasks: controlledRegistry.tasks.map((task) => task.threadId === threadId ? nextTask : task) }, paths.projectKey, paths.projectRoot);
+    let heartbeat = null;
+    if (heartbeatReason !== null) {
+      heartbeat = rearmControllerHeartbeatInRegistry(next, controllerThreadId, heartbeatReason, threadId);
+      next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
+    }
     await atomicWriteJson(paths.registryPath, next);
-    return controllerMutationResult(nextTask, next.tasks);
+    return controllerMutationResult(nextTask, next.tasks, heartbeat);
   });
+}
+
+export async function controllerRearmHeartbeat(input) {
+  const resolvedHome = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(resolvedHome, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  const reason = input.reason ?? 'reconcile';
+  if (reason !== 'reconcile') fail('CLI_INVALID_ARGUMENTS', 'controller-rearm-heartbeat 只能用于成功 reconciliation');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const rawRegistry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const registry = { ...rawRegistry, tasks: ensureTaskControls(rawRegistry.tasks, rawRegistry.rootControllerThreadIds) };
+    const controllerKnown = registry.rootControllerThreadIds.includes(input.controllerThreadId) || registry.tasks.some((task) => task.threadId === input.controllerThreadId);
+    if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
+    const heartbeat = rearmControllerHeartbeatInRegistry(registry, input.controllerThreadId, reason, null);
+    const next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, heartbeatState: heartbeat.state, heartbeatAction: heartbeat.heartbeatAction };
+  });
+}
+
+export async function controllerRecordDispatched(input) {
+  return mutateController({ ...input, heartbeatReason: 'dispatch', mutate: (task) => {
+    if (!dispatchAllowed(task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '只有 executing 且标题已同步的任务可以登记派发');
+    if (currentAttemptDispatched(task)) fail('TASK_DISPATCH_ALREADY_RECORDED', `第 ${task.attemptCount} 轮派发已登记`);
+    const now = new Date().toISOString();
+    return { ...task, lastDispatchedAttempt: task.attemptCount, lastDispatchedAt: now, updatedAt: now };
+  }});
 }
 
 export function auditControllerRouting(input = {}) {
@@ -739,7 +900,7 @@ export async function controllerRegisterTask(input) {
       if (input.parentThreadId !== input.controllerThreadId) fail('PARENT_NOT_REGISTERED', `父任务未登记: ${input.parentThreadId}`);
       if (!rootControllers.includes(input.controllerThreadId)) rootControllers.push(input.controllerThreadId);
     }
-    const draft = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
+    const draft = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
     const tasks = ensureTaskControls([...controlledTasks, draft], rootControllers);
     const task = tasks.find((candidate) => candidate.threadId === input.threadId);
     const next = validateRegistry({ ...registry, rootControllerThreadIds: rootControllers, updatedAt: new Date().toISOString(), tasks }, paths.projectKey, paths.projectRoot);
@@ -806,11 +967,12 @@ export async function auditArchiveBacklog(input = {}) {
       const descendants = descendantsOf(registry.tasks, task.threadId);
       const blockedByDescendants = descendants.some((descendant) => descendant.archiveStatus !== 'archived');
       const actions = threadActionsForTask(task, registry.tasks);
+      const actionability = cleanupActionability(task, registry.tasks);
       readyActionCount += actions.length;
       const ownerKey = `${registry.projectKey}:${task.directControllerThreadId}`;
       if (!ownerPlans.has(ownerKey)) ownerPlans.set(ownerKey, { projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: task.directControllerThreadId, tasks: [], threadActions: [] });
       const owner = ownerPlans.get(ownerKey);
-      owner.tasks.push({ threadId: task.threadId, displayKey: task.displayKey, title: task.title, status: task.status, archiveStatus: task.archiveStatus, legacyArchiveMetadata: !('archiveStatus' in rawById.get(task.threadId)), blockedByDescendants, descendantCount: descendants.length, updatedAt: task.updatedAt });
+      owner.tasks.push({ threadId: task.threadId, displayKey: task.displayKey, title: task.title, status: task.status, archiveStatus: task.archiveStatus, legacyArchiveMetadata: !('archiveStatus' in rawById.get(task.threadId)), blockedByDescendants, descendantCount: descendants.length, actionability, actionable: actionability === 'actionable', updatedAt: task.updatedAt });
       owner.threadActions.push(...actions);
     }
   }
@@ -819,9 +981,26 @@ export async function auditArchiveBacklog(input = {}) {
 }
 
 async function readArtifact(filePath, expectedType) {
-  const value = await readJson(filePath, expectedType === 'task_completed' ? 'EVENT_INVALID' : 'NOTIFICATION_RECEIPT_INVALID');
-  if (!isObject(value) || value.schemaVersion !== 1 || value.type !== expectedType || !nonEmpty(value.projectKey) || !isSafeThreadId(value.threadId) || !isSafeThreadId(value.parentThreadId) || !isSafeThreadId(value.controllerThreadId) || !isTimestamp(value.createdAt)) fail(expectedType === 'task_completed' ? 'EVENT_INVALID' : 'NOTIFICATION_RECEIPT_INVALID', '事件身份或时间字段无效');
+  const code = expectedType === 'notification_failed' ? 'NOTIFICATION_RECEIPT_INVALID' : 'EVENT_INVALID';
+  const value = await readJson(filePath, code);
+  if (!isObject(value) || value.schemaVersion !== 1 || value.type !== expectedType || !nonEmpty(value.projectKey) || !isSafeThreadId(value.threadId) || !isSafeThreadId(value.parentThreadId) || !isSafeThreadId(value.controllerThreadId) || !isTimestamp(value.createdAt)) fail(code, '事件身份或时间字段无效');
+  if (expectedType === 'task_progress' && (!nonEmpty(value.summary) || !Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'progress event summary 或 attemptCount 无效');
+  if (expectedType === 'task_completed' && value.attemptCount !== undefined && (!Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'completion event attemptCount 无效');
   return value;
+}
+
+export async function controllerIngestProgress(input) {
+  const home = resolveTaskControlHome(input);
+  const paths = pathsFor(home, input.projectRoot);
+  const event = await readArtifact(input.eventPath, 'task_progress');
+  if (event.projectKey !== paths.projectKey || !nonEmpty(event.summary) || !Number.isInteger(event.attemptCount) || event.attemptCount < 1) fail('EVENT_INVALID', 'progress event 项目、summary 或 attemptCount 无效');
+  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: event.threadId, heartbeatReason: 'progress', mutate: (task) => {
+    if (event.parentThreadId !== task.parentThreadId || event.controllerThreadId !== task.directControllerThreadId) fail('EVENT_INVALID', 'progress event parent/controller 不匹配');
+    if (task.status !== 'executing' || !currentAttemptDispatched(task) || event.attemptCount !== task.attemptCount) fail('EVENT_STALE', 'progress event 不属于当前执行轮次');
+    const freshnessAnchor = latestTimestamp(task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
+    if (Date.parse(event.createdAt) <= Date.parse(freshnessAnchor)) fail('EVENT_STALE', 'progress event 过期或重复');
+    return { ...task, progressEventCreatedAt: event.createdAt, lastProgressSummary: event.summary.trim(), updatedAt: new Date().toISOString() };
+  }});
 }
 
 export async function controllerIngestCompletion(input) {
@@ -830,9 +1009,12 @@ export async function controllerIngestCompletion(input) {
   const event = await readArtifact(input.eventPath, 'task_completed');
   if (event.projectKey !== paths.projectKey) fail('PROJECT_MISMATCH', 'completion event projectKey 不匹配');
   if (event.status !== 'awaiting_review' || !nonEmpty(event.candidateCommit)) fail('EVENT_INVALID', 'completion event 必须是 awaiting_review 且有 candidateCommit');
-  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: event.threadId, mutate: (task) => {
+  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: event.threadId, heartbeatReason: 'completion', mutate: (task) => {
     if (event.parentThreadId !== task.parentThreadId || event.controllerThreadId !== task.directControllerThreadId) fail('EVENT_INVALID', 'completion event parent/controller 不匹配');
-    if (Date.parse(event.createdAt) <= Date.parse(task.updatedAt)) fail('EVENT_STALE', 'completion event 过期或重复');
+    if (!currentAttemptDispatched(task)) fail('EVENT_STALE', '当前轮任务尚未登记真实派发');
+    if (event.attemptCount !== undefined && event.attemptCount !== task.attemptCount) fail('EVENT_STALE', 'completion event 不属于当前执行轮次');
+    const freshnessAnchor = latestTimestamp(task.completionEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
+    if (Date.parse(event.createdAt) <= Date.parse(freshnessAnchor)) fail('EVENT_STALE', 'completion event 过期或重复');
     if (task.status !== 'executing') fail('EVENT_STALE', `不能从 ${task.status} 入账 completion event`);
     if (task.candidateCommit === event.candidateCommit) fail('EVENT_STALE', '新一轮执行必须产生新 candidateCommit');
     return { ...task, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
@@ -840,7 +1022,7 @@ export async function controllerIngestCompletion(input) {
 }
 
 export async function controllerMarkNotificationSent(input) {
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.notificationStatus !== 'pending') fail('NOTIFICATION_ALREADY_RECORDED', `notificationStatus 已是 ${task.notificationStatus}`);
     return { ...task, notificationStatus: 'sent', updatedAt: new Date().toISOString() };
   }});
@@ -851,7 +1033,7 @@ export async function controllerIngestNotificationFailed(input) {
   const paths = pathsFor(home, input.projectRoot);
   const receipt = await readArtifact(input.receiptPath, 'notification_failed');
   if (receipt.projectKey !== paths.projectKey || !nonEmpty(receipt.reason)) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed 项目或 reason 无效');
-  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: receipt.threadId, mutate: (task) => {
+  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: receipt.threadId, heartbeatReason: 'reconcile', mutate: (task) => {
     if (receipt.parentThreadId !== task.parentThreadId || receipt.controllerThreadId !== task.directControllerThreadId) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed parent/controller 不匹配');
     const freshnessAnchor = task.completionEventCreatedAt ?? task.updatedAt;
     if (Date.parse(receipt.createdAt) <= Date.parse(freshnessAnchor)) fail('NOTIFICATION_RECEIPT_STALE', 'notification_failed 回执早于当前 completion 或已过期');
@@ -870,8 +1052,22 @@ async function listTaskEventFiles(paths, task) {
     fail('EVENT_SCAN_FAILED', `无法扫描 ${taskEventDir}: ${error instanceof Error ? error.message : String(error)}`);
   }
   return entries
-    .filter((entry) => entry.isFile() && (entry.name.startsWith('completion-') || entry.name.startsWith('notification-failed-')) && entry.name.endsWith('.json'))
+    .filter((entry) => entry.isFile() && (entry.name.startsWith('completion-') || entry.name.startsWith('progress-') || entry.name.startsWith('notification-failed-')) && entry.name.endsWith('.json'))
     .map((entry) => join(taskEventDir, entry.name));
+}
+
+function artifactTypeForPath(eventPath) {
+  const name = basename(eventPath);
+  if (name.startsWith('completion-')) return 'task_completed';
+  if (name.startsWith('progress-')) return 'task_progress';
+  if (name.startsWith('notification-failed-')) return 'notification_failed';
+  fail('EVENT_INVALID', `未知事件文件: ${eventPath}`);
+}
+
+function eventFreshnessAnchor(task, type) {
+  if (type === 'notification_failed') return task.completionEventCreatedAt ?? task.updatedAt;
+  if (type === 'task_progress') return latestTimestamp(task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
+  return latestTimestamp(task.completionEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
 }
 
 export async function controllerScanPendingEvents(input) {
@@ -883,46 +1079,85 @@ export async function controllerScanPendingEvents(input) {
   const controllerKnown = registry.rootControllerThreadIds.includes(input.controllerThreadId) || registry.tasks.some((task) => task.threadId === input.controllerThreadId);
   if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
 
+  const heartbeatState = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === input.controllerThreadId) ?? null;
+  if (input.heartbeatGeneration !== undefined) {
+    const requestedGeneration = Number(input.heartbeatGeneration);
+    if (!Number.isInteger(requestedGeneration) || requestedGeneration < 1) fail('CLI_INVALID_ARGUMENTS', 'heartbeat generation 必须是正整数');
+    if (heartbeatState === null || heartbeatState.status !== 'armed' || heartbeatState.generation !== requestedGeneration) {
+      return {
+        projectKey: registry.projectKey,
+        controllerThreadId: input.controllerThreadId,
+        staleHeartbeat: true,
+        heartbeatState,
+        pendingEvents: [],
+        reviewQueue: [],
+        routingQueue: [],
+        activeTasks: [],
+        overdueTasks: [],
+        pendingCleanupTasks: [],
+        deferredCleanupTasks: [],
+        threadActions: [],
+        needsControllerAttention: false,
+        shouldKeepHeartbeat: false,
+      };
+    }
+  }
+
   const directTasks = registry.tasks.filter((task) => task.directControllerThreadId === input.controllerThreadId);
   const pendingEvents = [];
   for (const task of directTasks) {
     for (const eventPath of await listTaskEventFiles(paths, task)) {
-      const isCompletion = eventPath.includes(`${win32.sep}completion-`);
-      const type = isCompletion ? 'task_completed' : 'notification_failed';
+      const type = artifactTypeForPath(eventPath);
       const artifact = await readArtifact(eventPath, type);
       if (artifact.projectKey !== paths.projectKey || artifact.threadId !== task.threadId || artifact.parentThreadId !== task.parentThreadId || artifact.controllerThreadId !== task.directControllerThreadId) {
         fail('EVENT_INVALID', `事件身份与台账不一致: ${eventPath}`);
       }
-      const freshnessAnchor = type === 'notification_failed' ? (task.completionEventCreatedAt ?? task.updatedAt) : task.updatedAt;
+      const freshnessAnchor = eventFreshnessAnchor(task, type);
       if (Date.parse(artifact.createdAt) <= Date.parse(freshnessAnchor)) continue;
       if (type === 'task_completed' && task.status !== 'executing') continue;
+      if (type === 'task_completed' && artifact.attemptCount !== undefined && artifact.attemptCount !== task.attemptCount) continue;
+      if (type === 'task_progress' && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
       if (type === 'notification_failed' && task.notificationStatus !== 'pending') continue;
-      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : { reason: artifact.reason }) });
+      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : type === 'task_progress' ? { attemptCount: artifact.attemptCount, summary: artifact.summary } : { reason: artifact.reason }) });
     }
   }
   pendingEvents.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.eventPath.localeCompare(right.eventPath));
-  const activeTasks = directTasks.filter((task) => task.status === 'executing').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, notificationStatus: task.notificationStatus }));
+  const now = Date.now();
+  const activeTaskRecords = directTasks.filter((task) => task.status === 'executing' && currentAttemptDispatched(task));
+  const activeTasks = activeTaskRecords.map((task) => {
+    const intervalMs = heartbeatIntervalForTask(task);
+    const lastObservedAt = latestTimestamp(task.progressEventCreatedAt, task.lastDispatchedAt);
+    return { threadId: task.threadId, displayKey: task.displayKey, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, notificationStatus: task.notificationStatus, lastObservedAt, heartbeatIntervalMs: intervalMs, heartbeatDueAt: new Date(Date.parse(lastObservedAt) + intervalMs).toISOString() };
+  });
+  const overdueTasks = activeTasks.filter((task) => Date.parse(task.heartbeatDueAt) <= now);
   const reviewQueue = directTasks.filter((task) => task.status === 'awaiting_review' || task.status === 'accepted').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, candidateCommit: task.candidateCommit, notificationStatus: task.notificationStatus }));
   const routingQueue = directTasks.filter((task) => task.status === 'changes_requested').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, executionStatus: task.executionStatus, nextOwner: task.nextOwner, failureClass: task.failureClass }));
-  const pendingCleanupTasks = directTasks.filter((task) => isTerminalTask(task) && task.archiveStatus !== 'archived').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, archiveStatus: task.archiveStatus }));
+  const cleanupDebtTasks = directTasks.filter((task) => isTerminalTask(task) && task.archiveStatus !== 'archived').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, archiveStatus: task.archiveStatus, actionability: cleanupActionability(task, registry.tasks) }));
+  const pendingCleanupTasks = cleanupDebtTasks.filter((task) => task.actionability === 'actionable');
+  const deferredCleanupTasks = cleanupDebtTasks.filter((task) => task.actionability !== 'actionable');
   const threadActions = directTasks.flatMap((task) => threadActionsForTask(task, registry.tasks));
+  const queues = controllerWorkQueues(registry.tasks, input.controllerThreadId);
   return {
     projectKey: registry.projectKey,
     controllerThreadId: input.controllerThreadId,
+    staleHeartbeat: false,
+    heartbeatState,
     pendingEvents,
     reviewQueue,
     routingQueue,
     activeTasks,
+    overdueTasks,
     pendingCleanupTasks,
+    deferredCleanupTasks,
     threadActions,
-    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || threadActions.length > 0,
-    shouldKeepHeartbeat: activeTasks.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || pendingCleanupTasks.length > 0,
+    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || threadActions.length > 0,
+    shouldKeepHeartbeat: queues.shouldKeepHeartbeat,
   };
 }
 
 export async function controllerMarkChangesRequested(input) {
   if (!has(input.failureClass, FAILURE_CLASSES.filter((value) => value !== 'unclassified')) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'changes_requested 必须提供失败分类和原因');
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'executing' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 changes_requested`);
     return { ...task, status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: input.failureClass, changesRequestedReason: input.reason.trim(), reviewVerdict: 'changes_requested', updatedAt: new Date().toISOString() };
   }});
@@ -939,7 +1174,7 @@ export async function controllerDispatchRework(input) {
 
 export async function controllerReclaimTask(input) {
   if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'reclaim reason 不能为空');
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'changes_requested' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 由主控收回`);
     return { ...task, status: 'reclaimed', executionStatus: 'terminal', nextOwner: 'controller', reclaimedReason: input.reason.trim(), updatedAt: new Date().toISOString() };
   }});
@@ -947,21 +1182,21 @@ export async function controllerReclaimTask(input) {
 
 export async function controllerMarkBlocked(input) {
   if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'blocked reason 不能为空');
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'executing' && task.status !== 'changes_requested' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 blocked`);
     return { ...task, status: 'blocked', executionStatus: 'terminal', nextOwner: 'none', blockedReason: input.reason.trim(), updatedAt: new Date().toISOString() };
   }});
 }
 
 export async function controllerMarkAccepted(input) {
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'awaiting_review' || !nonEmpty(task.candidateCommit)) fail('TASK_TRANSITION_INVALID', '只有有 candidateCommit 的 awaiting_review 可以 accepted');
     return { ...task, status: 'accepted', executionStatus: 'stopped', nextOwner: 'controller', reviewVerdict: 'accepted', updatedAt: new Date().toISOString() };
   }});
 }
 
 export async function controllerMarkIntegrated(input) {
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'accepted') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 integrated`);
     return { ...task, status: 'integrated', executionStatus: 'terminal', nextOwner: 'none', reviewVerdict: 'accepted', integrationStatus: 'integrated', updatedAt: new Date().toISOString() };
   }});
@@ -971,7 +1206,9 @@ export async function controllerRecordTitleSynced(input) {
   if (!nonEmpty(input.title)) fail('CLI_INVALID_ARGUMENTS', 'synced title 不能为空');
   return mutateController({ ...input, mutate: (task) => {
     if (input.title !== task.desiredThreadTitle) fail('THREAD_TITLE_STALE', '确认的 title 与当前 lifecycle title 不一致');
-    return { ...task, titleSyncStatus: 'synced', lastSyncedTitle: input.title, titleSyncError: null, updatedAt: new Date().toISOString() };
+    if (task.titleSyncStatus !== 'pending') fail('THREAD_ACTION_NOT_PENDING', 'title action 不是 pending；failed 必须先由直接主控显式重新排队');
+    const now = new Date().toISOString();
+    return { ...appendThreadActionHistory(task, 'set_thread_title', 'succeeded', input.title, now), titleSyncStatus: 'synced', lastSyncedTitle: input.title, titleSyncError: null, updatedAt: now };
   }});
 }
 
@@ -979,24 +1216,49 @@ export async function controllerRecordTitleFailed(input) {
   if (!nonEmpty(input.title) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'title 与失败原因不能为空');
   return mutateController({ ...input, mutate: (task) => {
     if (input.title !== task.desiredThreadTitle) fail('THREAD_TITLE_STALE', '失败的 title 已不是当前 lifecycle title');
-    return { ...task, titleSyncStatus: 'failed', titleSyncError: input.reason.trim(), updatedAt: new Date().toISOString() };
+    if (task.titleSyncStatus !== 'pending') fail('THREAD_ACTION_NOT_PENDING', '只能记录 pending title action 的失败');
+    const now = new Date().toISOString();
+    return { ...appendThreadActionHistory(task, 'set_thread_title', 'failed', input.reason.trim(), now), titleSyncStatus: 'failed', titleSyncError: input.reason.trim(), updatedAt: now };
   }});
 }
 
 export async function controllerRecordArchiveSucceeded(input) {
-  return mutateController({ ...input, mutate: (task, registry) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task, registry) => {
     if (!isTerminalTask(task)) fail('TASK_TRANSITION_INVALID', '只有 integrated、blocked 或 reclaimed 任务可以归档');
     if (task.titleSyncStatus !== 'synced') fail('THREAD_ARCHIVE_NOT_READY', '终态 title 尚未同步');
     if (!descendantsOf(registry.tasks, task.threadId).every((descendant) => descendant.archiveStatus === 'archived')) fail('THREAD_ARCHIVE_NOT_READY', '必须先归档所有可见后代任务');
-    return { ...task, archiveStatus: 'archived', archivedAt: new Date().toISOString(), archiveError: null, updatedAt: new Date().toISOString() };
+    if (task.archiveStatus !== 'pending') fail('THREAD_ACTION_NOT_PENDING', 'archive action 不是 pending；failed 必须先由直接主控显式重新排队');
+    const now = new Date().toISOString();
+    return { ...appendThreadActionHistory(task, 'set_thread_archived', 'succeeded', 'archived', now), archiveStatus: 'archived', archivedAt: now, archiveError: null, updatedAt: now };
   }});
 }
 
 export async function controllerRecordArchiveFailed(input) {
   if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'archive 失败原因不能为空');
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (!isTerminalTask(task)) fail('TASK_TRANSITION_INVALID', '只有 integrated、blocked 或 reclaimed 任务可以记录 archive 失败');
-    return { ...task, archiveStatus: 'failed', archivedAt: null, archiveError: input.reason.trim(), updatedAt: new Date().toISOString() };
+    if (task.archiveStatus !== 'pending') fail('THREAD_ACTION_NOT_PENDING', '只能记录 pending archive action 的失败');
+    const now = new Date().toISOString();
+    return { ...appendThreadActionHistory(task, 'set_thread_archived', 'failed', input.reason.trim(), now), archiveStatus: 'failed', archivedAt: null, archiveError: input.reason.trim(), updatedAt: now };
+  }});
+}
+
+export async function controllerRetryThreadAction(input) {
+  if (!has(input.action, THREAD_ACTION_TYPES) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', '显式重试必须提供合法 action 和非空原因');
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task, registry) => {
+    const now = new Date().toISOString();
+    if (input.action === 'set_thread_title') {
+      if (task.titleSyncStatus !== 'failed' || !nonEmpty(task.titleSyncError)) fail('THREAD_ACTION_NOT_FAILED', '只有 failed title action 可以显式重新排队');
+      let next = preserveLegacyFailure(task, input.action, task.titleSyncError);
+      next = appendThreadActionHistory(next, input.action, 'retry_requested', input.reason.trim(), now);
+      return { ...next, titleSyncStatus: 'pending', titleSyncError: null, updatedAt: now };
+    }
+    if (!isTerminalTask(task) || task.archiveStatus !== 'failed' || !nonEmpty(task.archiveError)) fail('THREAD_ACTION_NOT_FAILED', '只有终态 failed archive action 可以显式重新排队');
+    if (task.titleSyncStatus !== 'synced') fail('THREAD_ARCHIVE_NOT_READY', '终态 title 尚未同步');
+    if (!descendantsOf(registry.tasks, task.threadId).every((descendant) => descendant.archiveStatus === 'archived')) fail('THREAD_ARCHIVE_NOT_READY', '必须先归档所有可见后代任务');
+    let next = preserveLegacyFailure(task, input.action, task.archiveError);
+    next = appendThreadActionHistory(next, input.action, 'retry_requested', input.reason.trim(), now);
+    return { ...next, archiveStatus: 'pending', archiveError: null, updatedAt: now };
   }});
 }
 
@@ -1029,12 +1291,24 @@ export function buildCompletionNotification(task) {
   return `任务已完成，等待主控审查。任务：${identity}`;
 }
 
+export function buildProgressNotification(task, summary) {
+  const identity = nonEmpty(task.displayKey) ? `${task.displayKey} ${task.title}` : task.threadId;
+  return `任务有进展。任务：${identity}。进度：${summary.trim()}`;
+}
+
+export async function createProgressEvent(input) {
+  const result = await querySelf(input);
+  if (!dispatchAllowed(result.task) || !currentAttemptDispatched(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交进度');
+  if (!nonEmpty(input.summary)) fail('CLI_INVALID_ARGUMENTS', 'progress summary 不能为空');
+  return writeChildArtifact(result.paths, result.task.threadId, 'progress', { schemaVersion: 1, type: 'task_progress', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, summary: input.summary.trim(), createdAt: new Date().toISOString() });
+}
+
 export async function createCompletionEvent(input) {
   const result = await querySelf(input);
-  if (!dispatchAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', 'thread title 尚未同步，任务不得开始或提交 completion');
+  if (!dispatchAllowed(result.task) || !currentAttemptDispatched(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', 'thread title 尚未同步或当前轮尚未登记真实派发，任务不得提交 completion');
   if (input.status !== undefined && input.status !== 'awaiting_review') fail('CHILD_STATUS_FORBIDDEN', '子任务只能提交 awaiting_review');
   if (!nonEmpty(input.candidateCommit)) fail('CLI_INVALID_ARGUMENTS', 'candidateCommit 不能为空');
-  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, status: 'awaiting_review', candidateCommit: input.candidateCommit, createdAt: new Date().toISOString() });
+  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, attemptCount: result.task.attemptCount, status: 'awaiting_review', candidateCommit: input.candidateCommit, createdAt: new Date().toISOString() });
 }
 
 export async function createNotificationFailureReceipt(input) {
@@ -1104,11 +1378,21 @@ export async function runCli(args = process.argv.slice(2)) {
     const task = (await querySelf({ ...storage, selfThreadId })).task;
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildCompletionNotification(task), notificationRequired: true, notificationFailureRequiredOnSendError: true };
   }
+  else if (command === 'progress') {
+    const selfThreadId = required(args, '--self');
+    const summary = required(args, '--summary');
+    const eventPath = await createProgressEvent({ ...storage, selfThreadId, summary });
+    const task = (await querySelf({ ...storage, selfThreadId })).task;
+    result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildProgressNotification(task, summary), notificationRequired: true };
+  }
   else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason') });
   else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions') });
+  else if (command === 'controller-ingest-progress') result = await controllerIngestProgress({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-completion') result = await controllerIngestCompletion({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-notification-failed') result = await controllerIngestNotificationFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
-  else if (command === 'controller-scan-events') result = await controllerScanPendingEvents({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
+  else if (command === 'controller-scan-events') result = await controllerScanPendingEvents({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), heartbeatGeneration: option(args, '--heartbeat-generation') });
+  else if (command === 'controller-rearm-heartbeat') result = await controllerRearmHeartbeat({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: option(args, '--reason') ?? 'reconcile' });
+  else if (command === 'controller-record-dispatched') result = await controllerRecordDispatched({ ...controllerInput(args) });
   else if (command === 'controller-mark-notification-sent') result = await controllerMarkNotificationSent({ ...controllerInput(args) });
   else if (command === 'mark-changes-requested') result = await controllerMarkChangesRequested({ ...controllerInput(args), failureClass: required(args, '--failure-class'), reason: required(args, '--reason') });
   else if (command === 'controller-dispatch-rework') result = await controllerDispatchRework({ ...controllerInput(args) });
@@ -1120,6 +1404,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-record-title-failed') result = await controllerRecordTitleFailed({ ...controllerInput(args), title: required(args, '--title'), reason: required(args, '--reason') });
   else if (command === 'controller-record-archive-succeeded') result = await controllerRecordArchiveSucceeded({ ...controllerInput(args) });
   else if (command === 'controller-record-archive-failed') result = await controllerRecordArchiveFailed({ ...controllerInput(args), reason: required(args, '--reason') });
+  else if (command === 'controller-retry-thread-action') result = await controllerRetryThreadAction({ ...controllerInput(args), action: required(args, '--action'), reason: required(args, '--reason') });
   else if (command === 'adapter') result = await loadProjectAdapter(required(args, '--file'));
   else fail('CLI_INVALID_ARGUMENTS', `未知命令: ${command || '(empty)'}`);
   process.stdout.write(`${typeof result === 'string' ? result : JSON.stringify(result)}\n`);

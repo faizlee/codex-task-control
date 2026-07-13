@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Name, review, and archive visible Codex tasks"
-  default_prompt: "Use $codex-task-control to preflight Sol reasoning, route economical work only to registered visible tasks, synchronize sidebar titles, and archive terminal tasks without deleting ledger history."
+  short_description: "Route visible tasks with adaptive heartbeat recovery"
+  default_prompt: "Use $codex-task-control to preflight Sol reasoning, route economical work only to registered visible tasks, synchronize sidebar titles, renew adaptive heartbeat leases from real progress, and keep failed sidebar actions auditable without polling them forever."

@@ -58,7 +58,7 @@ try {
   if ($archiveAudit.backlogCount -eq 0) {
     Write-Output "Archive backlog audit: compliant (no terminal sidebar cleanup pending)"
   } else {
-    Write-Warning "Archive backlog audit found $($archiveAudit.backlogCount) terminal task(s) across $($archiveAudit.ownerCount) direct-controller plan(s); $($archiveAudit.readyActionCount) thread action(s) are ready now. Each recorded direct controller must apply descendant-first title/archive actions and record the result."
+    Write-Warning "Archive backlog audit found $($archiveAudit.backlogCount) terminal debt item(s) across $($archiveAudit.ownerCount) direct-controller plan(s); $($archiveAudit.readyActionCount) thread action(s) are ready now. Each recorded direct controller applies only returned actions. Failed or descendant-blocked debt stays auditable without keeping a heartbeat and requires an explicit owner retry when appropriate."
     foreach ($owner in $archiveAudit.owners) {
       Write-Warning "[$($owner.projectRoot)] controller=$($owner.controllerThreadId) backlog=$($owner.tasks.Count) readyActions=$($owner.threadActions.Count)"
     }
