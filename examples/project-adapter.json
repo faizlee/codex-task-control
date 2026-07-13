@@ -5,6 +5,5 @@
   ],
   "workflowSources": [
     "docs/WORKFLOW.md"
-  ],
-  "modelRoutingSource": "config/codex-model-routing.json"
+  ]
 }

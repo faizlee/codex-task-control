@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import {
   TaskControlError,
+  auditControllerRouting,
   controllerIngestCompletion,
   controllerIngestNotificationFailed,
+  controllerMarkChangesRequested,
   controllerMarkAccepted,
   controllerMarkBlocked,
   controllerMarkIntegrated,
@@ -19,14 +21,144 @@ import {
   controllerScanPendingEvents,
   createCompletionEvent,
   createNotificationFailureReceipt,
+  loadProjectAdapter,
+  projectKeyForRoot,
+  runCli,
 } from './task-control.mjs';
 
 const delay = () => new Promise((resolve) => setTimeout(resolve, 5));
+
+async function invokeCli(args) {
+  let output = '';
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { output += String(chunk); return true; };
+  try {
+    await runCli(args);
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  return JSON.parse(output);
+}
 
 async function register(input) {
   const task = await controllerRegisterTask(input);
   return { task, synced: await controllerRecordTitleSynced({ ...input, title: task.desiredThreadTitle }) };
 }
+
+test('Sol controller routing defaults to high and allows evidence-gated escalation', async () => {
+  assert.deepEqual(auditControllerRouting({
+    model: 'gpt-5.6-sol',
+    thinking: 'medium',
+    controllerWorkClass: 'bounded_control',
+  }), {
+    compliant: true,
+    model: 'gpt-5.6-sol',
+    thinking: 'medium',
+    controllerWorkClass: 'bounded_control',
+    escalationTrigger: null,
+    escalationReason: null,
+    maxAuthority: null,
+    providerCalls: 0,
+  });
+
+  assert.equal(auditControllerRouting({
+    model: 'gpt-5.6-sol',
+    thinking: 'high',
+    controllerWorkClass: 'frontier_control',
+  }).thinking, 'high');
+
+  const xhigh = auditControllerRouting({
+    model: 'gpt-5.6-sol',
+    thinking: 'xhigh',
+    controllerWorkClass: 'hard_arbitration',
+    escalationTrigger: 'cross_module_contract_conflict',
+    escalationReason: 'Multiple modules encode incompatible contract boundaries.',
+  });
+  assert.equal(xhigh.escalationTrigger, 'cross_module_contract_conflict');
+
+  const max = auditControllerRouting({
+    model: 'gpt-5.6-sol',
+    thinking: 'max',
+    controllerWorkClass: 'final_arbitration',
+    escalationReason: 'The user explicitly authorized maximum reasoning for final arbitration.',
+    maxAuthority: 'user_explicit',
+  });
+  assert.equal(max.maxAuthority, 'user_explicit');
+});
+
+test('Sol controller routing fails closed on low thinking, mechanical work, and unsupported escalation', async () => {
+  const expectCode = async (input, code) => assert.rejects(
+    async () => auditControllerRouting(input),
+    (error) => error instanceof TaskControlError && error.code === code,
+  );
+
+  await expectCode({ model: 'gpt-5.6-sol', thinking: 'low', controllerWorkClass: 'frontier_control' }, 'CONTROLLER_THINKING_TOO_LOW');
+  await expectCode({ model: 'gpt-5.6-terra', thinking: 'high', controllerWorkClass: 'frontier_control' }, 'CONTROLLER_MODEL_REQUIRED');
+  await expectCode({ model: 'gpt-5.6-sol', thinking: 'xhigh', controllerWorkClass: 'repeatable' }, 'CONTROLLER_MECHANICAL_WORK_FORBIDDEN');
+  await expectCode({ model: 'gpt-5.6-sol', thinking: 'xhigh', controllerWorkClass: 'frontier_control' }, 'CONTROLLER_THINKING_WORK_CLASS_MISMATCH');
+  await expectCode({ model: 'gpt-5.6-sol', thinking: 'xhigh', controllerWorkClass: 'hard_arbitration' }, 'CONTROLLER_ESCALATION_TRIGGER_REQUIRED');
+  await expectCode({ model: 'gpt-5.6-sol', thinking: 'xhigh', controllerWorkClass: 'hard_arbitration', escalationTrigger: 'formatting', escalationReason: 'Formatting should not use frontier escalation.' }, 'CONTROLLER_ESCALATION_TRIGGER_INVALID');
+  await expectCode({ model: 'gpt-5.6-sol', thinking: 'max', controllerWorkClass: 'final_arbitration', escalationReason: 'No authority was supplied for maximum reasoning.' }, 'CONTROLLER_MAX_AUTHORITY_REQUIRED');
+});
+
+test('audit-controller-routing CLI returns a zero-provider preflight decision', async () => {
+  const result = await invokeCli([
+    'audit-controller-routing',
+    '--model', 'gpt-5.6-sol',
+    '--thinking', 'xhigh',
+    '--work-class', 'hard_arbitration',
+    '--escalation-trigger', 'high_failed',
+    '--reason', 'A prior high-reasoning controller pass failed to resolve the conflict.',
+  ]);
+  assert.equal(result.compliant, true);
+  assert.equal(result.providerCalls, 0);
+  assert.equal(result.thinking, 'xhigh');
+});
+
+test('project adapter accepts project rules without a project model-routing source', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'codex-task-control-adapter-'));
+  try {
+    const adapterPath = join(root, 'adapter.json');
+    const expected = {
+      projectRoot: 'E:\\work\\project\\example',
+      rulesSources: ['AGENTS.md'],
+      workflowSources: [],
+    };
+    await writeFile(adapterPath, JSON.stringify(expected), 'utf8');
+
+    assert.deepEqual(await loadProjectAdapter(adapterPath), expected);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('project adapter supports ordinary project policy references and rejects legacy routing shadows', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'codex-task-control-adapter-'));
+  try {
+    const adapterPath = join(root, 'adapter.json');
+    const expected = {
+      projectRoot: 'E:\\work\\project\\example',
+      rulesSources: ['AGENTS.md'],
+      workflowSources: ['docs/sops/sop-001-testing.md'],
+      projectPolicySources: ['docs/testing/project-acceptance.md'],
+    };
+    await writeFile(adapterPath, JSON.stringify(expected), 'utf8');
+    assert.deepEqual(await loadProjectAdapter(adapterPath), expected);
+
+    await writeFile(adapterPath, JSON.stringify({
+      projectRoot: expected.projectRoot,
+      rulesSources: expected.rulesSources,
+      workflowSources: [],
+      modelRoutingSource: 'config/codex-model-routing.json',
+    }), 'utf8');
+    await assert.rejects(
+      loadProjectAdapter(adapterPath),
+      (error) => error instanceof TaskControlError && error.code === 'ADAPTER_INVALID',
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function withFixture(run) {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-'));
@@ -42,11 +174,16 @@ async function withFixture(run) {
       threadId,
       title: '审计 Provider 调用',
       model: 'gpt-5.6-luna',
-      thinking: 'low',
+      thinking: 'medium',
       delegationMode: 'explicit',
       executionSurface: 'visible_task',
       modelClass: 'economical',
       quotaReason: 'mechanical scan verification saves controller quota',
+      workClass: 'repeatable',
+      decisionStatus: 'resolved',
+      scope: 'Only inspect and update the named provider call sites.',
+      acceptance: 'Run the targeted unit test and require a zero exit code.',
+      forbiddenDecisions: 'Do not change provider contracts or routing policy.',
     };
     await register(base);
     await run({ ...base });
@@ -66,11 +203,16 @@ test('registration allocates readable hierarchy and blocks dispatch until title 
     threadId: 'root-child',
     title: '审计 Provider 调用',
     model: 'gpt-5.6-luna',
-    thinking: 'low',
+    thinking: 'medium',
     delegationMode: 'explicit',
     executionSurface: 'visible_task',
     modelClass: 'economical',
     quotaReason: 'mechanical title verification saves controller quota',
+    workClass: 'repeatable',
+    decisionStatus: 'resolved',
+    scope: 'Only inspect and update the named provider call sites.',
+    acceptance: 'Run the targeted unit test and require a zero exit code.',
+    forbiddenDecisions: 'Do not change provider contracts or routing policy.',
   };
   try {
     const root = await controllerRegisterTask(rootInput);
@@ -101,6 +243,67 @@ test('controller scan discovers a fresh completion and keeps the heartbeat', asy
     assert.equal(scan.shouldKeepHeartbeat, true);
     assert.deepEqual(scan.pendingEvents.map((event) => ({ type: event.type, eventPath })), [{ type: 'task_completed', eventPath }]);
   });
+});
+
+test('changes requested enters a stopped routing queue instead of pretending to run', async () => {
+  await withFixture(async (fixture) => {
+    await delay();
+    const eventPath = await createCompletionEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, candidateCommit: 'candidate-routing' });
+    await controllerIngestCompletion({ ...fixture, eventPath });
+    const pending = await controllerMarkChangesRequested({ ...fixture, failureClass: 'comprehension', reason: 'The change crossed a decided module boundary.' });
+    assert.equal(pending.desiredThreadTitle, '待决｜01 审计 Provider 调用');
+
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.deepEqual(scan.activeTasks, []);
+    assert.deepEqual(scan.routingQueue, [{ threadId: fixture.threadId, displayKey: '01', status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: 'comprehension' }]);
+    assert.equal(scan.needsControllerAttention, true);
+    assert.equal(scan.shouldKeepHeartbeat, true);
+  });
+});
+
+test('v0.3 changes-requested titles migrate safely to a stopped pending decision', async () => {
+  await withFixture(async (fixture) => {
+    const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const task = registry.tasks[0];
+    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason']) delete task[key];
+    task.status = 'changes_requested';
+    task.reviewVerdict = 'changes_requested';
+    task.desiredThreadTitle = '返工｜01 审计 Provider 调用';
+    task.lastSyncedTitle = task.desiredThreadTitle;
+    task.titleSyncStatus = 'synced';
+    task.updatedAt = new Date().toISOString();
+    registry.updatedAt = task.updatedAt;
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.deepEqual(scan.routingQueue, [{ threadId: fixture.threadId, displayKey: '01', status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: 'unclassified' }]);
+    assert.deepEqual(scan.threadActions, [{ type: 'set_thread_title', threadId: fixture.threadId, title: '待决｜01 审计 Provider 调用' }]);
+  });
+});
+
+test('CLI enforces readiness and drives an explicit controller reclaim flow', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-cli-'));
+  const projectRoot = 'E:\\work\\project\\cli-routing';
+  const common = ['--task-control-home', taskControlHome, '--project-root', projectRoot, '--controller', 'controller-cli', '--thread', 'worker-cli'];
+  try {
+    const registered = await invokeCli(['register', ...common, '--parent', 'controller-cli', '--title', 'Implement bounded validator', '--model', 'gpt-5.6-terra', '--thinking', 'high', '--delegation', 'explicit', '--execution-surface', 'visible_task', '--model-class', 'economical', '--quota-reason', 'A bounded validator implementation saves frontier quota.', '--work-class', 'bounded_reasoning', '--decision-status', 'resolved', '--scope', 'Only modify the named validator module.', '--acceptance', 'Run the validator unit test with a zero exit code.', '--forbidden-decisions', 'Do not change persistence trust or error policy.']);
+    assert.equal(registered.dispatchAllowed, false);
+    await invokeCli(['controller-record-title-synced', ...common, '--title', registered.desiredThreadTitle]);
+    const self = await invokeCli(['query-self', '--task-control-home', taskControlHome, '--self', 'worker-cli']);
+    assert.equal(self.dispatchAllowed, true);
+
+    await delay();
+    const completion = await invokeCli(['complete', '--task-control-home', taskControlHome, '--self', 'worker-cli', '--candidate-commit', 'candidate-cli-1']);
+    await delay();
+    await invokeCli(['controller-ingest-completion', '--task-control-home', taskControlHome, '--project-root', projectRoot, '--controller', 'controller-cli', '--event', completion.eventPath]);
+    const pending = await invokeCli(['mark-changes-requested', ...common, '--failure-class', 'judgment', '--reason', 'The candidate attempted to choose between conflicting contracts.']);
+    assert.equal(pending.desiredThreadTitle, '待决｜01 Implement bounded validator');
+    const reclaimed = await invokeCli(['controller-reclaim', ...common, '--reason', 'The controller will resolve the contract boundary.']);
+    assert.equal(reclaimed.desiredThreadTitle, '收回｜01 Implement bounded validator');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
 });
 
 test('lifecycle titles synchronize before terminal archive and heartbeat cleanup', async () => {
@@ -136,7 +339,7 @@ test('lifecycle titles synchronize before terminal archive and heartbeat cleanup
 
 test('archive waits for visible descendants and failed thread actions remain retryable', async () => {
   await withFixture(async (fixture) => {
-    const nestedInput = { ...fixture, controllerThreadId: fixture.threadId, parentThreadId: fixture.threadId, threadId: 'nested-child', title: '补充超时测试', model: 'gpt-5.6-luna', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'mechanical nested verification saves controller quota' };
+    const nestedInput = { ...fixture, controllerThreadId: fixture.threadId, parentThreadId: fixture.threadId, threadId: 'nested-child', title: '补充超时测试', model: 'gpt-5.6-luna', thinking: 'medium', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'mechanical nested verification saves controller quota' };
     await register(nestedInput);
 
     const blockedParent = await controllerMarkBlocked({ ...fixture, reason: 'superseded' });

@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.3 preview. The ledger is local and makes zero model-provider calls.
+> Windows-first v0.4.4 preview. The ledger and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,15 +23,23 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.3 does
+## What v0.4.4 does
 
 - Keeps task registries isolated by normalized project root.
 - Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
 - Rejects internal subagent execution and requires a user-visible Codex task/thread.
-- Requires explicit delegation to an economical model with low reasoning.
+- Requires explicit delegation to an economical model with at least medium reasoning; low reasoning fails closed.
+- Rejects delegation until decisions, scope, acceptance evidence, and forbidden decision boundaries are explicit.
+- Hard-binds `repeatable` to `gpt-5.6-luna` and `bounded_reasoning` to `gpt-5.6-terra`; old or mismatched model names fail closed at registration.
+- Hard-binds `repeatable` to medium reasoning and allows `bounded_reasoning` to use medium or high reasoning.
+- Keeps `gpt-5.6-sol` at high reasoning by default, permits bounded medium control work, and gates xhigh/max behind a zero-provider `audit-controller-routing` preflight with explicit escalation evidence.
+- Adds a read-only active-task model audit. Installers report legacy tasks without mutating their model identity or ledger history.
+- Adds a read-only active-task thinking audit so legacy low-thinking workers remain visible without rewriting their identity.
+- Adds a read-only terminal archive-backlog audit grouped by registered direct controller, with descendant-first ready actions and legacy metadata detection.
+- Treats failed review as a stopped routing decision, not as running rework; permits one explicit mechanical retry and supports controller reclaim.
 - Assigns readable hierarchical keys such as `01` and `01.1`, then synchronizes lifecycle titles in the Codex sidebar.
 - Keeps a heartbeat until pending events, reviews, title changes, and terminal archives are resolved.
-- Archives `integrated` and `blocked` visible tasks after their descendants while retaining the complete ledger history.
+- Archives `integrated`, `blocked`, and `reclaimed` visible tasks after their descendants while retaining the complete ledger history.
 - Lets children query only themselves and emit completion or notification-failure artifacts.
 - Reserves registration, review, acceptance, and integration transitions for controllers.
 - Rejects unsafe identifiers, stale events, project mismatches, cycles, and contradictory state.
@@ -39,7 +47,7 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.3 does not do
+## What v0.4.4 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
@@ -65,13 +73,13 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.3 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.4.4 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
 ```
 
-The installer copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`. It does not edit your global `AGENTS.md` or live task ledger.
+The installer copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`, then runs read-only model-routing, thinking-routing, and terminal archive-backlog audits. It does not edit your global `AGENTS.md` or live task ledger. Any reported legacy task must be handled by its registered direct controller.
 
 ## Configure the controller policy
 
@@ -84,6 +92,7 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 - Let a child notify only the direct parent stored in its record.
 - Let only the controller accept, request changes, or integrate.
 - Stop unregistered visible work instead of inventing lifecycle state.
+- Keep Sol at high by default; require local preflight evidence before xhigh/max and never use those levels for mechanical work.
 
 ## Quick start
 
@@ -93,18 +102,30 @@ Set a project root and the controller/child task IDs supplied by your Codex work
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 $TaskControl = "$CodexHome\skills\codex-task-control\scripts\task-control.mjs"
 
+node $TaskControl audit-controller-routing `
+  --model "gpt-5.6-sol" `
+  --thinking "xhigh" `
+  --work-class "hard_arbitration" `
+  --escalation-trigger "cross_module_contract_conflict" `
+  --reason "Multiple modules encode incompatible contract boundaries."
+
 $Registration = node $TaskControl register `
   --project-root "C:\work\example" `
   --controller "controller-1" `
   --thread "worker-1" `
   --parent "controller-1" `
   --title "Audit authentication flow" `
-  --model "economical-worker" `
-  --thinking "low" `
+  --model "gpt-5.6-luna" `
+  --thinking "medium" `
   --delegation "explicit" `
   --execution-surface "visible_task" `
   --model-class "economical" `
-  --quota-reason "Mechanical work is cheaper than using the frontier controller."
+  --quota-reason "Mechanical work is cheaper than using the frontier controller." `
+  --work-class "repeatable" `
+  --decision-status "resolved" `
+  --scope "Only update the named authentication tests." `
+  --acceptance "Run the targeted authentication test successfully." `
+  --forbidden-decisions "Do not change authentication contracts or error policy."
 
 $Registration = $Registration | ConvertFrom-Json
 ```
@@ -136,10 +157,29 @@ The child stops at `awaiting_review`. The controller ingests the emitted event a
 
 ```text
 executing -> awaiting_review -> accepted -> integrated
-     \----> changes_requested -> awaiting_review
+                 \----> changes_requested (stopped / 待决)
+                              \----> explicit mechanical rework (once)
+                              \----> reclaimed by controller
 ```
 
 See [`skill/codex-task-control/references/lifecycle.md`](skill/codex-task-control/references/lifecycle.md) for the complete storage and event contract.
+
+After a failed review, record why and then make an explicit routing decision:
+
+```powershell
+node $TaskControl mark-changes-requested `
+  --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" `
+  --failure-class "mechanical" --reason "A named assertion is missing."
+
+# Only for the first mechanical failure:
+node $TaskControl controller-dispatch-rework `
+  --project-root "C:\work\example" --controller "controller-1" --thread "worker-1"
+
+# For comprehension/judgment/spec failures, or after the retry:
+node $TaskControl controller-reclaim `
+  --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" `
+  --reason "The controller must resolve the contract boundary."
+```
 
 ## Project adapters
 
@@ -149,10 +189,11 @@ Adapters contain references, not copied policy. Start from [`examples/project-ad
 {
   "projectRoot": "C:\\work\\example",
   "rulesSources": ["AGENTS.md"],
-  "workflowSources": ["docs/WORKFLOW.md"],
-  "modelRoutingSource": "config/codex-model-routing.json"
+  "workflowSources": ["docs/WORKFLOW.md"]
 }
 ```
+
+Model, thinking, work-class, and lifecycle routing come only from the user-level skill; project adapters must not shadow them.
 
 ## Verify
 
@@ -166,7 +207,7 @@ The test suite uses temporary `CODEX_HOME` directories and verifies that the rea
 ## Roadmap
 
 - Cross-platform project-root normalization.
-- Complexity-based model and reasoning policy.
+- Optional project-specific model-name validation on top of work-class routing.
 - Broader Codex task-surface compatibility beyond the current title/archive tools.
 - Visible-task fan-out, depth, and stop-point budgets.
 - A local task/status dashboard.

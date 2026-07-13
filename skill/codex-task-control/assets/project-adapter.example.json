@@ -5,7 +5,5 @@
   ],
   "workflowSources": [
     "docs/sops/example.md"
-  ],
-  "modelRoutingSource": "config/codex-model-routing.json",
-  "nativeAdapter": "scripts/task-control/task-control.ts"
+  ]
 }
