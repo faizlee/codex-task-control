@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.4.2 是 Windows-first preview。台账完全保存在本地，台账操作不会调用模型 provider。
+> v0.4.3 是 Windows-first preview。台账完全保存在本地，台账操作不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,15 +12,17 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.4.2 已经解决什么
+## v0.4.3 已经解决什么
 
 - 按项目根目录隔离任务注册表。
 - 记录直接父任务、controller、执行界面、模型等级、reasoning、额度理由和生命周期状态。
 - 拒绝内部 subagent，只接受用户可见的 Codex task/thread。
-- 委派必须显式授权，并使用 economical 模型与 low reasoning。
+- 委派必须显式授权，并使用 economical 模型与至少 medium reasoning；low 直接 fail closed。
 - 架构/合同/错误策略未决、scope 或验收证据不明确时，登记直接 fail closed。
 - 将 `repeatable` 硬绑定到 `gpt-5.6-luna`，将 `bounded_reasoning` 硬绑定到 `gpt-5.6-terra`；旧模型或错配模型在登记时直接 fail closed。
+- 将 `repeatable` 的 reasoning 固定为 medium，允许 `bounded_reasoning` 使用 medium 或 high。
 - 新增只读的活跃任务模型审计；安装器会报告遗留任务，但不会偷改模型身份或台账历史。
+- 新增只读的活跃任务 thinking 审计，报告遗留 low 任务但不原地篡改其身份。
 - 新增只读的终态归档积压审计，按登记的直接主控分组，生成后代优先的可执行动作，并识别旧版缺失的归档元数据。
 - 审查失败先进入停止的“待决”状态，只允许一次明确的机械返工，其他失败由主控收回。
 - 自动分配 `01`、`01.1` 这类层级编号，并把生命周期标题同步到 Codex 侧边栏。
@@ -33,7 +35,7 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.4.2 不做什么
+## v0.4.3 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
@@ -57,7 +59,7 @@ pwsh -File .\scripts\install.ps1
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-安装器会把 skill 复制到 `${CODEX_HOME:-~/.codex}/skills/codex-task-control`，然后执行只读的模型路由审计和终态归档积压审计。它不会修改全局 `AGENTS.md`，也不会改写 live task ledger；报告的遗留任务必须由登记的直接主控处理。
+安装器会把 skill 复制到 `${CODEX_HOME:-~/.codex}/skills/codex-task-control`，然后执行只读的模型路由、thinking 路由和终态归档积压审计。它不会修改全局 `AGENTS.md`，也不会改写 live task ledger；报告的遗留任务必须由登记的直接主控处理。
 
 然后把 [`examples/AGENTS.md`](examples/AGENTS.md) 中适用的控制规则加入你的用户级或项目级 `AGENTS.md`。
 
@@ -76,7 +78,7 @@ $Registration = node $TaskControl register `
   --parent "controller-1" `
   --title "Audit authentication flow" `
   --model "gpt-5.6-luna" `
-  --thinking "low" `
+  --thinking "medium" `
   --delegation "explicit" `
   --execution-surface "visible_task" `
   --model-class "economical" `

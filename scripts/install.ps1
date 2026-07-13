@@ -40,6 +40,20 @@ try {
 }
 
 try {
+  $thinkingAudit = (& node $auditScript audit-thinking-routing --codex-home $CodexHome | ConvertFrom-Json)
+  if ($thinkingAudit.violationCount -eq 0) {
+    Write-Output "Thinking routing audit: compliant ($($thinkingAudit.activeTaskCount) active tasks checked)"
+  } else {
+    Write-Warning "Thinking routing audit found $($thinkingAudit.violationCount) active legacy low or mismatched task(s). Do not mutate their thinking identity; the registered direct controller must stop/reclaim each old task and register a medium/high replacement."
+    foreach ($violation in $thinkingAudit.violations) {
+      Write-Warning "[$($violation.projectRoot)] $($violation.threadId) thinking=$($violation.currentThinking) workClass=$($violation.workClass) allowed=$($violation.allowedThinking -join ',') controller=$($violation.directControllerThreadId) reason=$($violation.reason)"
+    }
+  }
+} catch {
+  Write-Warning "Skill installed, but thinking routing audit could not run: $($_.Exception.Message)"
+}
+
+try {
   $archiveAudit = (& node $auditScript audit-archive-backlog --codex-home $CodexHome | ConvertFrom-Json)
   if ($archiveAudit.backlogCount -eq 0) {
     Write-Output "Archive backlog audit: compliant (no terminal sidebar cleanup pending)"

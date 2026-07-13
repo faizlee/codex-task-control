@@ -58,3 +58,22 @@ if audit_json="$(node "$target/scripts/task-control.mjs" audit-model-routing --c
 else
   echo "WARNING: Skill installed, but model routing audit could not run." >&2
 fi
+
+if thinking_json="$(node "$target/scripts/task-control.mjs" audit-thinking-routing --codex-home "$codex_home")"; then
+  printf '%s' "$thinking_json" | node -e '
+    let raw = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { raw += chunk; });
+    process.stdin.on("end", () => {
+      const audit = JSON.parse(raw);
+      if (audit.violationCount === 0) {
+        console.log(`Thinking routing audit: compliant (${audit.activeTaskCount} active tasks checked)`);
+        return;
+      }
+      console.error(`WARNING: Thinking routing audit found ${audit.violationCount} active legacy low or mismatched task(s). Do not mutate their thinking identity; the registered direct controller must stop/reclaim each old task and register a medium/high replacement.`);
+      for (const item of audit.violations) console.error(`WARNING: [${item.projectRoot}] ${item.threadId} thinking=${item.currentThinking} workClass=${item.workClass} allowed=${item.allowedThinking?.join(",") ?? "unknown"} controller=${item.directControllerThreadId} reason=${item.reason}`);
+    });
+  '
+else
+  echo "WARNING: Skill installed, but thinking routing audit could not run." >&2
+fi
