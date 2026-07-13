@@ -57,7 +57,7 @@ async function withFixture(run) {
       threadId,
       title: '审计 Provider 调用',
       model: 'gpt-5.6-luna',
-      thinking: 'low',
+      thinking: 'medium',
       delegationMode: 'explicit',
       executionSurface: 'visible_task',
       modelClass: 'economical',
@@ -86,7 +86,7 @@ test('registration allocates readable hierarchy and blocks dispatch until title 
     threadId: 'root-child',
     title: '审计 Provider 调用',
     model: 'gpt-5.6-luna',
-    thinking: 'low',
+    thinking: 'medium',
     delegationMode: 'explicit',
     executionSurface: 'visible_task',
     modelClass: 'economical',
@@ -170,7 +170,7 @@ test('CLI enforces readiness and drives an explicit controller reclaim flow', as
   const projectRoot = 'E:\\work\\project\\cli-routing';
   const common = ['--task-control-home', taskControlHome, '--project-root', projectRoot, '--controller', 'controller-cli', '--thread', 'worker-cli'];
   try {
-    const registered = await invokeCli(['register', ...common, '--parent', 'controller-cli', '--title', 'Implement bounded validator', '--model', 'gpt-5.6-terra', '--thinking', 'low', '--delegation', 'explicit', '--execution-surface', 'visible_task', '--model-class', 'economical', '--quota-reason', 'A bounded validator implementation saves frontier quota.', '--work-class', 'bounded_reasoning', '--decision-status', 'resolved', '--scope', 'Only modify the named validator module.', '--acceptance', 'Run the validator unit test with a zero exit code.', '--forbidden-decisions', 'Do not change persistence trust or error policy.']);
+    const registered = await invokeCli(['register', ...common, '--parent', 'controller-cli', '--title', 'Implement bounded validator', '--model', 'gpt-5.6-terra', '--thinking', 'high', '--delegation', 'explicit', '--execution-surface', 'visible_task', '--model-class', 'economical', '--quota-reason', 'A bounded validator implementation saves frontier quota.', '--work-class', 'bounded_reasoning', '--decision-status', 'resolved', '--scope', 'Only modify the named validator module.', '--acceptance', 'Run the validator unit test with a zero exit code.', '--forbidden-decisions', 'Do not change persistence trust or error policy.']);
     assert.equal(registered.dispatchAllowed, false);
     await invokeCli(['controller-record-title-synced', ...common, '--title', registered.desiredThreadTitle]);
     const self = await invokeCli(['query-self', '--task-control-home', taskControlHome, '--self', 'worker-cli']);
@@ -222,7 +222,7 @@ test('lifecycle titles synchronize before terminal archive and heartbeat cleanup
 
 test('archive waits for visible descendants and failed thread actions remain retryable', async () => {
   await withFixture(async (fixture) => {
-    const nestedInput = { ...fixture, controllerThreadId: fixture.threadId, parentThreadId: fixture.threadId, threadId: 'nested-child', title: '补充超时测试', model: 'gpt-5.6-luna', thinking: 'low', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'mechanical nested verification saves controller quota' };
+    const nestedInput = { ...fixture, controllerThreadId: fixture.threadId, parentThreadId: fixture.threadId, threadId: 'nested-child', title: '补充超时测试', model: 'gpt-5.6-luna', thinking: 'medium', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'mechanical nested verification saves controller quota' };
     await register(nestedInput);
 
     const blockedParent = await controllerMarkBlocked({ ...fixture, reason: 'superseded' });
