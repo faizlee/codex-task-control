@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.10.0 preview. The ledger, contract/result checks, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
+> Windows-first v0.11.0 preview. The ledger, contract/result checks, controller message queue, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,10 +23,12 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.10.0 does
+## What v0.11.0 does
 
 - Lets a worker submit a first-class failed/blocked event before required stages finish, with attempted stage, classified cause, command summary, and evidence references.
 - Audits stalled execution from lease/progress/attempt evidence even when no completion or ordinary message arrives.
+- Defers ordinary controller-to-worker messages in the local ledger while the visible task is running or its turn state is unknown. Only an externally confirmed idle state releases a `send_thread_message` action, and delivery requires a matching action ID plus a real host receipt.
+- Rejects ordinary interrupt/steer requests. Only an explicitly authorized `stop` or `cancel` can produce a `steer_thread_message` action, and a deferred message is cancelled instead of restarting a terminal task.
 - Preserves stable objective identity across replacements and fails closed before r3 after two failed replacements or an exhausted time budget.
 - Requires product-value evidence before a diagnostic may block a milestone; otherwise it remains non-blocking technical debt.
 - Requires reclaim/block closeout with a user notification and refreshed delivery report before replacement.
@@ -70,11 +72,12 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.10.0 does not do
+## What v0.11.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
-- It does not automatically spawn, stop, or steer Codex tasks.
+- It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode or a queue acknowledgement. Therefore v0.11.0 safely defers a running-task message locally instead of claiming it reached the App queue. A future host API can replace this fallback with native queue delivery plus an explicit receipt.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
 - It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. The skill now blocks later controlled business actions and returns bounded cleanup selectors, but a host-native compare-and-delete/defer hook remains the complete fix.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
@@ -98,7 +101,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.10.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.11.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -113,6 +116,7 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 - Never use internal Codex subagents or `spawn_agent`.
 - Delegate only through a user-visible Codex task/thread.
 - Register the visible task with a semantic title, synchronize the returned title action, send its work prompt, and record the successful dispatch to start the heartbeat.
+- Route later controller messages through `controller-prepare-message`. While a target turn is running or unknown, do not call the host send tool; release only after a real idle observation. Reserve interrupt for authorized stop/cancel.
 - Classify the task explicitly; code/resource/UI/test changes require a project-owned implementation contract, and visual work also requires a visual oracle.
 - Apply lifecycle title and archive actions returned by the controller heartbeat.
 - Let a child notify only the direct parent stored in its record.
@@ -181,6 +185,15 @@ node $TaskControl query-parent --self "worker-1"
 ```
 
 Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.
+
+Later messages use a separate prepare/release/receipt protocol. A running target returns `deferred_local` and no host action. After independently observing the task as idle, release it, execute the returned action, and record the real receipt:
+
+```powershell
+$Queued = node $TaskControl controller-prepare-message --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --kind follow_up --delivery-mode queue --target-turn-state running --message "Run the already-approved extra check." | ConvertFrom-Json
+$Prepared = node $TaskControl controller-release-message --project-root "C:\work\example" --controller "controller-1" --message-id $Queued.messageId --target-turn-state idle | ConvertFrom-Json
+# Call the host send tool only now, then use its real success receipt:
+node $TaskControl controller-record-message-delivery --project-root "C:\work\example" --controller "controller-1" --message-id $Prepared.messageId --action-id $Prepared.actionId --outcome delivered --receipt "host-send-receipt"
+```
 
 At the end of every controller reconciliation, call the single cycle finalizer before returning to project work:
 

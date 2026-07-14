@@ -147,6 +147,16 @@ History is append-only by attempt. Review updates only the matching package: `ca
 
 The report embeds the registry `updatedAt` value. A current scan compares this marker and returns `reportNeedsRefresh`, but that flag is informational: it must not affect `needsControllerAttention`, `shouldKeepHeartbeat`, controller queues, or heartbeat rearm.
 
+## Controller-to-worker message contract
+
+The App's user-facing composer supports follow-up queue behavior, but the current programmatic message tool does not expose a queue/steer parameter or a queue acknowledgement. The ledger must therefore never infer native queue delivery from a generic successful send call.
+
+`controller-prepare-message` is the only normal controller-to-direct-worker message entry point. It verifies direct ownership, an `executing/running` lifecycle, a bounded message, and a stable digest. Ordinary follow-up, clarification, evidence-request, and notification messages use `deliveryMode=queue`. A target turn observed as `running` or `unknown` is persisted as `deferred_local` with no host action. An idle target produces a unique `send_thread_message` action whose `deliveryMode` is `start_next_turn_only`. The host performs that real send, then `controller-record-message-delivery` requires the exact message/action pair and a non-empty receipt. Duplicate message IDs are idempotent only when identity, kind, mode, and digest all match; otherwise they fail closed.
+
+`controller-release-message` rechecks the externally observed turn state. Running or unknown remains deferred. Idle becomes prepared only while the task is still `executing/running`; any later lifecycle state cancels the deferred message so it cannot restart completed, blocked, reclaimed, or review work. A prepared host action expires after 30 seconds and states its immediate precondition; an expired queue action needs a fresh idle observation and a new action ID. A forged/stale action receipt is rejected.
+
+Interrupt delivery is exceptional. Only `kind=stop|cancel` with `interruptAuthority=user_explicit|controller_safety` can produce `steer_thread_message`; ordinary work can never request interrupt. Deferred messages appear in controller scans but do not independently keep or create a heartbeat. Prepared actions and lifecycle-stale deferred items set controller attention during an existing scan, while host delivery evidence remains separate from heartbeat evidence.
+
 ## Adaptive wake-up and lease contract
 
 A file under `events/` does not wake a Codex task by itself. Progress and completion commands return a short notification for the registered direct parent. The direct controller also maintains exactly one confirmed one-shot heartbeat as a recovery watchdog; fixed repeating cron and in-place heartbeat replacement are forbidden.

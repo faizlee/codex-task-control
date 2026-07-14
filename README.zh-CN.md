@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.10.0 是 Windows-first preview。台账、合同/成果校验、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
+> v0.11.0 是 Windows-first preview。台账、合同/成果校验、主控消息队列、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,10 +12,12 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.10.0 已经解决什么
+## v0.11.0 已经解决什么
 
 - worker 可以在 required stage 尚未完成时提交正式 `task_failed` / `task_blocked`，包含失败阶段、分类、命令摘要和证据引用。
 - 即使没有 completion 或普通消息，主控扫描也会根据 lease、最后进度、attempt 时长和 candidate 缺失识别停滞。
+- 主控给 worker 的普通补充消息在目标 turn 运行中或状态未知时先写入本地台账；只有外部确认目标 idle 后才生成 `send_thread_message` 动作，真实发送还必须用匹配的 action ID 和宿主回执入账。
+- 普通消息禁止 interrupt/steer；只有明确授权的 `stop` / `cancel` 才会生成 `steer_thread_message`。目标任务已终态时，旧延后消息会取消，不能重新启动任务。
 - replacement 继承稳定 objective；连续两个 replacement 失败或时间预算耗尽后，r3/new dispatch 直接 fail closed。
 - 诊断缺少玩家影响、正常生命周期复现、增长趋势和阻塞价值时，只能登记为非阻塞技术债。
 - reclaim/blocked 后必须完成用户摘要通知和 delivery report 刷新，才能创建 replacement。
@@ -59,11 +61,12 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.10.0 不做什么
+## v0.11.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
-- 不自动创建、停止或 steer Codex task。
+- 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer 参数，也不返回“已进入队列”的回执。因此 v0.11.0 在任务运行中使用本地延后，不会伪称消息已经进入 App 队列；未来宿主提供原生 queue + ack 后才能替换这层安全回退。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
 - 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能在主控 turn 进行中原子延后定时消息，或取消已经挂起的宿主工具调用。Skill 会阻止后续受控业务动作并返回有界清理选择器，但彻底解决仍需要宿主级 compare-and-delete/defer hook。
 - 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
@@ -89,7 +92,7 @@ pwsh -File .\scripts\install.ps1 -Force
 
 然后把 [`examples/AGENTS.md`](examples/AGENTS.md) 中适用的控制规则加入你的用户级或项目级 `AGENTS.md`。
 
-核心规则：绝不使用内部 subagent 或 `spawn_agent`；委派只能创建用户可见的 Codex task/thread。任务必须用语义标题登记、完成真实侧边栏改名并确认 `dispatchAllowed: true`，才能发送工作提示词。可见任务可以并行或嵌套，但每一个都必须独立登记、可供用户检查。
+核心规则：绝不使用内部 subagent 或 `spawn_agent`；委派只能创建用户可见的 Codex task/thread。任务必须用语义标题登记、完成真实侧边栏改名并确认 `dispatchAllowed: true`，才能发送工作提示词。可见任务可以并行或嵌套，但每一个都必须独立登记、可供用户检查。后续普通消息必须先经过 `controller-prepare-message`；运行中不直接调用宿主发送，确认 idle 后才 release，interrupt 只用于有权限的停止/取消。
 
 Sol 主控默认使用 high；medium 只用于边界明确的短控制工作。xhigh 必须记录允许的升级触发条件和具体原因；max 只允许用户明确授权或 xhigh 仍未解决的最终仲裁。搜索、格式化、命令、重复测试和机械实现不得使用 Sol xhigh/max。
 
@@ -153,6 +156,15 @@ node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" -
 ```
 
 不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。
+
+后续补充消息使用独立的 prepare/release/receipt 协议。目标运行中时只返回 `deferred_local`，没有宿主动作；外部真实确认任务 idle 后再 release、执行返回的发送动作并记录真实回执：
+
+```powershell
+$Queued = node $TaskControl controller-prepare-message --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --kind follow_up --delivery-mode queue --target-turn-state running --message "补跑已经批准的检查。" | ConvertFrom-Json
+$Prepared = node $TaskControl controller-release-message --project-root "C:\work\example" --controller "controller-1" --message-id $Queued.messageId --target-turn-state idle | ConvertFrom-Json
+# 只有现在才真实调用宿主发送工具，然后记录它的成功回执：
+node $TaskControl controller-record-message-delivery --project-root "C:\work\example" --controller "controller-1" --message-id $Prepared.messageId --action-id $Prepared.actionId --outcome delivered --receipt "host-send-receipt"
+```
 
 每轮主控事件处理、closeout、报告和侧边栏动作结束后，必须先通过单入口收口，再继续项目业务：
 

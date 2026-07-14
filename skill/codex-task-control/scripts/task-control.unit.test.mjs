@@ -22,6 +22,9 @@ import {
   controllerMarkIntegrated,
   controllerMarkCloseoutNotificationSent,
   controllerQueryDeliverables,
+  controllerPrepareMessage,
+  controllerReleaseMessage,
+  controllerRecordMessageDelivery,
   controllerRecordDiagnostic,
   controllerReclaimTask,
   controllerRefreshCloseoutReport,
@@ -675,6 +678,81 @@ async function withFixture(run) {
     await rm(taskControlHome, { recursive: true, force: true });
   }
 }
+
+test('normal controller messages defer locally while a visible task is running and release only when idle', async () => {
+  await withFixture(async (fixture) => {
+    const deferred = await controllerPrepareMessage({ ...fixture, messageId: 'followup-1', kind: 'follow_up', deliveryMode: 'queue', targetTurnState: 'running', messageText: '补充检查现有测试，但不要改变合同。' });
+    assert.equal(deferred.status, 'deferred_local');
+    assert.equal(deferred.hostAction, null);
+
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.deepEqual(scan.deferredMessages.map((message) => message.messageId), ['followup-1']);
+    assert.equal(scan.pendingMessageActions.length, 0);
+    assert.equal(scan.staleDeferredMessages.length, 0);
+
+    const stillRunning = await controllerReleaseMessage({ ...fixture, messageId: 'followup-1', targetTurnState: 'running' });
+    assert.equal(stillRunning.status, 'deferred_local');
+    assert.equal(stillRunning.hostAction, null);
+
+    const prepared = await controllerReleaseMessage({ ...fixture, messageId: 'followup-1', targetTurnState: 'idle' });
+    assert.equal(prepared.status, 'prepared');
+    assert.equal(prepared.hostAction.type, 'send_thread_message');
+    assert.equal(prepared.hostAction.deliveryMode, 'start_next_turn_only');
+    await assert.rejects(
+      controllerRecordMessageDelivery({ ...fixture, messageId: 'followup-1', actionId: 'forged-action', outcome: 'delivered', receipt: 'host-ok' }),
+      (error) => error instanceof TaskControlError && error.code === 'MESSAGE_ACTION_STALE',
+    );
+    const delivered = await controllerRecordMessageDelivery({ ...fixture, messageId: 'followup-1', actionId: prepared.actionId, outcome: 'delivered', receipt: 'send-message-receipt-1' });
+    assert.equal(delivered.status, 'delivered');
+    assert.equal(delivered.receipt, 'send-message-receipt-1');
+  });
+});
+
+test('interrupt is fail closed except for explicitly authorized stop or cancel', async () => {
+  await withFixture(async (fixture) => {
+    await assert.rejects(
+      controllerPrepareMessage({ ...fixture, messageId: 'unsafe-interrupt', kind: 'follow_up', deliveryMode: 'interrupt', targetTurnState: 'running', messageText: '立刻插入这条普通补充。', interruptAuthority: 'controller_safety' }),
+      (error) => error instanceof TaskControlError && error.code === 'MESSAGE_INTERRUPT_NOT_AUTHORIZED',
+    );
+    await assert.rejects(
+      controllerPrepareMessage({ ...fixture, messageId: 'missing-authority', kind: 'stop', deliveryMode: 'interrupt', targetTurnState: 'running', messageText: '立即停止当前执行。' }),
+      (error) => error instanceof TaskControlError && error.code === 'MESSAGE_INTERRUPT_NOT_AUTHORIZED',
+    );
+    const stop = await controllerPrepareMessage({ ...fixture, messageId: 'safe-stop', kind: 'stop', deliveryMode: 'interrupt', targetTurnState: 'running', messageText: '立即停止当前执行并保留证据。', interruptAuthority: 'controller_safety' });
+    assert.equal(stop.status, 'prepared');
+    assert.equal(stop.hostAction.type, 'steer_thread_message');
+    assert.equal(stop.hostAction.deliveryMode, 'interrupt_current_turn');
+  });
+});
+
+test('deferred messages never restart a task after its lifecycle becomes terminal', async () => {
+  await withFixture(async (fixture) => {
+    await controllerPrepareMessage({ ...fixture, messageId: 'stale-followup', kind: 'clarification', deliveryMode: 'queue', targetTurnState: 'unknown', messageText: '空闲后补充一条澄清。' });
+    await controllerMarkBlocked({ ...fixture, reason: 'superseded', userSummary: 'The task is no longer needed.', blockerSource: 'superseded' });
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.deepEqual(scan.staleDeferredMessages.map((message) => message.messageId), ['stale-followup']);
+    const cancelled = await controllerReleaseMessage({ ...fixture, messageId: 'stale-followup', targetTurnState: 'idle' });
+    assert.equal(cancelled.status, 'cancelled');
+    assert.equal(cancelled.hostAction, null);
+    assert.match(cancelled.failureReason, /target lifecycle/);
+  });
+});
+
+test('legacy registries without a controller message group stay read-compatible without scan-time rewrites', async () => {
+  await withFixture(async (fixture) => {
+    const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
+    const legacy = JSON.parse(await readFile(registryPath, 'utf8'));
+    delete legacy.controllerMessages;
+    await writeFile(registryPath, `${JSON.stringify(legacy, null, 2)}\n`, 'utf8');
+    const self = await querySelf({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId });
+    assert.equal(self.task.threadId, fixture.threadId);
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.deepEqual(scan.deferredMessages, []);
+    assert.deepEqual(scan.pendingMessageActions, []);
+    const after = JSON.parse(await readFile(registryPath, 'utf8'));
+    assert.equal('controllerMessages' in after, false);
+  });
+});
 
 test('registration allocates readable hierarchy and blocks dispatch until title sync', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-title-'));

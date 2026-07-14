@@ -42,6 +42,14 @@ export const HEARTBEAT_PROTOCOL_VERSION = 2;
 export const HEARTBEAT_ACTION_TIMEOUT_MS = 30 * 1000;
 export const HEARTBEAT_STALE_LIMIT = 3;
 export const HEARTBEAT_MAX_OCCURRENCES = 1;
+export const CONTROLLER_MESSAGE_PROTOCOL_VERSION = 1;
+export const CONTROLLER_MESSAGE_KINDS = Object.freeze(['follow_up', 'clarification', 'evidence_request', 'notification', 'stop', 'cancel']);
+export const CONTROLLER_MESSAGE_DELIVERY_MODES = Object.freeze(['queue', 'interrupt']);
+export const CONTROLLER_MESSAGE_TARGET_STATES = Object.freeze(['running', 'idle', 'unknown']);
+export const CONTROLLER_MESSAGE_STATUSES = Object.freeze(['deferred_local', 'prepared', 'delivered', 'failed', 'cancelled']);
+export const CONTROLLER_MESSAGE_INTERRUPT_AUTHORITIES = Object.freeze(['user_explicit', 'controller_safety']);
+export const CONTROLLER_MESSAGE_MAX_LENGTH = 4000;
+export const CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS = 30 * 1000;
 export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
@@ -1155,6 +1163,63 @@ function controllerMutationResult(task, tasks, heartbeat = null) {
   return { ...task, ...contractSummary(task), dispatchAllowed: dispatchAllowed(task), requiredThreadActions: threadActionsForTask(task, tasks), ...(closeoutPending ? { notificationRequired: task.closeout.notificationStatus === 'pending', notificationText: task.closeout.userVisibleSummary, reportRefreshRequired: task.closeout.reportStatus === 'pending' } : {}), ...(heartbeat ? { heartbeatState: heartbeat.state, pendingHeartbeatState: heartbeat.pendingState, heartbeatAction: heartbeat.heartbeatAction, reusedPendingHeartbeatAction: heartbeat.reusedPendingAction } : {}) };
 }
 
+function controllerMessageDigest(messageText) {
+  return createHash('sha256').update(messageText, 'utf8').digest('hex');
+}
+
+function controllerMessageAction(message) {
+  if (message.status !== 'prepared') return null;
+  return {
+    type: message.deliveryMode === 'interrupt' ? 'steer_thread_message' : 'send_thread_message',
+    actionId: message.actionId,
+    messageId: message.messageId,
+    targetThreadId: message.targetThreadId,
+    messageText: message.messageText,
+    deliveryMode: message.deliveryMode === 'interrupt' ? 'interrupt_current_turn' : 'start_next_turn_only',
+    receiptRequired: true,
+    expiresAt: message.actionExpiresAt,
+    precondition: message.deliveryMode === 'interrupt' ? 'target task is still executing/running and interruption authority is still valid immediately before host steer' : 'target task is still executing/running and the target turn is still idle immediately before host send',
+    onSuccess: 'controller-record-message-delivery --outcome delivered --receipt <host-receipt>',
+    onFailure: 'controller-record-message-delivery --outcome failed --reason <host-error>',
+  };
+}
+
+function controllerMessageSummary(message) {
+  return { ...message, hostAction: controllerMessageAction(message) };
+}
+
+function validateControllerMessage(value, tasks, knownControllers) {
+  if (!isObject(value) || value.protocolVersion !== CONTROLLER_MESSAGE_PROTOCOL_VERSION) fail('REGISTRY_INVALID', 'controller message schema 无效');
+  const required = ['messageId', 'controllerThreadId', 'targetThreadId', 'kind', 'deliveryMode', 'interruptAuthority', 'messageText', 'messageDigest', 'targetTurnState', 'status', 'actionId', 'actionExpiresAt', 'createdAt', 'updatedAt', 'deliveredAt', 'receipt', 'failureReason'];
+  if (!required.every((key) => key in value)) fail('REGISTRY_INVALID', 'controller message 缺少字段');
+  assertSafeThreadId(value.messageId, 'controllerMessage.messageId');
+  assertSafeThreadId(value.controllerThreadId, 'controllerMessage.controllerThreadId');
+  assertSafeThreadId(value.targetThreadId, 'controllerMessage.targetThreadId');
+  if (!knownControllers.has(value.controllerThreadId)) fail('REGISTRY_INVALID', 'controller message 主控未登记');
+  const target = tasks.find((task) => task.threadId === value.targetThreadId);
+  if (!target || target.directControllerThreadId !== value.controllerThreadId) fail('REGISTRY_INVALID', 'controller message 目标不属于直接主控');
+  if (!has(value.kind, CONTROLLER_MESSAGE_KINDS) || !has(value.deliveryMode, CONTROLLER_MESSAGE_DELIVERY_MODES) || !has(value.targetTurnState, CONTROLLER_MESSAGE_TARGET_STATES) || !has(value.status, CONTROLLER_MESSAGE_STATUSES)) fail('REGISTRY_INVALID', 'controller message 枚举字段无效');
+  if (!nonEmpty(value.messageText) || value.messageText.length > CONTROLLER_MESSAGE_MAX_LENGTH || value.messageDigest !== controllerMessageDigest(value.messageText)) fail('REGISTRY_INVALID', 'controller message 文本或 digest 无效');
+  if (!isTimestamp(value.createdAt) || !isTimestamp(value.updatedAt)) fail('REGISTRY_INVALID', 'controller message 时间无效');
+  if (value.deliveryMode === 'interrupt') {
+    if (!['stop', 'cancel'].includes(value.kind) || !has(value.interruptAuthority, CONTROLLER_MESSAGE_INTERRUPT_AUTHORITIES)) fail('REGISTRY_INVALID', 'interrupt message 必须是已授权的 stop/cancel');
+  } else if (value.interruptAuthority !== null || ['stop', 'cancel'].includes(value.kind)) {
+    fail('REGISTRY_INVALID', 'queue message 不得携带中断权限或 stop/cancel kind');
+  }
+  if (value.status === 'deferred_local') {
+    if (value.deliveryMode !== 'queue' || value.targetTurnState === 'idle' || value.actionId !== null || value.actionExpiresAt !== null || value.deliveredAt !== null || value.receipt !== null || value.failureReason !== null) fail('REGISTRY_INVALID', 'deferred controller message 状态无效');
+  } else if (value.status === 'prepared') {
+    if (!isSafeThreadId(value.actionId) || !isTimestamp(value.actionExpiresAt) || value.deliveredAt !== null || value.receipt !== null || value.failureReason !== null || (value.deliveryMode === 'queue' && value.targetTurnState !== 'idle')) fail('REGISTRY_INVALID', 'prepared controller message 状态无效');
+  } else if (value.status === 'delivered') {
+    if (!isSafeThreadId(value.actionId) || !isTimestamp(value.actionExpiresAt) || !isTimestamp(value.deliveredAt) || !nonEmpty(value.receipt) || value.failureReason !== null) fail('REGISTRY_INVALID', 'delivered controller message 状态无效');
+  } else if (value.status === 'failed') {
+    if (!isSafeThreadId(value.actionId) || !isTimestamp(value.actionExpiresAt) || value.deliveredAt !== null || value.receipt !== null || !nonEmpty(value.failureReason)) fail('REGISTRY_INVALID', 'failed controller message 状态无效');
+  } else if (value.actionId !== null || value.actionExpiresAt !== null || value.deliveredAt !== null || value.receipt !== null || !nonEmpty(value.failureReason)) {
+    fail('REGISTRY_INVALID', 'cancelled controller message 状态无效');
+  }
+  return { ...value };
+}
+
 function validatePendingHeartbeatAction(value, state) {
   if (!isObject(value)) fail('REGISTRY_INVALID', 'pending heartbeat action 必须是对象');
   const required = ['actionId', 'type', 'generation', 'previousGeneration', 'previousAutomationId', 'dueAt', 'intervalMs', 'desiredStatus', 'reason', 'triggerTaskThreadId', 'preparedAt', 'expiresAt', 'maxOccurrences'];
@@ -1458,7 +1523,16 @@ export function validateRegistry(value, expectedProjectKey, expectedProjectRoot)
     if (!isObject(health) || !isSafeThreadId(health.controllerThreadId) || healthControllers.has(health.controllerThreadId) || !has(health.status, CONTEXT_HEALTH_STATUSES) || !nonEmpty(health.reportPath) || !/^[0-9a-f]{64}$/.test(health.reportSha256 ?? '') || !isTimestamp(health.capturedAt) || !isObject(health.metrics)) fail('REGISTRY_INVALID', 'controllerHealth receipt 无效');
     healthControllers.add(health.controllerThreadId);
   }
-  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), updatedAt: value.updatedAt, tasks };
+  const messageValues = value.controllerMessages ?? [];
+  if (!Array.isArray(messageValues)) fail('REGISTRY_INVALID', 'controllerMessages 必须是数组');
+  const messageIds = new Set();
+  const controllerMessages = messageValues.map((message) => {
+    const validated = validateControllerMessage(message, tasks, knownControllers);
+    if (messageIds.has(validated.messageId)) fail('REGISTRY_INVALID', `重复 controller message: ${validated.messageId}`);
+    messageIds.add(validated.messageId);
+    return validated;
+  });
+  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), controllerMessages, updatedAt: value.updatedAt, tasks };
 }
 
 async function readIndex(home) {
@@ -1502,7 +1576,7 @@ async function ensureProject(home, projectRoot, controllerThreadId) {
   } catch (error) {
     if (!(error instanceof TaskControlError) || !/ENOENT/.test(error.message)) throw error;
     if (!controllerThreadId) fail('TASK_NOT_REGISTERED', '项目注册表不存在');
-    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], updatedAt: new Date().toISOString(), tasks: [] };
+    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], controllerHealth: [], controllerMessages: [], updatedAt: new Date().toISOString(), tasks: [] };
     return { paths, registry: await withExclusiveLock(paths.registryPath, async () => {
       try {
         return validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
@@ -2130,6 +2204,120 @@ async function deliveryReportNeedsRefresh(paths, controllerThreadId, registryUpd
   }
 }
 
+function assertControllerKnown(registry, controllerThreadId) {
+  assertSafeThreadId(controllerThreadId, 'controllerThreadId');
+  if (!registry.rootControllerThreadIds.includes(controllerThreadId) && !registry.tasks.some((task) => task.threadId === controllerThreadId)) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
+}
+
+async function mutateControllerMessages(input, mutate) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    assertControllerKnown(registry, input.controllerThreadId);
+    const result = await mutate(registry);
+    if (result.registry === registry) return result.output;
+    const next = validateRegistry({ ...result.registry, updatedAt: new Date().toISOString() }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return result.output;
+  });
+}
+
+export async function controllerPrepareMessage(input) {
+  const kind = input.kind ?? 'follow_up';
+  const deliveryMode = input.deliveryMode ?? 'queue';
+  const targetTurnState = input.targetTurnState ?? 'unknown';
+  if (!has(kind, CONTROLLER_MESSAGE_KINDS) || !has(deliveryMode, CONTROLLER_MESSAGE_DELIVERY_MODES) || !has(targetTurnState, CONTROLLER_MESSAGE_TARGET_STATES)) fail('CLI_INVALID_ARGUMENTS', 'controller message kind、delivery mode 或 target turn state 无效');
+  if (!nonEmpty(input.messageText) || input.messageText.length > CONTROLLER_MESSAGE_MAX_LENGTH) fail('CLI_INVALID_ARGUMENTS', `message 必须为 1-${CONTROLLER_MESSAGE_MAX_LENGTH} 个字符`);
+  const messageId = input.messageId ?? `msg_${randomUUID().replaceAll('-', '')}`;
+  assertSafeThreadId(messageId, 'messageId');
+  return mutateControllerMessages(input, async (registry) => {
+    assertControllerCycleBusinessReady(registry, input.controllerThreadId);
+    const target = taskOrThrow(registry, input.threadId);
+    assertTaskController(target, input.controllerThreadId);
+    if (target.status !== 'executing' || target.executionStatus !== 'running') fail('MESSAGE_TARGET_NOT_EXECUTING', '普通工作消息只能发给当前 executing/running 的直接子任务');
+    const digest = controllerMessageDigest(input.messageText);
+    const existing = registry.controllerMessages.find((message) => message.messageId === messageId);
+    if (existing) {
+      if (existing.controllerThreadId !== input.controllerThreadId || existing.targetThreadId !== input.threadId || existing.kind !== kind || existing.deliveryMode !== deliveryMode || existing.messageDigest !== digest) fail('MESSAGE_ID_CONFLICT', 'messageId 已用于不同消息');
+      return { registry, output: controllerMessageSummary(existing) };
+    }
+    let interruptAuthority = null;
+    let status;
+    let actionId = null;
+    if (deliveryMode === 'interrupt') {
+      interruptAuthority = input.interruptAuthority ?? null;
+      if (!['stop', 'cancel'].includes(kind) || !has(interruptAuthority, CONTROLLER_MESSAGE_INTERRUPT_AUTHORITIES)) fail('MESSAGE_INTERRUPT_NOT_AUTHORIZED', '只有 stop/cancel 且具有 user_explicit 或 controller_safety 权限时才能中断');
+      if (targetTurnState === 'idle') fail('MESSAGE_INTERRUPT_NOT_AUTHORIZED', '目标已 idle，不应使用 interrupt');
+      status = 'prepared';
+      actionId = `msgact_${randomUUID().replaceAll('-', '')}`;
+    } else {
+      if (['stop', 'cancel'].includes(kind) || input.interruptAuthority !== undefined && input.interruptAuthority !== null) fail('MESSAGE_INTERRUPT_NOT_AUTHORIZED', 'stop/cancel 不得伪装成普通 queue message');
+      status = targetTurnState === 'idle' ? 'prepared' : 'deferred_local';
+      if (status === 'prepared') actionId = `msgact_${randomUUID().replaceAll('-', '')}`;
+    }
+    const now = new Date().toISOString();
+    const message = { protocolVersion: CONTROLLER_MESSAGE_PROTOCOL_VERSION, messageId, controllerThreadId: input.controllerThreadId, targetThreadId: input.threadId, kind, deliveryMode, interruptAuthority, messageText: input.messageText, messageDigest: digest, targetTurnState, status, actionId, actionExpiresAt: actionId === null ? null : new Date(Date.parse(now) + CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS).toISOString(), createdAt: now, updatedAt: now, deliveredAt: null, receipt: null, failureReason: null };
+    const next = { ...registry, controllerMessages: [...registry.controllerMessages, message] };
+    return { registry: next, output: controllerMessageSummary(message) };
+  });
+}
+
+export async function controllerReleaseMessage(input) {
+  if (!isSafeThreadId(input.messageId)) fail('CLI_INVALID_ARGUMENTS', 'messageId 无效');
+  if (!has(input.targetTurnState, CONTROLLER_MESSAGE_TARGET_STATES)) fail('CLI_INVALID_ARGUMENTS', 'target turn state 无效');
+  return mutateControllerMessages(input, async (registry) => {
+    const message = registry.controllerMessages.find((candidate) => candidate.messageId === input.messageId);
+    if (!message || message.controllerThreadId !== input.controllerThreadId) fail('MESSAGE_NOT_FOUND', 'controller message 不存在或不属于当前主控');
+    if (message.status === 'prepared' && message.deliveryMode === 'queue' && Date.now() > Date.parse(message.actionExpiresAt)) {
+      const target = taskOrThrow(registry, message.targetThreadId);
+      if (target.status !== 'executing' || target.executionStatus !== 'running') {
+        const cancelled = { ...message, targetTurnState: input.targetTurnState, status: 'cancelled', actionId: null, actionExpiresAt: null, failureReason: `target lifecycle is ${target.status}/${target.executionStatus}`, updatedAt: new Date().toISOString() };
+        return { registry: { ...registry, controllerMessages: registry.controllerMessages.map((candidate) => candidate.messageId === message.messageId ? cancelled : candidate) }, output: controllerMessageSummary(cancelled) };
+      }
+      if (input.targetTurnState !== 'idle') fail('MESSAGE_ACTION_EXPIRED', '旧 message action 已过期；重新确认 idle 后才能生成新动作');
+      const now = new Date().toISOString();
+      const renewed = { ...message, actionId: `msgact_${randomUUID().replaceAll('-', '')}`, actionExpiresAt: new Date(Date.parse(now) + CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS).toISOString(), updatedAt: now };
+      return { registry: { ...registry, controllerMessages: registry.controllerMessages.map((candidate) => candidate.messageId === message.messageId ? renewed : candidate) }, output: controllerMessageSummary(renewed) };
+    }
+    if (message.status !== 'deferred_local') return { registry, output: controllerMessageSummary(message) };
+    const target = taskOrThrow(registry, message.targetThreadId);
+    if (target.status !== 'executing' || target.executionStatus !== 'running') {
+      const cancelled = { ...message, targetTurnState: input.targetTurnState, status: 'cancelled', actionId: null, actionExpiresAt: null, failureReason: `target lifecycle is ${target.status}/${target.executionStatus}`, updatedAt: new Date().toISOString() };
+      return { registry: { ...registry, controllerMessages: registry.controllerMessages.map((candidate) => candidate.messageId === message.messageId ? cancelled : candidate) }, output: controllerMessageSummary(cancelled) };
+    }
+    if (input.targetTurnState !== 'idle') {
+      if (message.targetTurnState === input.targetTurnState) return { registry, output: controllerMessageSummary(message) };
+      const deferred = { ...message, targetTurnState: input.targetTurnState, updatedAt: new Date().toISOString() };
+      return { registry: { ...registry, controllerMessages: registry.controllerMessages.map((candidate) => candidate.messageId === message.messageId ? deferred : candidate) }, output: controllerMessageSummary(deferred) };
+    }
+    const now = new Date().toISOString();
+    const prepared = { ...message, targetTurnState: 'idle', status: 'prepared', actionId: `msgact_${randomUUID().replaceAll('-', '')}`, actionExpiresAt: new Date(Date.parse(now) + CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS).toISOString(), updatedAt: now };
+    return { registry: { ...registry, controllerMessages: registry.controllerMessages.map((candidate) => candidate.messageId === message.messageId ? prepared : candidate) }, output: controllerMessageSummary(prepared) };
+  });
+}
+
+export async function controllerRecordMessageDelivery(input) {
+  if (!isSafeThreadId(input.messageId) || !isSafeThreadId(input.actionId)) fail('CLI_INVALID_ARGUMENTS', 'messageId 或 actionId 无效');
+  if (!['delivered', 'failed'].includes(input.outcome)) fail('CLI_INVALID_ARGUMENTS', 'outcome 必须是 delivered 或 failed');
+  return mutateControllerMessages(input, async (registry) => {
+    const message = registry.controllerMessages.find((candidate) => candidate.messageId === input.messageId);
+    if (!message || message.controllerThreadId !== input.controllerThreadId) fail('MESSAGE_NOT_FOUND', 'controller message 不存在或不属于当前主控');
+    if (message.status !== 'prepared' || message.actionId !== input.actionId) fail('MESSAGE_ACTION_STALE', 'message action 不存在、已处理或 actionId 不匹配');
+    const now = new Date().toISOString();
+    let settled;
+    if (input.outcome === 'delivered') {
+      if (!nonEmpty(input.receipt)) fail('CLI_INVALID_ARGUMENTS', 'delivered 必须记录非空 host receipt');
+      settled = { ...message, status: 'delivered', deliveredAt: now, receipt: input.receipt, updatedAt: now };
+    } else {
+      if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'failed 必须记录非空 reason');
+      settled = { ...message, status: 'failed', failureReason: input.reason, updatedAt: now };
+    }
+    return { registry: { ...registry, controllerMessages: registry.controllerMessages.map((candidate) => candidate.messageId === message.messageId ? settled : candidate) }, output: controllerMessageSummary(settled) };
+  });
+}
+
 async function readArtifact(filePath, expectedType) {
   const code = expectedType === 'notification_failed' ? 'NOTIFICATION_RECEIPT_INVALID' : 'EVENT_INVALID';
   const value = await readJson(filePath, code);
@@ -2334,6 +2522,9 @@ function staleHeartbeatResult(registry, state, input, reason, extra = {}) {
     overdueTasks: [],
     pendingCleanupTasks: [],
     deferredCleanupTasks: [],
+    deferredMessages: [],
+    pendingMessageActions: [],
+    staleDeferredMessages: [],
     threadActions: [],
     reportNeedsRefresh: false,
     needsControllerAttention: false,
@@ -2446,6 +2637,13 @@ export async function controllerScanPendingEvents(input) {
   const pendingCleanupTasks = cleanupDebtTasks.filter((task) => task.actionability === 'actionable');
   const deferredCleanupTasks = cleanupDebtTasks.filter((task) => task.actionability !== 'actionable');
   const threadActions = directTasks.flatMap((task) => threadActionsForTask(task, registry.tasks));
+  const directMessages = registry.controllerMessages.filter((message) => message.controllerThreadId === input.controllerThreadId);
+  const deferredMessages = directMessages.filter((message) => message.status === 'deferred_local').map(controllerMessageSummary);
+  const pendingMessageActions = directMessages.filter((message) => message.status === 'prepared').map(controllerMessageSummary);
+  const staleDeferredMessages = deferredMessages.filter((message) => {
+    const target = registry.tasks.find((task) => task.threadId === message.targetThreadId);
+    return target === undefined || target.status !== 'executing' || target.executionStatus !== 'running';
+  });
   const queues = controllerWorkQueues(registry.tasks, input.controllerThreadId);
   const reportNeedsRefresh = await deliveryReportNeedsRefresh(paths, input.controllerThreadId, registry.updatedAt);
   return {
@@ -2464,10 +2662,13 @@ export async function controllerScanPendingEvents(input) {
     contextHealth,
     pendingCleanupTasks,
     deferredCleanupTasks,
+    deferredMessages,
+    pendingMessageActions,
+    staleDeferredMessages,
     threadActions,
     reportNeedsRefresh,
     deliveryReportPath: deliveryReportPath(paths.home, paths.projectKey, input.controllerThreadId),
-    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0,
+    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0,
     shouldKeepHeartbeat: queues.shouldKeepHeartbeat,
   };
 }
@@ -2793,7 +2994,7 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.10.0',
+    'codex-task-control v0.11.0',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>]',
@@ -2808,10 +3009,14 @@ function helpText() {
     '  controller-confirm-heartbeat-action --project-root <root> --controller <id> --action-id <id> [--automation-id <new-or-deleted-id>] [--pending-create-cleanup-outcome deleted|not_found]',
     '  controller-finalize-cycle --project-root <root> --controller <id>',
     '  controller-assert-business-ready --project-root <root> --controller <id>',
+    '  controller-prepare-message --project-root <root> --controller <id> --thread <id> --kind follow_up|clarification|evidence_request|notification|stop|cancel --delivery-mode queue|interrupt --target-turn-state running|idle|unknown --message <text> [--message-id <id>] [--interrupt-authority user_explicit|controller_safety]',
+    '  controller-release-message --project-root <root> --controller <id> --message-id <id> --target-turn-state running|idle|unknown',
+    '  controller-record-message-delivery --project-root <root> --controller <id> --message-id <id> --action-id <id> --outcome delivered|failed [--receipt <host-receipt>] [--reason <host-error>]',
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
     'implementation 成果包按 attempt 追加保存；HTML 报告确定性生成到 task-control/reports，刷新不维持 heartbeat。',
     'heartbeat 使用 prepare/create-new/confirm/switch/delete-old 两阶段协议；终态必须 finalize 并确认删除，stale invocation 只返回受限自删除动作。',
+    '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
   ].join('\n');
 }
 
@@ -2881,6 +3086,9 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-confirm-heartbeat-action') result = await controllerConfirmHeartbeatAction({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), observed: option(args, '--observed') === 'true', pendingCreateCleanupOutcome: option(args, '--pending-create-cleanup-outcome') });
   else if (command === 'controller-finalize-cycle') result = await controllerFinalizeCycle({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-assert-business-ready') result = await controllerAssertBusinessReady({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
+  else if (command === 'controller-prepare-message') result = await controllerPrepareMessage({ ...controllerInput(args), messageId: option(args, '--message-id'), kind: required(args, '--kind'), deliveryMode: required(args, '--delivery-mode'), targetTurnState: required(args, '--target-turn-state'), messageText: required(args, '--message'), interruptAuthority: option(args, '--interrupt-authority') });
+  else if (command === 'controller-release-message') result = await controllerReleaseMessage({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), messageId: required(args, '--message-id'), targetTurnState: required(args, '--target-turn-state') });
+  else if (command === 'controller-record-message-delivery') result = await controllerRecordMessageDelivery({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), messageId: required(args, '--message-id'), actionId: required(args, '--action-id'), outcome: required(args, '--outcome'), receipt: option(args, '--receipt'), reason: option(args, '--reason') });
   else if (command === 'controller-record-heartbeat-action-failed') result = await controllerRecordHeartbeatActionFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), reason: required(args, '--reason') });
   else if (command === 'controller-mark-heartbeat-notification-sent') result = await controllerMarkHeartbeatNotificationSent({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-record-dispatched') result = await controllerRecordDispatched({ ...controllerInput(args) });
