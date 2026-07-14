@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "projectKey": "replace-with-project-key",
+  "controllerThreadId": "controller-thread-id",
+  "threadId": "worker-thread-id",
+  "displayKey": "01",
+  "attempt": 1,
+  "contractVersion": "visual-example-r1",
+  "contractDigest": "replace-with-64-character-contract-digest",
+  "candidateCommit": "replace-with-candidate-commit",
+  "integrationStatus": "candidate",
+  "userVisibleSummary": "The required visible state is ready for direct-controller review.",
+  "actualChanges": [
+    "Updated the existing UI path without replacing the component."
+  ],
+  "incompleteItems": [],
+  "testSummary": {
+    "status": "passed",
+    "summary": "The screenshot runner completed without ERROR output.",
+    "commands": [
+      "replace-with-project-screenshot-command"
+    ],
+    "metrics": []
+  },
+  "noScreenshotReason": null,
+  "artifacts": [
+    {
+      "id": "reference",
+      "type": "reference",
+      "milestone": "reference",
+      "label": "Fixed visual reference",
+      "description": "Controller-provided reference used by the visual oracle.",
+      "createdAt": "2026-01-01T00:00:00.000Z",
+      "sourceStageId": "visual-verification",
+      "sourceTaskThreadId": "worker-thread-id",
+      "workspaceRole": "external_reference",
+      "uri": "https://example.com/reference.png"
+    },
+    {
+      "id": "after",
+      "type": "screenshot",
+      "milestone": "after",
+      "label": "Current candidate",
+      "description": "High-value current state selected for controller review.",
+      "createdAt": "2026-01-01T00:05:00.000Z",
+      "sourceStageId": "visual-verification",
+      "sourceTaskThreadId": "worker-thread-id",
+      "workspaceRole": "candidate_worktree",
+      "path": "docs/test-reports/current.png"
+    }
+  ]
+}

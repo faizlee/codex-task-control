@@ -126,6 +126,27 @@ Archiving affects only the Codex sidebar thread. The registry record and event a
 
 `audit-archive-backlog` scans every project registry without writing it. It treats a complete legacy terminal record with no thread-control group as in-memory `archiveStatus: pending`, groups backlog by `projectKey + directControllerThreadId`, and returns only currently legal `set_thread_title` or `set_thread_archived` actions. Every debt item reports `actionable`, `title_failed`, `archive_failed`, or `waiting_descendants`; only `actionable` items contribute actions. Failed debt remains visible without creating a heartbeat loop. The registered direct controller applies each returned action and records the result; explicit retry is a separate owner-authorized decision.
 
+## Result manifests and delivery history
+
+New `implementation` and `visual_implementation` registrations use `resultProtocolVersion: 1`. Their controller-owned implementation contract must include `resultRequirements` with `manifestSchemaVersion: 1`, one or more `allowedArtifactRoots`, arrays of required artifact types and milestones, and an optional `presentationStageId`. A visual task must bind that stage to a required gate, require `screenshot` or `contact_sheet`, and require `after` or `current`. Records created before v0.8.0 migrate in memory with result protocol 0, null requirements, and empty history; read-only queries do not rewrite them.
+
+The worker passes a project-owned result manifest to `complete --result-manifest`. Its identity must match `projectKey`, direct controller, task, display key, attempt, contract version/digest, and candidate commit. The worker may declare only `integrationStatus: candidate`. It also records:
+
+- a short user-visible summary;
+- non-empty actual changes and explicit incomplete items;
+- a test status/summary plus at least one command or before/after metric;
+- a screenshot-absence reason for non-visual work with no screenshot;
+- typed artifacts: `screenshot`, `reference`, `contact_sheet`, `log`, `test_summary`, or `report`;
+- milestone, label, description, timestamp, source stage/task, and workspace role for every artifact.
+
+Local artifacts resolve against the result manifest, then must remain inside a controller-fixed allowed root after real-path resolution. Completion verifies existence, non-zero file size, SHA-256, and no duplicate content hash inside the package. Screenshot/contact-sheet artifacts require a local path, `candidate_worktree` workspace role, and decodable non-zero PNG, JPEG, or GIF dimensions; a worker candidate cannot label a result as `project_main` or `task_control`. A `project_main` item is allowed only as an explicit reference. Remote references may use only HTTP(S) and cannot claim a locally verified hash or dimensions. The completion event stores the normalized result snapshot; ingestion re-reads it and rejects drift before appending it to `deliverableHistory`.
+
+History is append-only by attempt. Review updates only the matching package: `candidate -> accepted_not_integrated -> integrated`, or `candidate -> rejected`. `changes_requested`, `reclaimed`, and `blocked` retain rejected artifacts; the report renders those states in red. Visual acceptance requires a review reason and at least one selected screenshot/contact sheet. The project `visualOracle` and direct controller judge quality; the control plane validates structure and identity only.
+
+`controller-query-deliverables` returns the registered controller subtree and all packages. `controller-build-delivery-report` deterministically writes `$CODEX_HOME/task-control/reports/<project-key>/<controller-thread-id>/index.html`. The page contains work-package state, every attempt, actual changes, tests/metrics, blockers, next gates, selected images, and a chronological artifact timeline. It links local paths with absolute file URIs and does not copy project files. Legacy stage references may appear as unverified references; missing history is shown as `historical_evidence_unavailable` and never blocks a current task.
+
+The report embeds the registry `updatedAt` value. A current scan compares this marker and returns `reportNeedsRefresh`, but that flag is informational: it must not affect `needsControllerAttention`, `shouldKeepHeartbeat`, controller queues, or heartbeat rearm.
+
 ## Adaptive wake-up and lease contract
 
 A file under `events/` does not wake a Codex task by itself. Progress and completion commands return a short notification for the registered direct parent. The direct controller also maintains exactly one confirmed one-shot heartbeat as a recovery watchdog; fixed repeating cron and in-place heartbeat replacement are forbidden.

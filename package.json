@@ -1,6 +1,6 @@
 {
   "name": "codex-task-control",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "description": "A quota-aware controller that names, reviews, and archives visible Codex tasks while forbidding internal subagents.",
   "type": "module",

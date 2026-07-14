@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.7.0 preview. The ledger, contract checks, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
+> Windows-first v0.8.0 preview. The ledger, contract/result checks, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,7 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.7.0 does
+## What v0.8.0 does
 
 - Keeps task registries isolated by normalized project root.
 - Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
@@ -46,6 +46,10 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Uses adaptive `COUNT=1` cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval.
 - Turns stale, wrong-ID, expired, repeated, or misconfigured heartbeat invocations into an empty-queue `delete_stale_automation` path instead of a silent infinite loop.
 - Persists last successful generation, automation ID, pending action, trigger/stale/delete-failure counts, fuse evidence, and one-time notification state.
+- Requires schema-versioned result manifests for newly registered implementation tasks. They capture the candidate commit, user-visible outcome, actual changes, incomplete items, readable tests/metrics, and typed artifact references.
+- Validates visual presentation artifacts before completion: required stage/type/milestone, ownership, allowlisted roots, file existence, non-zero size, SHA-256 uniqueness, and decodable PNG/JPEG/GIF dimensions.
+- Appends every attempt to immutable deliverable history, keeps rejected/reclaimed/blocked evidence visibly failed, and distinguishes candidate, accepted-not-integrated, and integrated outcomes.
+- Builds a deterministic, mobile-friendly disk report at `$CODEX_HOME/task-control/reports/<project-key>/<controller-thread-id>/index.html` without writing into the project repository.
 - Separates actionable cleanup from historical debt: a failed title/archive tool action stays auditable but no longer re-emits itself or keeps a heartbeat alive.
 - Lets only the registered direct controller explicitly requeue a failed sidebar action with a recorded reason.
 - Archives `integrated`, `blocked`, and `reclaimed` visible tasks after their descendants while retaining the complete ledger history.
@@ -56,13 +60,14 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.7.0 does not do
+## What v0.8.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, or steer Codex tasks.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
 - It cannot make Codex App compare-and-delete an automation atomically or stop a tool call inside the host. The protocol preserves the old confirmed generation, uses a 30-second pending-action deadline, and self-recovers on the next trigger; a host-native stale cleanup hook remains the long-term fix.
+- It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
 ## Install
@@ -83,7 +88,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.7.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.8.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -166,6 +171,17 @@ node $TaskControl query-parent --self "worker-1"
 ```
 
 Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.
+
+New implementation contracts must also include `resultRequirements`. At completion the worker supplies a project-owned result manifest; the controller then reviews and builds the historical report:
+
+```powershell
+node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" --result-manifest "docs/test-reports/task-result.json"
+node $TaskControl mark-accepted --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --reason "Contract and visual oracle passed." --selected-artifact "after"
+node $TaskControl controller-query-deliverables --project-root "C:\work\example" --controller "controller-1"
+node $TaskControl controller-build-delivery-report --project-root "C:\work\example" --controller "controller-1"
+```
+
+Use [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json) for non-visual work and [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json) for visual work. Old tasks remain readable and show “historical evidence unavailable” when no trustworthy artifacts exist.
 
 If a sidebar title/archive tool call fails, record the failure once. It becomes non-actionable audit debt and the heartbeat stops when no other work remains. The registered direct controller can deliberately requeue it later:
 

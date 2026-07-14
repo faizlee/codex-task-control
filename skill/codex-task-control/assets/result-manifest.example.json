@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "projectKey": "replace-with-project-key",
+  "controllerThreadId": "controller-thread-id",
+  "threadId": "worker-thread-id",
+  "displayKey": "01",
+  "attempt": 1,
+  "contractVersion": "example-r1",
+  "contractDigest": "replace-with-64-character-contract-digest",
+  "candidateCommit": "replace-with-candidate-commit",
+  "integrationStatus": "candidate",
+  "userVisibleSummary": "The bounded behavior and its targeted verification are complete.",
+  "actualChanges": [
+    "Updated the existing contract-bound implementation path."
+  ],
+  "incompleteItems": [],
+  "testSummary": {
+    "status": "passed",
+    "summary": "The targeted test passed and the failure count moved to zero.",
+    "commands": [
+      "replace-with-project-test-command"
+    ],
+    "metrics": [
+      {
+        "label": "failed targeted tests",
+        "before": 1,
+        "after": 0,
+        "unit": "tests"
+      }
+    ]
+  },
+  "noScreenshotReason": "This change has no user-visible surface; tests and before/after metrics are the relevant result.",
+  "artifacts": []
+}

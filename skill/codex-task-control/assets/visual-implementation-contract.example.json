@@ -52,5 +52,19 @@
       "Required content is visible without overlap.",
       "No ERROR banner or missing asset is present."
     ]
+  },
+  "resultRequirements": {
+    "manifestSchemaVersion": 1,
+    "allowedArtifactRoots": [
+      "docs/test-reports",
+      "_scratch/task-results"
+    ],
+    "requiredArtifactTypes": [
+      "screenshot"
+    ],
+    "requiredMilestones": [
+      "after"
+    ],
+    "presentationStageId": "visual-verification"
   }
 }

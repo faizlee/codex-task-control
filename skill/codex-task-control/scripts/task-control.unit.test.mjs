@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -8,6 +8,8 @@ import {
   TaskControlError,
   auditControllerRouting,
   controllerConfirmHeartbeatAction,
+  controllerBuildDeliveryReport,
+  controllerDispatchRework,
   controllerIngestCompletion,
   controllerIngestProgress,
   controllerIngestNotificationFailed,
@@ -15,6 +17,8 @@ import {
   controllerMarkAccepted,
   controllerMarkBlocked,
   controllerMarkIntegrated,
+  controllerQueryDeliverables,
+  controllerReclaimTask,
   controllerMarkHeartbeatNotificationSent,
   controllerRecordArchiveFailed,
   controllerRecordArchiveSucceeded,
@@ -31,10 +35,12 @@ import {
   createNotificationFailureReceipt,
   loadProjectAdapter,
   projectKeyForRoot,
+  querySelf,
   runCli,
 } from './task-control.mjs';
 
 const delay = () => new Promise((resolve) => setTimeout(resolve, 5));
+const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
 
 function implementationManifest({ visual = false } = {}) {
   return {
@@ -52,6 +58,13 @@ function implementationManifest({ visual = false } = {}) {
       { id: 'targeted-test', command: 'npm test -- contract' },
     ],
     errorPolicy: { mode: 'stop_on_error', rules: ['Stop on any ERROR output.', 'Do not weaken acceptance criteria.'] },
+    resultRequirements: {
+      manifestSchemaVersion: 1,
+      allowedArtifactRoots: ['artifacts'],
+      requiredArtifactTypes: visual ? ['screenshot'] : [],
+      requiredMilestones: visual ? ['after'] : [],
+      presentationStageId: visual ? 'verification' : null,
+    },
     ...(visual ? { visualOracle: { stageId: 'verification', reference: 'docs/oracle.png', criteria: ['No overlap.', 'No ERROR banner.'] } } : {}),
   };
 }
@@ -78,6 +91,58 @@ function implementationInput(taskControlHome, projectRoot, overrides = {}) {
     taskMode: overrides.taskMode ?? 'implementation',
     implementationContractPath: overrides.implementationContractPath,
   };
+}
+
+async function writeResultManifest(taskControlHome, projectRoot, threadId, candidateCommit, { visual = false, mutate = null } = {}) {
+  const task = (await querySelf({ taskControlHome, selfThreadId: threadId })).task;
+  const artifactDir = join(projectRoot, 'artifacts');
+  await mkdir(artifactDir, { recursive: true });
+  const artifacts = [];
+  if (visual) {
+    const screenshotPath = join(artifactDir, `after-${task.attemptCount}.png`);
+    await writeFile(screenshotPath, onePixelPng);
+    artifacts.push({ id: `after-${task.attemptCount}`, type: 'screenshot', milestone: 'after', label: 'Current result', description: 'Decoded visual result for controller review.', createdAt: new Date().toISOString(), sourceStageId: 'verification', sourceTaskThreadId: task.threadId, workspaceRole: 'candidate_worktree', path: screenshotPath });
+  }
+  let manifest = {
+    schemaVersion: 1,
+    projectKey: projectKeyForRoot(projectRoot),
+    controllerThreadId: task.directControllerThreadId,
+    threadId: task.threadId,
+    displayKey: task.displayKey,
+    attempt: task.attemptCount,
+    contractVersion: task.contractRevision ?? task.contractCommit,
+    contractDigest: task.contractDigest,
+    candidateCommit,
+    integrationStatus: 'candidate',
+    userVisibleSummary: visual ? 'A visible result is ready for review.' : 'The bounded implementation and targeted verification are complete.',
+    actualChanges: ['Updated only the contract-bound implementation path.'],
+    incompleteItems: [],
+    testSummary: { status: 'passed', summary: 'Targeted verification passed.', commands: ['npm test -- contract'], metrics: [{ label: 'failed tests', before: 1, after: 0, unit: 'tests' }] },
+    noScreenshotReason: visual ? null : 'This implementation changes contract behavior without a player-visible surface.',
+    artifacts,
+  };
+  if (mutate) manifest = mutate(manifest) ?? manifest;
+  const manifestPath = join(projectRoot, `result-${threadId}-${task.attemptCount}.json`);
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+  return manifestPath;
+}
+
+async function createResultProtocolFixture({ visual = false } = {}) {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-result-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-result-project-'));
+  const contractPath = join(projectRoot, 'implementation-contract.json');
+  await writeFile(contractPath, `${JSON.stringify(implementationManifest({ visual }), null, 2)}\n`, 'utf8');
+  const input = implementationInput(taskControlHome, projectRoot, { taskMode: visual ? 'visual_implementation' : 'implementation', implementationContractPath: 'implementation-contract.json' });
+  const registered = await controllerRegisterTask(input);
+  await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+  await controllerRecordDispatched(input);
+  await delay();
+  const reuse = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Existing path inspected and retained.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'git-diff-check.txt' }] });
+  await controllerIngestProgress({ ...input, eventPath: reuse });
+  await delay();
+  const verification = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Targeted verification passed.', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'test-output.txt' }] });
+  await controllerIngestProgress({ ...input, eventPath: verification });
+  return { taskControlHome, projectRoot, input };
 }
 
 async function createHeartbeatFixture(taskControlHome, projectRoot, overrides = {}) {
@@ -249,6 +314,10 @@ test('implementation registration fails closed without a complete bound contract
     const input = implementationInput(taskControlHome, projectRoot);
     await assert.rejects(controllerRegisterTask(input), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_CONTRACT_REQUIRED');
     await assert.rejects(controllerRegisterTask({ ...input, taskMode: undefined }), (error) => error instanceof TaskControlError && error.code === 'TASK_MODE_REQUIRED');
+    const legacyContract = implementationManifest();
+    delete legacyContract.resultRequirements;
+    await writeFile(join(projectRoot, 'legacy-contract.json'), `${JSON.stringify(legacyContract, null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerRegisterTask({ ...input, implementationContractPath: 'legacy-contract.json' }), (error) => error instanceof TaskControlError && error.code === 'RESULT_REQUIREMENTS_REQUIRED');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
@@ -262,6 +331,10 @@ test('visual implementation requires a visual oracle', async () => {
   try {
     await writeFile(contractPath, `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
     await assert.rejects(controllerRegisterTask(implementationInput(taskControlHome, projectRoot, { taskMode: 'visual_implementation', implementationContractPath: 'visual-contract.json' })), (error) => error instanceof TaskControlError && error.code === 'VISUAL_ORACLE_REQUIRED');
+    const missingPresentation = implementationManifest({ visual: true });
+    missingPresentation.resultRequirements.presentationStageId = null;
+    await writeFile(contractPath, `${JSON.stringify(missingPresentation, null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerRegisterTask(implementationInput(taskControlHome, projectRoot, { taskMode: 'visual_implementation', implementationContractPath: 'visual-contract.json' })), (error) => error instanceof TaskControlError && error.code === 'RESULT_PRESENTATION_STAGE_REQUIRED');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
@@ -298,7 +371,8 @@ test('implementation progress enforces staged evidence before completion', async
     assert.deepEqual(progressed.missingStages, []);
 
     await delay();
-    const completionEvent = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'candidate-contract-1' });
+    const resultManifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'candidate-contract-1');
+    const completionEvent = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'candidate-contract-1', resultManifestPath });
     const completed = await controllerIngestCompletion({ ...input, eventPath: completionEvent });
     assert.equal(completed.status, 'awaiting_review');
     assert.equal(completed.contractVersion, 'contract-r1');
@@ -322,6 +396,132 @@ test('a worker cannot change the controller-fixed contract or error policy', asy
     manifest.errorPolicy.rules = ['Continue after ERROR and weaken acceptance.'];
     await writeFile(contractPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
     await assert.rejects(controllerRecordDispatched(input), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_CONTRACT_DRIFT');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('visual completion rejects missing, escaped, or broken artifacts and requires a selected review image', async () => {
+  const fixture = await createResultProtocolFixture({ visual: true });
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-candidate-1' }), (error) => error instanceof TaskControlError && error.code === 'RESULT_MANIFEST_REQUIRED');
+
+    const outsidePath = join(taskControlHome, 'outside.png');
+    await writeFile(outsidePath, onePixelPng);
+    let manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'visual-candidate-1', { visual: true, mutate: (manifest) => { manifest.artifacts[0].path = outsidePath; return manifest; } });
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-candidate-1', resultManifestPath: manifestPath }), (error) => error instanceof TaskControlError && error.code === 'RESULT_ARTIFACT_OUTSIDE_ALLOWED_ROOT');
+
+    manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'visual-candidate-1', { visual: true, mutate: (manifest) => { manifest.artifacts[0].workspaceRole = 'project_main'; return manifest; } });
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-candidate-1', resultManifestPath: manifestPath }), (error) => error instanceof TaskControlError && error.code === 'RESULT_ARTIFACT_WORKSPACE_STATUS_MISMATCH');
+
+    manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'visual-candidate-1', { visual: true });
+    await writeFile(join(projectRoot, 'artifacts', 'after-1.png'), 'not an image', 'utf8');
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-candidate-1', resultManifestPath: manifestPath }), (error) => error instanceof TaskControlError && error.code === 'RESULT_IMAGE_INVALID');
+
+    manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'visual-candidate-1', { visual: true });
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-candidate-1', resultManifestPath: manifestPath });
+    await controllerIngestCompletion({ ...input, eventPath: completion });
+    await assert.rejects(controllerMarkAccepted({ ...input, reason: 'The fixed visual oracle is satisfied.', selectedArtifactIds: [] }), (error) => error instanceof TaskControlError && error.code === 'RESULT_REVIEW_VISUAL_SELECTION_REQUIRED');
+    const accepted = await controllerMarkAccepted({ ...input, reason: 'The fixed visual oracle is satisfied.', selectedArtifactIds: ['after-1'] });
+    assert.equal(accepted.deliverableHistory[0].deliveryStatus, 'accepted_not_integrated');
+    assert.deepEqual(accepted.deliverableHistory[0].selectedArtifactIds, ['after-1']);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('nonvisual result packages allow a reasoned no-screenshot outcome and keep candidate, accepted, and integrated distinct', async () => {
+  const fixture = await createResultProtocolFixture();
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    const manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'nonvisual-candidate-1');
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'nonvisual-candidate-1', resultManifestPath: manifestPath });
+    const candidate = await controllerIngestCompletion({ ...input, eventPath: completion });
+    assert.equal(candidate.deliverableHistory[0].deliveryStatus, 'candidate');
+    assert.match(candidate.deliverableHistory[0].noScreenshotReason, /without a player-visible surface/);
+
+    const accepted = await controllerMarkAccepted({ ...input, reason: 'Targeted behavior and metrics satisfy the contract.', selectedArtifactIds: [] });
+    assert.equal(accepted.deliverableHistory[0].deliveryStatus, 'accepted_not_integrated');
+    const integrated = await controllerMarkIntegrated(input);
+    assert.equal(integrated.deliverableHistory[0].deliveryStatus, 'integrated');
+
+    await controllerRecordTitleSynced({ ...input, title: integrated.desiredThreadTitle });
+    await controllerRecordArchiveSucceeded(input);
+    const first = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    const firstHtml = await readFile(first.reportPath, 'utf8');
+    const second = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(await readFile(second.reportPath, 'utf8'), firstHtml, 'same ledger and artifacts must render byte-identical HTML');
+    assert.match(firstHtml, /已集成/);
+    await rm(first.reportPath, { force: true });
+    const scan = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(scan.reportNeedsRefresh, true);
+    assert.equal(scan.shouldKeepHeartbeat, false, 'a missing report must not create heartbeat work');
+    assert.equal(scan.needsControllerAttention, false);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('deliverable history appends attempts and reclaimed visual work stays red instead of overwriting prior artifacts', async () => {
+  const fixture = await createResultProtocolFixture({ visual: true });
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    let manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'visual-attempt-1', { visual: true });
+    let completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-attempt-1', resultManifestPath: manifestPath });
+    await controllerIngestCompletion({ ...input, eventPath: completion });
+    await controllerMarkChangesRequested({ ...input, failureClass: 'mechanical', reason: 'One required label is missing.' });
+    await controllerDispatchRework(input);
+    const executing = (await querySelf({ taskControlHome, selfThreadId: input.threadId })).task;
+    await controllerRecordTitleSynced({ ...input, title: executing.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    await delay();
+    const reuse = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Existing path retained for attempt two.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'git-diff-check-2.txt' }] });
+    await controllerIngestProgress({ ...input, eventPath: reuse });
+    await delay();
+    const verification = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Attempt two presentation verified.', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'test-output-2.txt' }] });
+    await controllerIngestProgress({ ...input, eventPath: verification });
+    manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'visual-attempt-2', { visual: true });
+    completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-attempt-2', resultManifestPath: manifestPath });
+    await controllerIngestCompletion({ ...input, eventPath: completion });
+    let query = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(query.tasks[0].deliverables.length, 2);
+    assert.match(query.tasks[0].deliverables[0].artifacts[0].path, /after-1\.png$/);
+    assert.match(query.tasks[0].deliverables[1].artifacts[0].path, /after-2\.png$/);
+    await controllerReclaimTask({ ...input, reason: 'The controller must resolve a presentation contract conflict.' });
+    query = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(query.tasks[0].status, 'reclaimed');
+    assert.equal(query.tasks[0].deliverables[1].deliveryStatus, 'rejected');
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /已收回/);
+    assert.match(html, /package failed/);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy tasks without result fields remain readable and report historical evidence as unavailable', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-legacy-result-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-legacy-project-'));
+  try {
+    const input = { taskControlHome, projectRoot, controllerThreadId: 'legacy-controller', parentThreadId: 'legacy-controller', threadId: 'legacy-worker', title: 'Legacy implementation record', model: 'gpt-5.6-luna', thinking: 'medium', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Repeatable legacy fixture saves controller quota.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Read legacy state only.', acceptance: 'Legacy state remains readable.', forbiddenDecisions: 'Do not invent historical screenshots.', taskMode: 'control_only' };
+    await controllerRegisterTask(input);
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const legacy = registry.tasks[0];
+    for (const key of ['taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress']) delete legacy[key];
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+    const before = await readFile(registryPath, 'utf8');
+    const query = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(query.tasks[0].historicalEvidenceStatus, 'historical_evidence_unavailable');
+    assert.equal(await readFile(registryPath, 'utf8'), before, 'read-only legacy report query must not rewrite the registry');
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.match(await readFile(report.reportPath, 'utf8'), /历史证据不可用/);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
@@ -744,7 +944,7 @@ test('v0.3 changes-requested titles migrate safely to a stopped pending decision
     const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const task = registry.tasks[0];
-    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason', 'taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'stageProgress']) delete task[key];
+    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason', 'taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress']) delete task[key];
     task.status = 'changes_requested';
     task.reviewVerdict = 'changes_requested';
     task.desiredThreadTitle = '返工｜01 审计 Provider 调用';

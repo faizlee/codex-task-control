@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, win32 } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { access, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { access, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
 
 export const TASK_STATUSES = Object.freeze(['executing', 'awaiting_review', 'changes_requested', 'accepted', 'integrated', 'blocked', 'reclaimed']);
 export const REVIEW_VERDICTS = Object.freeze(['pending', 'changes_requested', 'accepted']);
@@ -39,6 +39,14 @@ export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'ret
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
 export const REGISTER_TASK_MODES = Object.freeze(['control_only', 'implementation', 'visual_implementation']);
 export const IMPLEMENTATION_CONTRACT_SCHEMA_VERSION = 1;
+export const RESULT_MANIFEST_SCHEMA_VERSION = 1;
+export const RESULT_PROTOCOL_VERSION = 1;
+export const RESULT_ARTIFACT_TYPES = Object.freeze(['screenshot', 'reference', 'contact_sheet', 'log', 'test_summary', 'report']);
+export const RESULT_ARTIFACT_MILESTONES = Object.freeze(['reference', 'before', 'intermediate', 'after', 'current', 'failure', 'other']);
+export const RESULT_WORKSPACE_ROLES = Object.freeze(['candidate_worktree', 'project_main', 'external_reference', 'task_control']);
+export const RESULT_TEST_STATUSES = Object.freeze(['passed', 'failed', 'partial', 'not_run']);
+export const RESULT_REVIEW_STATUSES = Object.freeze(['pending', 'accepted', 'rejected']);
+export const DELIVERY_STATUSES = Object.freeze(['candidate', 'accepted_not_integrated', 'integrated', 'rejected']);
 export const HEARTBEAT_INTERVALS_MS = Object.freeze({
   repeatable: 3 * 60 * 1000,
   bounded_reasoning_medium: 5 * 60 * 1000,
@@ -132,9 +140,9 @@ function resolveImplementationContractPath(projectRoot, reference) {
   return resolved;
 }
 
-function validateImplementationContractManifest(value, taskMode) {
+function validateImplementationContractManifest(value, taskMode, { requireResultRequirements = false } = {}) {
   if (!isObject(value) || value.schemaVersion !== IMPLEMENTATION_CONTRACT_SCHEMA_VERSION) fail('IMPLEMENTATION_CONTRACT_INVALID', `实施合同 schemaVersion 必须为 ${IMPLEMENTATION_CONTRACT_SCHEMA_VERSION}`);
-  const allowed = new Set(['schemaVersion', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle']);
+  const allowed = new Set(['schemaVersion', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultRequirements']);
   if (Object.keys(value).some((key) => !allowed.has(key))) fail('IMPLEMENTATION_CONTRACT_INVALID', '实施合同包含未知字段');
   const contractRevision = nonEmpty(value.contractRevision) ? value.contractRevision.trim() : null;
   const contractCommit = nonEmpty(value.contractCommit) ? value.contractCommit.trim() : null;
@@ -177,10 +185,31 @@ function validateImplementationContractManifest(value, taskMode) {
     if (!stageIds.has(stageId)) fail('VISUAL_ORACLE_INVALID', 'visualOracle.stageId 未登记');
     visualOracle = { stageId, reference: value.visualOracle.reference.trim(), criteria: stringArray(value.visualOracle.criteria, 'visualOracle.criteria', { allowEmpty: false }) };
   }
-  return { contractRevision, contractCommit, reuseRequirements, forbiddenNewPaths, forbiddenReimplementations, stageGates, evidenceCommands, errorPolicy, visualOracle };
+  let resultRequirements = null;
+  if (value.resultRequirements !== undefined && value.resultRequirements !== null) {
+    const resultAllowed = new Set(['manifestSchemaVersion', 'allowedArtifactRoots', 'requiredArtifactTypes', 'requiredMilestones', 'presentationStageId']);
+    if (!isObject(value.resultRequirements) || Object.keys(value.resultRequirements).some((key) => !resultAllowed.has(key)) || value.resultRequirements.manifestSchemaVersion !== RESULT_MANIFEST_SCHEMA_VERSION) fail('RESULT_REQUIREMENTS_INVALID', `resultRequirements 必须使用 manifestSchemaVersion=${RESULT_MANIFEST_SCHEMA_VERSION}`);
+    const allowedArtifactRoots = stringArray(value.resultRequirements.allowedArtifactRoots, 'resultRequirements.allowedArtifactRoots', { allowEmpty: false });
+    if (allowedArtifactRoots.some((root) => root.replaceAll('/', '\\').split('\\').includes('..'))) fail('RESULT_REQUIREMENTS_INVALID', 'allowedArtifactRoots 不得包含 .. 路径段');
+    const requiredArtifactTypes = stringArray(value.resultRequirements.requiredArtifactTypes, 'resultRequirements.requiredArtifactTypes');
+    if (requiredArtifactTypes.some((type) => !RESULT_ARTIFACT_TYPES.includes(type)) || new Set(requiredArtifactTypes).size !== requiredArtifactTypes.length) fail('RESULT_REQUIREMENTS_INVALID', 'requiredArtifactTypes 包含未知或重复类型');
+    const requiredMilestones = stringArray(value.resultRequirements.requiredMilestones, 'resultRequirements.requiredMilestones');
+    if (requiredMilestones.some((milestone) => !RESULT_ARTIFACT_MILESTONES.includes(milestone)) || new Set(requiredMilestones).size !== requiredMilestones.length) fail('RESULT_REQUIREMENTS_INVALID', 'requiredMilestones 包含未知或重复值');
+    const presentationStageId = nonEmpty(value.resultRequirements.presentationStageId) ? value.resultRequirements.presentationStageId.trim() : null;
+    if (presentationStageId !== null && (!stageIds.has(presentationStageId) || !stageGates.find((entry) => entry.id === presentationStageId)?.required)) fail('RESULT_REQUIREMENTS_INVALID', 'presentationStageId 必须指向 required stage gate');
+    if (taskMode === 'visual_implementation') {
+      if (presentationStageId === null) fail('RESULT_PRESENTATION_STAGE_REQUIRED', 'visual_implementation 必须绑定 presentation/result stage');
+      if (!requiredArtifactTypes.some((type) => ['screenshot', 'contact_sheet'].includes(type))) fail('RESULT_VISUAL_ARTIFACT_REQUIRED', 'visual_implementation 必须要求 screenshot 或 contact_sheet');
+      if (!requiredMilestones.some((milestone) => ['after', 'current'].includes(milestone))) fail('RESULT_VISUAL_MILESTONE_REQUIRED', 'visual_implementation 必须要求 after 或 current 里程碑');
+    }
+    resultRequirements = { manifestSchemaVersion: RESULT_MANIFEST_SCHEMA_VERSION, allowedArtifactRoots, requiredArtifactTypes, requiredMilestones, presentationStageId };
+  } else if (requireResultRequirements) {
+    fail('RESULT_REQUIREMENTS_REQUIRED', '新登记 implementation/visual_implementation 必须在合同中提供 resultRequirements');
+  }
+  return { contractRevision, contractCommit, reuseRequirements, forbiddenNewPaths, forbiddenReimplementations, stageGates, evidenceCommands, errorPolicy, visualOracle, resultRequirements };
 }
 
-export async function loadImplementationContract(projectRoot, reference, taskMode) {
+export async function loadImplementationContract(projectRoot, reference, taskMode, options = {}) {
   if (!['implementation', 'visual_implementation'].includes(taskMode)) fail('IMPLEMENTATION_CONTRACT_NOT_APPLICABLE', '只有 implementation/visual_implementation 任务可以绑定实施合同');
   const implementationContractPath = resolveImplementationContractPath(projectRoot, reference);
   let raw;
@@ -195,8 +224,188 @@ export async function loadImplementationContract(projectRoot, reference, taskMod
   } catch (error) {
     fail('IMPLEMENTATION_CONTRACT_INVALID', `实施合同 JSON 无效: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const manifest = validateImplementationContractManifest(value, taskMode);
+  const manifest = validateImplementationContractManifest(value, taskMode, options);
   return { contractSchemaVersion: IMPLEMENTATION_CONTRACT_SCHEMA_VERSION, implementationContractPath, contractDigest: createHash('sha256').update(raw, 'utf8').digest('hex'), ...manifest };
+}
+
+function resolveResultManifestPath(projectRoot, reference) {
+  if (!nonEmpty(reference)) fail('RESULT_MANIFEST_REQUIRED', 'resultProtocolVersion=1 的实施任务必须提供 result manifest');
+  const root = win32.resolve(projectRoot.replaceAll('/', '\\'));
+  const resolved = win32.resolve(root, reference.replaceAll('/', '\\'));
+  const normalizedRoot = root.toLowerCase();
+  const normalizedResolved = resolved.toLowerCase();
+  if (normalizedResolved !== normalizedRoot && !normalizedResolved.startsWith(`${normalizedRoot}\\`)) fail('RESULT_MANIFEST_OUTSIDE_PROJECT', 'result manifest 必须位于项目根目录内');
+  return resolved;
+}
+
+function windowsPathInside(filePath, rootPath) {
+  const normalizedFile = win32.resolve(filePath).toLowerCase();
+  const normalizedRoot = win32.resolve(rootPath).toLowerCase();
+  return normalizedFile === normalizedRoot || normalizedFile.startsWith(`${normalizedRoot}\\`);
+}
+
+function imageDimensions(buffer) {
+  if (buffer.length >= 24 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { format: 'png', width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
+  if (buffer.length >= 10 && ['GIF87a', 'GIF89a'].includes(buffer.subarray(0, 6).toString('ascii'))) {
+    return { format: 'gif', width: buffer.readUInt16LE(6), height: buffer.readUInt16LE(8) };
+  }
+  if (buffer.length >= 4 && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    const sofMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+    while (offset + 8 < buffer.length) {
+      if (buffer[offset] !== 0xff) { offset += 1; continue; }
+      const marker = buffer[offset + 1];
+      if (marker === 0xd9 || marker === 0xda) break;
+      if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) { offset += 2; continue; }
+      if (offset + 4 > buffer.length) break;
+      const segmentLength = buffer.readUInt16BE(offset + 2);
+      if (segmentLength < 2 || offset + 2 + segmentLength > buffer.length) break;
+      if (sofMarkers.has(marker)) return { format: 'jpeg', width: buffer.readUInt16BE(offset + 7), height: buffer.readUInt16BE(offset + 5) };
+      offset += 2 + segmentLength;
+    }
+  }
+  fail('RESULT_IMAGE_INVALID', '图片无法解码；仅接受有效 PNG、JPEG 或 GIF');
+}
+
+async function normalizeLocalResultArtifact(artifact, resultManifestPath, projectRoot, allowedArtifactRoots) {
+  const candidate = win32.isAbsolute(artifact.path) ? win32.resolve(artifact.path) : win32.resolve(dirname(resultManifestPath), artifact.path.replaceAll('/', '\\'));
+  let resolved;
+  try {
+    resolved = await realpath(candidate);
+  } catch (error) {
+    fail('RESULT_ARTIFACT_PATH_INVALID', `artifact 路径不存在: ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const allowedRoots = [];
+  for (const rootRef of allowedArtifactRoots) {
+    const rootCandidate = win32.isAbsolute(rootRef) ? win32.resolve(rootRef) : win32.resolve(projectRoot, rootRef.replaceAll('/', '\\'));
+    try {
+      allowedRoots.push(await realpath(rootCandidate));
+    } catch {
+      // A missing allowlisted root cannot authorize an artifact.
+    }
+  }
+  if (!allowedRoots.some((root) => windowsPathInside(resolved, root))) fail('RESULT_ARTIFACT_OUTSIDE_ALLOWED_ROOT', `artifact 超出合同允许根目录: ${resolved}`);
+  const info = await stat(resolved);
+  if (!info.isFile() || info.size <= 0) fail('RESULT_ARTIFACT_EMPTY', `artifact 必须是非空文件: ${resolved}`);
+  const buffer = await readFile(resolved);
+  const sha256 = createHash('sha256').update(buffer).digest('hex');
+  if (artifact.sha256 !== undefined && artifact.sha256 !== sha256) fail('RESULT_ARTIFACT_HASH_MISMATCH', `artifact hash 不匹配: ${artifact.id}`);
+  let dimensions = null;
+  if (['screenshot', 'contact_sheet'].includes(artifact.type)) {
+    dimensions = imageDimensions(buffer);
+    if (dimensions.width <= 0 || dimensions.height <= 0) fail('RESULT_IMAGE_INVALID', `图片尺寸无效: ${artifact.id}`);
+    if (artifact.dimensions !== undefined && (!isObject(artifact.dimensions) || artifact.dimensions.width !== dimensions.width || artifact.dimensions.height !== dimensions.height)) fail('RESULT_IMAGE_DIMENSION_MISMATCH', `artifact dimensions 与文件不一致: ${artifact.id}`);
+  } else if (artifact.dimensions !== undefined) {
+    fail('RESULT_ARTIFACT_INVALID', `非图片 artifact 不得声明 dimensions: ${artifact.id}`);
+  }
+  return { path: resolved, uri: null, sha256, dimensions };
+}
+
+function normalizeResultTestSummary(value) {
+  if (!isObject(value) || Object.keys(value).some((key) => !['status', 'summary', 'commands', 'metrics'].includes(key)) || !RESULT_TEST_STATUSES.includes(value.status) || !nonEmpty(value.summary)) fail('RESULT_TEST_SUMMARY_INVALID', 'testSummary 必须包含 status、summary、commands 和 metrics');
+  const commands = stringArray(value.commands, 'testSummary.commands');
+  if (!Array.isArray(value.metrics)) fail('RESULT_TEST_SUMMARY_INVALID', 'testSummary.metrics 必须是数组');
+  const metrics = value.metrics.map((metric) => {
+    if (!isObject(metric) || Object.keys(metric).some((key) => !['label', 'before', 'after', 'unit'].includes(key)) || !nonEmpty(metric.label) || !['string', 'number'].includes(typeof metric.before) || !['string', 'number'].includes(typeof metric.after) || (metric.unit !== undefined && metric.unit !== null && !nonEmpty(metric.unit))) fail('RESULT_TEST_SUMMARY_INVALID', 'metric 必须包含 label、before、after，可选 unit');
+    return { label: metric.label.trim(), before: metric.before, after: metric.after, unit: nonEmpty(metric.unit) ? metric.unit.trim() : null };
+  });
+  if (commands.length === 0 && metrics.length === 0) fail('RESULT_TEST_SUMMARY_INVALID', 'testSummary 至少提供一个命令或一组前后数值');
+  return { status: value.status, summary: value.summary.trim(), commands, metrics };
+}
+
+async function loadResultManifest(projectRoot, reference, task, candidateCommit) {
+  if (!implementationTask(task) || task.resultProtocolVersion !== RESULT_PROTOCOL_VERSION || task.resultRequirements === null) fail('RESULT_MANIFEST_NOT_APPLICABLE', '当前任务未启用 result protocol');
+  const lexicalResultManifestPath = resolveResultManifestPath(projectRoot, reference);
+  let resultManifestPath;
+  try {
+    const [realManifest, realProjectRoot] = await Promise.all([realpath(lexicalResultManifestPath), realpath(projectRoot)]);
+    if (!windowsPathInside(realManifest, realProjectRoot)) fail('RESULT_MANIFEST_OUTSIDE_PROJECT', 'result manifest 的真实路径超出项目根目录');
+    resultManifestPath = realManifest;
+  } catch (error) {
+    if (error instanceof TaskControlError) throw error;
+    fail('RESULT_MANIFEST_READ_FAILED', `无法解析 result manifest: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let raw;
+  try {
+    raw = await readFile(resultManifestPath, 'utf8');
+  } catch (error) {
+    fail('RESULT_MANIFEST_READ_FAILED', `无法读取 ${resultManifestPath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    fail('RESULT_MANIFEST_INVALID', `result manifest JSON 无效: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const allowed = new Set(['schemaVersion', 'projectKey', 'controllerThreadId', 'threadId', 'displayKey', 'attempt', 'contractVersion', 'contractDigest', 'candidateCommit', 'integrationStatus', 'userVisibleSummary', 'actualChanges', 'incompleteItems', 'testSummary', 'noScreenshotReason', 'artifacts']);
+  if (!isObject(value) || value.schemaVersion !== RESULT_MANIFEST_SCHEMA_VERSION || Object.keys(value).some((key) => !allowed.has(key))) fail('RESULT_MANIFEST_INVALID', `result manifest 必须使用 schemaVersion=${RESULT_MANIFEST_SCHEMA_VERSION} 且不得包含未知字段`);
+  if (value.projectKey !== projectKeyForRoot(projectRoot) || value.controllerThreadId !== task.directControllerThreadId || value.threadId !== task.threadId || value.displayKey !== task.displayKey || value.attempt !== task.attemptCount) fail('RESULT_MANIFEST_OWNERSHIP_MISMATCH', 'result manifest 的项目、主控、任务、displayKey 或 attempt 与台账不一致');
+  if (value.contractVersion !== contractVersion(task) || value.contractDigest !== task.contractDigest || value.candidateCommit !== candidateCommit) fail('RESULT_MANIFEST_CONTRACT_MISMATCH', 'result manifest 的合同或 candidateCommit 与 completion 不一致');
+  if (value.integrationStatus !== 'candidate') fail('RESULT_MANIFEST_STATUS_INVALID', 'worker 成果包只能声明 integrationStatus=candidate');
+  if (!nonEmpty(value.userVisibleSummary)) fail('RESULT_MANIFEST_INVALID', 'userVisibleSummary 不能为空');
+  const actualChanges = stringArray(value.actualChanges, 'actualChanges', { allowEmpty: false });
+  const incompleteItems = stringArray(value.incompleteItems, 'incompleteItems');
+  const testSummary = normalizeResultTestSummary(value.testSummary);
+  if (!Array.isArray(value.artifacts)) fail('RESULT_MANIFEST_INVALID', 'artifacts 必须是数组');
+  const artifactIds = new Set();
+  const artifactHashes = new Set();
+  const stageIds = new Set(task.stageGates.map((gate) => gate.id));
+  const artifacts = [];
+  for (const artifact of value.artifacts) {
+    const artifactAllowed = new Set(['id', 'type', 'milestone', 'label', 'description', 'createdAt', 'sourceStageId', 'sourceTaskThreadId', 'workspaceRole', 'path', 'uri', 'sha256', 'dimensions']);
+    if (!isObject(artifact) || Object.keys(artifact).some((key) => !artifactAllowed.has(key)) || !isSafeThreadId(artifact.id) || artifactIds.has(artifact.id) || !RESULT_ARTIFACT_TYPES.includes(artifact.type) || !RESULT_ARTIFACT_MILESTONES.includes(artifact.milestone) || !nonEmpty(artifact.label) || !nonEmpty(artifact.description) || !isTimestamp(artifact.createdAt) || !nonEmpty(artifact.sourceStageId) || !stageIds.has(artifact.sourceStageId) || artifact.sourceTaskThreadId !== task.threadId || !RESULT_WORKSPACE_ROLES.includes(artifact.workspaceRole)) fail('RESULT_ARTIFACT_INVALID', 'artifact 身份、类型、里程碑、来源阶段或任务无效');
+    if (artifact.workspaceRole === 'task_control' || (artifact.workspaceRole === 'project_main' && artifact.type !== 'reference') || (['screenshot', 'contact_sheet'].includes(artifact.type) && artifact.workspaceRole !== 'candidate_worktree')) fail('RESULT_ARTIFACT_WORKSPACE_STATUS_MISMATCH', 'worker candidate artifact 不得冒充 project_main/task_control 成果');
+    artifactIds.add(artifact.id);
+    const hasPath = nonEmpty(artifact.path);
+    const hasUri = nonEmpty(artifact.uri);
+    if (hasPath === hasUri) fail('RESULT_ARTIFACT_INVALID', `artifact ${artifact.id} 必须且只能提供 path 或 uri`);
+    if (['screenshot', 'contact_sheet'].includes(artifact.type) && !hasPath) fail('RESULT_IMAGE_PATH_REQUIRED', `视觉 artifact 必须提供可验证的本地 path: ${artifact.id}`);
+    let location;
+    if (hasPath) {
+      location = await normalizeLocalResultArtifact(artifact, resultManifestPath, projectRoot, task.resultRequirements.allowedArtifactRoots);
+      if (artifactHashes.has(location.sha256)) fail('RESULT_ARTIFACT_DUPLICATE_HASH', `成果包不得重复登记同一文件内容: ${artifact.id}`);
+      artifactHashes.add(location.sha256);
+    } else {
+      let parsed;
+      try { parsed = new URL(artifact.uri); } catch { fail('RESULT_ARTIFACT_URI_INVALID', `artifact URI 无效: ${artifact.id}`); }
+      if (!['http:', 'https:'].includes(parsed.protocol) || artifact.sha256 !== undefined || artifact.dimensions !== undefined) fail('RESULT_ARTIFACT_URI_INVALID', `远程 artifact 仅允许 http/https 且不得伪造本地 hash/dimensions: ${artifact.id}`);
+      location = { path: null, uri: parsed.toString(), sha256: null, dimensions: null };
+    }
+    artifacts.push({ id: artifact.id, type: artifact.type, milestone: artifact.milestone, label: artifact.label.trim(), description: artifact.description.trim(), createdAt: artifact.createdAt, sourceStageId: artifact.sourceStageId.trim(), sourceTaskThreadId: artifact.sourceTaskThreadId, workspaceRole: artifact.workspaceRole, ...location });
+  }
+  const artifactTypes = new Set(artifacts.map((artifact) => artifact.type));
+  const milestones = new Set(artifacts.map((artifact) => artifact.milestone));
+  const missingTypes = task.resultRequirements.requiredArtifactTypes.filter((type) => !artifactTypes.has(type));
+  const missingMilestones = task.resultRequirements.requiredMilestones.filter((milestone) => !milestones.has(milestone));
+  if (missingTypes.length > 0 || missingMilestones.length > 0) fail('RESULT_ARTIFACT_REQUIRED', `成果包缺少类型 [${missingTypes.join(', ')}] 或里程碑 [${missingMilestones.join(', ')}]`);
+  const imageArtifacts = artifacts.filter((artifact) => ['screenshot', 'contact_sheet'].includes(artifact.type));
+  if (task.taskMode === 'visual_implementation') {
+    if (imageArtifacts.length === 0 || !imageArtifacts.some((artifact) => artifact.sourceStageId === task.resultRequirements.presentationStageId)) fail('RESULT_VISUAL_ARTIFACT_REQUIRED', '视觉成果包必须包含来自 presentation stage 的可解码截图');
+  } else if (imageArtifacts.length === 0 && !nonEmpty(value.noScreenshotReason)) {
+    fail('RESULT_NO_SCREENSHOT_REASON_REQUIRED', '非视觉 implementation 没有截图时必须说明原因');
+  }
+  return {
+    resultManifestSchemaVersion: RESULT_MANIFEST_SCHEMA_VERSION,
+    resultManifestPath,
+    resultManifestDigest: createHash('sha256').update(raw, 'utf8').digest('hex'),
+    projectKey: value.projectKey,
+    controllerThreadId: value.controllerThreadId,
+    threadId: value.threadId,
+    displayKey: value.displayKey,
+    attempt: value.attempt,
+    contractVersion: value.contractVersion,
+    contractDigest: value.contractDigest,
+    candidateCommit: value.candidateCommit,
+    manifestIntegrationStatus: value.integrationStatus,
+    userVisibleSummary: value.userVisibleSummary.trim(),
+    actualChanges,
+    incompleteItems,
+    testSummary,
+    noScreenshotReason: nonEmpty(value.noScreenshotReason) ? value.noScreenshotReason.trim() : null,
+    artifacts,
+  };
 }
 
 async function replaceFileWithRetry(tempPath, filePath) {
@@ -226,6 +435,24 @@ async function atomicWriteJson(filePath, value) {
   } catch (error) {
     await rm(tempPath, { force: true });
     fail('REGISTRY_WRITE_FAILED', `无法原子写入 ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function atomicWriteText(filePath, value) {
+  await mkdir(dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    const handle = await open(tempPath, 'wx');
+    try {
+      await handle.writeFile(value, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await replaceFileWithRetry(tempPath, filePath);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    fail('REPORT_WRITE_FAILED', `无法原子写入 ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -460,12 +687,24 @@ function emptyContractControl(taskMode = 'legacy_unclassified') {
     evidenceCommands: [],
     errorPolicy: null,
     visualOracle: null,
+    resultProtocolVersion: 0,
+    resultRequirements: null,
+    deliverableHistory: [],
     stageProgress: [],
   };
 }
 
 function ensureImplementationControl(tasks) {
-  return tasks.map((task) => 'taskMode' in task ? { ...task, stageProgress: Array.isArray(task.stageProgress) ? task.stageProgress : [] } : { ...task, ...emptyContractControl('legacy_unclassified') });
+  return tasks.map((task) => {
+    if (!('taskMode' in task)) return { ...task, ...emptyContractControl('legacy_unclassified') };
+    return {
+      ...task,
+      resultProtocolVersion: Number.isInteger(task.resultProtocolVersion) ? task.resultProtocolVersion : 0,
+      resultRequirements: task.resultRequirements ?? null,
+      deliverableHistory: Array.isArray(task.deliverableHistory) ? task.deliverableHistory : [],
+      stageProgress: Array.isArray(task.stageProgress) ? task.stageProgress : [],
+    };
+  });
 }
 
 function implementationTask(task) {
@@ -492,12 +731,12 @@ function missingRequiredStageIds(task) {
 }
 
 function contractSummary(task) {
-  return { taskMode: task.taskMode ?? 'legacy_unclassified', contractVersion: contractVersion(task), contractDigest: task.contractDigest ?? null, completedStages: completedStageIds(task), missingStages: missingRequiredStageIds(task) };
+  return { taskMode: task.taskMode ?? 'legacy_unclassified', contractVersion: contractVersion(task), contractDigest: task.contractDigest ?? null, resultProtocolVersion: task.resultProtocolVersion ?? 0, completedStages: completedStageIds(task), missingStages: missingRequiredStageIds(task), deliverableCount: task.deliverableHistory?.length ?? 0 };
 }
 
 async function assertImplementationContractCurrent(task, projectRoot) {
   if (!implementationTask(task)) return;
-  const current = await loadImplementationContract(projectRoot ?? dirname(task.implementationContractPath), task.implementationContractPath, task.taskMode);
+  const current = await loadImplementationContract(projectRoot ?? dirname(task.implementationContractPath), task.implementationContractPath, task.taskMode, { requireResultRequirements: task.resultProtocolVersion === RESULT_PROTOCOL_VERSION });
   if (current.contractDigest !== task.contractDigest) fail('IMPLEMENTATION_CONTRACT_DRIFT', '实施合同内容已变化；主控必须收回任务并绑定新 revision，worker 不得自行改变合同或 errorPolicy');
 }
 
@@ -826,6 +1065,43 @@ function validateControllerHeartbeat(value, knownControllers) {
   return { ...value, pendingAction, actionHistory: value.actionHistory.map(validateHeartbeatHistoryEntry), retiredAutomationIds: [...new Set(value.retiredAutomationIds)] };
 }
 
+function validateDeliverablePackage(value, task, projectRoot) {
+  if (!isObject(value) || value.resultManifestSchemaVersion !== RESULT_MANIFEST_SCHEMA_VERSION || !nonEmpty(value.resultManifestPath) || !win32.isAbsolute(value.resultManifestPath) || !windowsPathInside(value.resultManifestPath, projectRoot) || !/^[0-9a-f]{64}$/.test(value.resultManifestDigest ?? '')) fail('REGISTRY_INVALID', 'deliverable result manifest 元数据无效');
+  if (value.projectKey !== projectKeyForRoot(projectRoot) || value.controllerThreadId !== task.directControllerThreadId || value.threadId !== task.threadId || value.displayKey !== task.displayKey || !Number.isInteger(value.attempt) || value.attempt < 1 || value.contractVersion !== contractVersion(task) || value.contractDigest !== task.contractDigest || !nonEmpty(value.candidateCommit) || value.manifestIntegrationStatus !== 'candidate' || !nonEmpty(value.userVisibleSummary)) fail('REGISTRY_INVALID', 'deliverable 身份、合同或候选状态无效');
+  if (!Array.isArray(value.actualChanges) || value.actualChanges.length === 0 || !value.actualChanges.every(nonEmpty) || !Array.isArray(value.incompleteItems) || !value.incompleteItems.every(nonEmpty)) fail('REGISTRY_INVALID', 'deliverable changes/incompleteItems 无效');
+  const testSummary = normalizeResultTestSummary(value.testSummary);
+  if (value.noScreenshotReason !== null && !nonEmpty(value.noScreenshotReason)) fail('REGISTRY_INVALID', 'deliverable noScreenshotReason 无效');
+  if (!Array.isArray(value.artifacts)) fail('REGISTRY_INVALID', 'deliverable artifacts 必须是数组');
+  const artifactIds = new Set();
+  const artifactHashes = new Set();
+  const stageIds = new Set(task.stageGates.map((gate) => gate.id));
+  const allowedRoots = (task.resultRequirements?.allowedArtifactRoots ?? []).map((root) => win32.isAbsolute(root) ? win32.resolve(root) : win32.resolve(projectRoot, root.replaceAll('/', '\\')));
+  const artifacts = value.artifacts.map((artifact) => {
+    if (!isObject(artifact) || !isSafeThreadId(artifact.id) || artifactIds.has(artifact.id) || !RESULT_ARTIFACT_TYPES.includes(artifact.type) || !RESULT_ARTIFACT_MILESTONES.includes(artifact.milestone) || !nonEmpty(artifact.label) || !nonEmpty(artifact.description) || !isTimestamp(artifact.createdAt) || !nonEmpty(artifact.sourceStageId) || !stageIds.has(artifact.sourceStageId) || artifact.sourceTaskThreadId !== task.threadId || !RESULT_WORKSPACE_ROLES.includes(artifact.workspaceRole)) fail('REGISTRY_INVALID', 'deliverable artifact 结构无效');
+    if (artifact.workspaceRole === 'task_control' || (artifact.workspaceRole === 'project_main' && artifact.type !== 'reference') || (['screenshot', 'contact_sheet'].includes(artifact.type) && artifact.workspaceRole !== 'candidate_worktree')) fail('REGISTRY_INVALID', 'deliverable artifact workspaceRole 与 candidate 状态冲突');
+    artifactIds.add(artifact.id);
+    const local = nonEmpty(artifact.path);
+    const remote = nonEmpty(artifact.uri);
+    if (local === remote) fail('REGISTRY_INVALID', 'deliverable artifact 必须且只能保留 path 或 uri');
+    if (local) {
+      if (!win32.isAbsolute(artifact.path) || !allowedRoots.some((root) => windowsPathInside(artifact.path, root)) || !/^[0-9a-f]{64}$/.test(artifact.sha256 ?? '') || artifactHashes.has(artifact.sha256)) fail('REGISTRY_INVALID', '本地 deliverable artifact path/hash 无效、越界或重复');
+      artifactHashes.add(artifact.sha256);
+    } else {
+      let parsed;
+      try { parsed = new URL(artifact.uri); } catch { fail('REGISTRY_INVALID', '远程 deliverable artifact URI 无效'); }
+      if (!['http:', 'https:'].includes(parsed.protocol) || artifact.sha256 !== null || artifact.dimensions !== null) fail('REGISTRY_INVALID', '远程 deliverable artifact URI/hash/dimensions 无效');
+    }
+    if (artifact.dimensions !== null && (!isObject(artifact.dimensions) || !['png', 'jpeg', 'gif'].includes(artifact.dimensions.format) || !Number.isInteger(artifact.dimensions.width) || artifact.dimensions.width <= 0 || !Number.isInteger(artifact.dimensions.height) || artifact.dimensions.height <= 0)) fail('REGISTRY_INVALID', 'deliverable image dimensions 无效');
+    return { ...artifact };
+  });
+  if (!isTimestamp(value.recordedAt) || !RESULT_REVIEW_STATUSES.includes(value.reviewStatus) || !DELIVERY_STATUSES.includes(value.deliveryStatus) || !Array.isArray(value.selectedArtifactIds) || new Set(value.selectedArtifactIds).size !== value.selectedArtifactIds.length || value.selectedArtifactIds.some((id) => !artifactIds.has(id))) fail('REGISTRY_INVALID', 'deliverable review 元数据无效');
+  if (value.reviewStatus === 'pending' && (value.reviewReason !== null || value.reviewedAt !== null || value.selectedArtifactIds.length > 0 || value.deliveryStatus !== 'candidate')) fail('REGISTRY_INVALID', 'pending deliverable 不得伪造审查结果');
+  if (value.reviewStatus !== 'pending' && (!nonEmpty(value.reviewReason) || !isTimestamp(value.reviewedAt))) fail('REGISTRY_INVALID', '已审查 deliverable 必须记录原因和时间');
+  if (value.reviewStatus === 'accepted' && !['accepted_not_integrated', 'integrated'].includes(value.deliveryStatus)) fail('REGISTRY_INVALID', 'accepted deliverable 状态无效');
+  if (value.reviewStatus === 'rejected' && value.deliveryStatus !== 'rejected') fail('REGISTRY_INVALID', 'rejected deliverable 状态无效');
+  return { ...value, testSummary, artifacts };
+}
+
 function validateTask(value, projectRoot) {
   if (!isObject(value)) fail('REGISTRY_INVALID', '任务记录必须是对象');
   const required = ['threadId', 'parentThreadId', 'directControllerThreadId', 'title', 'model', 'thinking', 'status', 'candidateCommit', 'reviewVerdict', 'integrationStatus', 'notificationStatus', 'updatedAt'];
@@ -860,20 +1136,30 @@ function validateTask(value, projectRoot) {
     for (const key of ['scope', 'acceptance', 'forbiddenDecisions']) if (!nonEmpty(value[key])) fail('REGISTRY_INVALID', `${key} 无效`);
   }
   const contractFields = ['taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'stageProgress'];
+  const resultControlFields = ['resultProtocolVersion', 'resultRequirements', 'deliverableHistory'];
   const presentContractFields = contractFields.filter((key) => key in value);
+  const presentResultControlFields = resultControlFields.filter((key) => key in value);
   if (presentContractFields.length !== 0 && presentContractFields.length !== contractFields.length) fail('REGISTRY_INVALID', '实施合同控制字段必须同时存在');
+  if (presentContractFields.length === 0 && presentResultControlFields.length > 0) fail('REGISTRY_INVALID', '成果控制字段不能脱离实施合同存在');
   if (presentContractFields.length === contractFields.length) {
+    if (presentResultControlFields.length !== 0 && presentResultControlFields.length !== resultControlFields.length) fail('REGISTRY_INVALID', '成果控制字段必须同时存在');
+    if (presentResultControlFields.length === 0) {
+      value.resultProtocolVersion = 0;
+      value.resultRequirements = null;
+      value.deliverableHistory = [];
+    }
     if (!has(value.taskMode, TASK_MODES)) fail('REGISTRY_INVALID', `taskMode 无效: ${value.taskMode}`);
-    if (!Array.isArray(value.stageProgress)) fail('REGISTRY_INVALID', 'stageProgress 必须是数组');
+    if (!Array.isArray(value.stageProgress) || !Array.isArray(value.deliverableHistory) || ![0, RESULT_PROTOCOL_VERSION].includes(value.resultProtocolVersion)) fail('REGISTRY_INVALID', 'stageProgress/deliverableHistory/resultProtocolVersion 无效');
     if (value.taskMode === 'legacy_unclassified' || value.taskMode === 'control_only') {
-      if (value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractDigest !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.visualOracle !== null) fail('REGISTRY_INVALID', '非实施任务不得绑定实施合同');
-      if (![value.reuseRequirements, value.forbiddenNewPaths, value.forbiddenReimplementations, value.stageGates, value.evidenceCommands, value.stageProgress].every((entry) => Array.isArray(entry) && entry.length === 0)) fail('REGISTRY_INVALID', '非实施任务不得保留合同或阶段数据');
+      if (value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractDigest !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.visualOracle !== null || value.resultProtocolVersion !== 0 || value.resultRequirements !== null) fail('REGISTRY_INVALID', '非实施任务不得绑定实施合同或成果协议');
+      if (![value.reuseRequirements, value.forbiddenNewPaths, value.forbiddenReimplementations, value.stageGates, value.evidenceCommands, value.stageProgress, value.deliverableHistory].every((entry) => Array.isArray(entry) && entry.length === 0)) fail('REGISTRY_INVALID', '非实施任务不得保留合同、阶段或成果数据');
     } else {
       if (value.contractSchemaVersion !== IMPLEMENTATION_CONTRACT_SCHEMA_VERSION || !nonEmpty(value.implementationContractPath) || !win32.isAbsolute(value.implementationContractPath) || !/^[0-9a-f]{64}$/.test(value.contractDigest ?? '')) fail('REGISTRY_INVALID', '实施任务合同 path/schema/digest 无效');
       const normalizedRoot = win32.resolve(projectRoot).toLowerCase();
       const normalizedContractPath = win32.resolve(value.implementationContractPath).toLowerCase();
       if (normalizedContractPath !== normalizedRoot && !normalizedContractPath.startsWith(`${normalizedRoot}\\`)) fail('REGISTRY_INVALID', '实施任务合同 path 不在项目根目录内');
-      validateImplementationContractManifest({ schemaVersion: value.contractSchemaVersion, contractRevision: value.contractRevision, contractCommit: value.contractCommit, reuseRequirements: value.reuseRequirements, forbiddenNewPaths: value.forbiddenNewPaths, forbiddenReimplementations: value.forbiddenReimplementations, stageGates: value.stageGates, evidenceCommands: value.evidenceCommands, errorPolicy: value.errorPolicy, ...(value.visualOracle === null ? {} : { visualOracle: value.visualOracle }) }, value.taskMode);
+      validateImplementationContractManifest({ schemaVersion: value.contractSchemaVersion, contractRevision: value.contractRevision, contractCommit: value.contractCommit, reuseRequirements: value.reuseRequirements, forbiddenNewPaths: value.forbiddenNewPaths, forbiddenReimplementations: value.forbiddenReimplementations, stageGates: value.stageGates, evidenceCommands: value.evidenceCommands, errorPolicy: value.errorPolicy, ...(value.visualOracle === null ? {} : { visualOracle: value.visualOracle }), ...(value.resultRequirements === null ? {} : { resultRequirements: value.resultRequirements }) }, value.taskMode, { requireResultRequirements: value.resultProtocolVersion === RESULT_PROTOCOL_VERSION });
+      if (value.resultProtocolVersion === 0 && value.resultRequirements !== null) fail('REGISTRY_INVALID', 'legacy implementation 不得声明 resultRequirements');
       const gateIds = new Set(value.stageGates.map((gate) => gate.id));
       const evidenceIds = new Set(value.evidenceCommands.map((entry) => entry.id));
       for (const progress of value.stageProgress) {
@@ -884,6 +1170,7 @@ function validateTask(value, projectRoot) {
           seenEvidence.add(evidence.id);
         }
       }
+      value.deliverableHistory = value.deliverableHistory.map((entry) => validateDeliverablePackage(entry, value, projectRoot));
     }
   }
   const executionFields = ['executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason'];
@@ -938,6 +1225,14 @@ function validateTask(value, projectRoot) {
     for (const entry of value.threadActionHistory) {
       if (!isObject(entry) || !has(entry.action, THREAD_ACTION_TYPES) || !has(entry.outcome, THREAD_ACTION_OUTCOMES) || !nonEmpty(entry.detail) || !isTimestamp(entry.recordedAt)) fail('REGISTRY_INVALID', 'threadActionHistory 记录无效');
     }
+  }
+  if (value.resultProtocolVersion === RESULT_PROTOCOL_VERSION) {
+    const currentDeliverable = value.deliverableHistory.findLast((entry) => entry.attempt === value.attemptCount && entry.candidateCommit === value.candidateCommit);
+    if (value.status === 'awaiting_review' && currentDeliverable?.deliveryStatus !== 'candidate') fail('REGISTRY_INVALID', 'awaiting_review 必须对应 candidate 成果包');
+    if (value.status === 'accepted' && currentDeliverable?.deliveryStatus !== 'accepted_not_integrated') fail('REGISTRY_INVALID', 'accepted 必须对应 accepted_not_integrated 成果包');
+    if (value.status === 'integrated' && currentDeliverable?.deliveryStatus !== 'integrated') fail('REGISTRY_INVALID', 'integrated 必须对应 integrated 成果包');
+    if (['changes_requested', 'reclaimed'].includes(value.status) && value.candidateCommit !== null && currentDeliverable?.deliveryStatus !== 'rejected') fail('REGISTRY_INVALID', `${value.status} 的当前成果包必须显示为 rejected`);
+    if (value.status === 'blocked' && currentDeliverable && currentDeliverable.deliveryStatus !== 'rejected') fail('REGISTRY_INVALID', 'blocked 的当前成果包必须显示为 rejected');
   }
   if (!isTimestamp(value.updatedAt) || !lifecycleConsistent(value)) fail('REGISTRY_INVALID', '任务生命周期或 updatedAt 无效');
   return { ...value };
@@ -1311,8 +1606,8 @@ export async function controllerRegisterTask(input) {
     if (nonEmpty(input.implementationContractPath)) fail('IMPLEMENTATION_CONTRACT_NOT_APPLICABLE', 'control_only 任务不得绑定实施合同');
     contractControl = emptyContractControl('control_only');
   } else {
-    const snapshot = await loadImplementationContract(input.projectRoot, input.implementationContractPath, input.taskMode);
-    contractControl = { taskMode: input.taskMode, ...snapshot, stageProgress: [] };
+    const snapshot = await loadImplementationContract(input.projectRoot, input.implementationContractPath, input.taskMode, { requireResultRequirements: true });
+    contractControl = { taskMode: input.taskMode, ...snapshot, resultProtocolVersion: RESULT_PROTOCOL_VERSION, deliverableHistory: [], stageProgress: [] };
   }
   const { paths } = await ensureProject(home, input.projectRoot, input.controllerThreadId);
   return withExclusiveLock(paths.registryPath, async () => {
@@ -1408,12 +1703,167 @@ export async function auditArchiveBacklog(input = {}) {
   return { compliant: backlogCount === 0, backlogCount, ownerCount: owners.length, readyActionCount, owners, auditedAt: new Date().toISOString() };
 }
 
+function deliveryReportPath(home, projectKey, controllerThreadId) {
+  assertSafeThreadId(controllerThreadId, 'controllerThreadId');
+  return join(home, 'reports', projectKey, controllerThreadId, 'index.html');
+}
+
+function taskBelongsToController(task, controllerThreadId, byId) {
+  let cursor = task.parentThreadId;
+  const seen = new Set();
+  while (!seen.has(cursor)) {
+    if (cursor === controllerThreadId) return true;
+    seen.add(cursor);
+    const parent = byId.get(cursor);
+    if (!parent) return false;
+    cursor = parent.parentThreadId;
+  }
+  return false;
+}
+
+async function inspectArtifactAvailability(artifact) {
+  if (artifact.path === null) return { availability: 'remote', href: artifact.uri };
+  try {
+    const info = await stat(artifact.path);
+    if (!info.isFile() || info.size <= 0) return { availability: 'missing', href: pathToFileURL(artifact.path).href };
+    if (['screenshot', 'contact_sheet'].includes(artifact.type)) imageDimensions(await readFile(artifact.path));
+    return { availability: 'available', href: pathToFileURL(artifact.path).href };
+  } catch {
+    return { availability: 'missing', href: pathToFileURL(artifact.path).href };
+  }
+}
+
+function legacyEvidenceForTask(task) {
+  return (task.stageProgress ?? []).flatMap((stage) => (stage.evidence ?? []).map((evidence, index) => ({
+    id: `legacy-${stage.attemptCount}-${stage.stageId}-${evidence.id}-${index}`,
+    type: 'reference',
+    milestone: 'other',
+    label: evidence.id,
+    description: `Legacy stage ${stage.stageId}: ${stage.summary}`,
+    createdAt: stage.createdAt,
+    sourceStageId: stage.stageId,
+    sourceTaskThreadId: task.threadId,
+    reference: evidence.reference,
+    availability: 'unverified_legacy',
+  })));
+}
+
+function taskBlocker(task) {
+  if (task.status === 'blocked') return task.blockedReason ?? '任务已阻塞，但旧记录没有原因。';
+  if (task.status === 'reclaimed') return task.reclaimedReason ?? '任务已由主控收回。';
+  if (task.status === 'changes_requested') return task.changesRequestedReason ?? '等待主控决定返工或收回。';
+  const current = task.deliverableHistory?.at(-1);
+  if (current?.incompleteItems?.length > 0) return current.incompleteItems.join('；');
+  return null;
+}
+
+function taskNextGate(task) {
+  return ({
+    executing: '完成当前合同阶段并提交成果包',
+    awaiting_review: '直接主控审查成果包并记录 accepted/rejected 理由',
+    changes_requested: '直接主控决定一次机械返工或收回',
+    accepted: '集成 candidate commit，不能提前冒充 main',
+    integrated: '已集成；只剩必要的侧边栏归档',
+    blocked: '解决阻塞或由主控另建干净任务',
+    reclaimed: '由主控裁决保留、重写或重新委派',
+  })[task.status];
+}
+
+export async function controllerQueryDeliverables(input) {
+  const home = resolveTaskControlHome(input);
+  const paths = pathsFor(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  const raw = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+  const registry = { ...raw, tasks: ensureTaskControls(raw.tasks, raw.rootControllerThreadIds) };
+  const controllerKnown = registry.rootControllerThreadIds.includes(input.controllerThreadId) || registry.tasks.some((task) => task.threadId === input.controllerThreadId);
+  if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
+  const byId = new Map(registry.tasks.map((task) => [task.threadId, task]));
+  const topicTasks = registry.tasks.filter((task) => taskBelongsToController(task, input.controllerThreadId, byId)).sort((left, right) => left.displayKey.localeCompare(right.displayKey, undefined, { numeric: true }));
+  const tasks = [];
+  for (const task of topicTasks) {
+    const deliverables = [];
+    for (const deliverable of [...task.deliverableHistory].sort((left, right) => left.recordedAt.localeCompare(right.recordedAt) || left.attempt - right.attempt)) {
+      const artifacts = [];
+      for (const artifact of [...deliverable.artifacts].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))) artifacts.push({ ...artifact, ...(await inspectArtifactAvailability(artifact)), selected: deliverable.selectedArtifactIds.includes(artifact.id) });
+      deliverables.push({ ...deliverable, artifacts });
+    }
+    const manifestReferences = new Set(deliverables.flatMap((deliverable) => deliverable.artifacts.flatMap((artifact) => [artifact.path, artifact.uri].filter(nonEmpty))));
+    const legacyArtifacts = legacyEvidenceForTask(task).filter((artifact) => !manifestReferences.has(artifact.reference));
+    tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, resultProtocolVersion: task.resultProtocolVersion, attemptCount: task.attemptCount, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
+  }
+  return { reportSchemaVersion: 1, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount: tasks.reduce((total, task) => total + task.deliverables.length, 0), tasks };
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
+}
+
+function reportStatusClass(status) {
+  if (status === 'integrated') return 'ok';
+  if (['accepted', 'awaiting_review', 'executing'].includes(status)) return 'pending';
+  return 'failed';
+}
+
+function deliveryStatusLabel(deliverable, task) {
+  if (deliverable.attempt === task.attemptCount && task.status === 'reclaimed') return '已收回';
+  if (deliverable.attempt === task.attemptCount && task.status === 'blocked') return '已阻塞';
+  if (deliverable.attempt === task.attemptCount && task.status === 'changes_requested' && deliverable.reviewStatus === 'rejected') return '审查未通过';
+  return ({ candidate: '候选', accepted_not_integrated: '已接受·未集成', integrated: '已集成', rejected: '未通过' })[deliverable.deliveryStatus];
+}
+
+function renderArtifactHtml(artifact) {
+  const meta = `${artifact.milestone} · ${artifact.workspaceRole} · ${artifact.createdAt}`;
+  const missing = artifact.availability === 'missing' ? '<div class="missing">文件当前不可用；历史引用仍保留。</div>' : '';
+  const visual = ['screenshot', 'contact_sheet'].includes(artifact.type) && artifact.availability !== 'missing'
+    ? `<a href="${escapeHtml(artifact.href)}"><img loading="lazy" src="${escapeHtml(artifact.href)}" alt="${escapeHtml(artifact.label)}"></a>`
+    : `<a class="artifact-link" href="${escapeHtml(artifact.href)}">打开 ${escapeHtml(artifact.type)}</a>`;
+  return `<figure class="artifact ${artifact.selected ? 'selected' : ''}">${visual}${missing}<figcaption><strong>${escapeHtml(artifact.label)}</strong><span>${escapeHtml(artifact.description)}</span><small>${escapeHtml(meta)}</small></figcaption></figure>`;
+}
+
+function renderDeliveryReport(data) {
+  const statusRows = data.tasks.map((task) => `<tr><td>${escapeHtml(task.displayKey)}</td><td>${escapeHtml(task.title)}</td><td><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(task.status)}</span></td><td>${escapeHtml(task.deliverables.at(-1)?.userVisibleSummary ?? '历史证据不可用')}</td><td>${escapeHtml(task.nextGate)}</td></tr>`).join('');
+  const timelines = data.tasks.map((task) => {
+    const packages = task.deliverables.map((deliverable) => {
+      const packageClass = ['reclaimed', 'blocked', 'changes_requested'].includes(task.status) || deliverable.deliveryStatus === 'rejected' ? 'failed' : reportStatusClass(task.status);
+      const artifacts = deliverable.artifacts.length > 0 ? `<div class="artifact-grid">${deliverable.artifacts.map(renderArtifactHtml).join('')}</div>` : `<p class="empty">无截图：${escapeHtml(deliverable.noScreenshotReason ?? '未说明')}</p>`;
+      const metrics = deliverable.testSummary.metrics.map((metric) => `<li>${escapeHtml(metric.label)}：${escapeHtml(metric.before)} → ${escapeHtml(metric.after)}${metric.unit ? ` ${escapeHtml(metric.unit)}` : ''}</li>`).join('');
+      return `<article class="package ${packageClass}"><div class="package-head"><div><h3>Attempt ${deliverable.attempt} · ${escapeHtml(deliverable.userVisibleSummary)}</h3><p>${escapeHtml(deliverable.recordedAt)} · candidate ${escapeHtml(deliverable.candidateCommit)}</p></div><span class="badge ${packageClass}">${escapeHtml(deliveryStatusLabel(deliverable, task))}</span></div><div class="columns"><div><h4>实际改变</h4><ul>${deliverable.actualChanges.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></div><div><h4>测试 / 数值</h4><p>${escapeHtml(deliverable.testSummary.status)}：${escapeHtml(deliverable.testSummary.summary)}</p><ul>${metrics}</ul></div></div>${deliverable.incompleteItems.length > 0 ? `<div class="warning"><strong>未完成：</strong>${escapeHtml(deliverable.incompleteItems.join('；'))}</div>` : ''}${deliverable.reviewReason ? `<div class="review"><strong>主控审查：</strong>${escapeHtml(deliverable.reviewReason)}</div>` : ''}${artifacts}</article>`;
+    }).join('');
+    const legacy = task.deliverables.length === 0 && task.legacyArtifacts.length === 0 ? '<div class="legacy">历史证据不可用；不据此伪造完成状态。</div>' : '';
+    const stageRefs = task.legacyArtifacts.length > 0 ? `<details class="legacy"><summary>阶段证据参考（未验证）</summary><ul>${task.legacyArtifacts.map((artifact) => `<li>${escapeHtml(artifact.createdAt)} · ${escapeHtml(artifact.label)} · ${escapeHtml(artifact.reference)}</li>`).join('')}</ul></details>` : '';
+    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${escapeHtml(task.title)}</h2><p>${escapeHtml(task.taskMode)} · attempt ${task.attemptCount}</p></div><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(task.status)}</span></div>${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${escapeHtml(task.blocker)}</div>` : ''}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${escapeHtml(task.nextGate)}</div></section>`;
+  }).join('');
+  const integrated = data.tasks.filter((task) => task.status === 'integrated').length;
+  const failed = data.tasks.filter((task) => ['blocked', 'reclaimed', 'changes_requested'].includes(task.status)).length;
+  const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}th:nth-child(4),td:nth-child(4){min-width:260px}}';
+  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><title>Codex 任务成果总览</title><style>${css}</style></head><body><header><h1>任务成果历史总览</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.deliverableCount}</strong><span>历史成果包</span></div><div class="metric"><strong>${integrated}</strong><span>已集成</span></div><div class="metric"><strong>${failed}</strong><span>阻塞 / 收回 / 未通过</span></div></div></header><main><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${timelines}</main></body></html>\n`;
+}
+
+export async function controllerBuildDeliveryReport(input) {
+  const data = await controllerQueryDeliverables(input);
+  const html = renderDeliveryReport(data);
+  await atomicWriteText(data.reportPath, html);
+  return { reportPath: data.reportPath, reportFileUri: pathToFileURL(data.reportPath).href, projectKey: data.projectKey, controllerThreadId: data.controllerThreadId, registryUpdatedAt: data.registryUpdatedAt, taskCount: data.taskCount, deliverableCount: data.deliverableCount };
+}
+
+async function deliveryReportNeedsRefresh(paths, controllerThreadId, registryUpdatedAt) {
+  const reportPath = deliveryReportPath(paths.home, paths.projectKey, controllerThreadId);
+  try {
+    const html = await readFile(reportPath, 'utf8');
+    const match = /<meta name="task-control-registry-updated-at" content="([^"]+)">/.exec(html);
+    return match?.[1] !== registryUpdatedAt;
+  } catch {
+    return true;
+  }
+}
+
 async function readArtifact(filePath, expectedType) {
   const code = expectedType === 'notification_failed' ? 'NOTIFICATION_RECEIPT_INVALID' : 'EVENT_INVALID';
   const value = await readJson(filePath, code);
   if (!isObject(value) || value.schemaVersion !== 1 || value.type !== expectedType || !nonEmpty(value.projectKey) || !isSafeThreadId(value.threadId) || !isSafeThreadId(value.parentThreadId) || !isSafeThreadId(value.controllerThreadId) || !isTimestamp(value.createdAt)) fail(code, '事件身份或时间字段无效');
   if (expectedType === 'task_progress' && (!nonEmpty(value.summary) || !Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'progress event summary 或 attemptCount 无效');
   if (expectedType === 'task_completed' && value.attemptCount !== undefined && (!Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'completion event attemptCount 无效');
+  if (expectedType === 'task_completed' && value.resultManifest !== undefined && !isObject(value.resultManifest)) fail(code, 'completion event resultManifest 无效');
   if (expectedType === 'task_progress' && value.stageId !== undefined && !nonEmpty(value.stageId)) fail(code, 'progress event stageId 无效');
   if (expectedType === 'task_progress' && value.evidence !== undefined && !Array.isArray(value.evidence)) fail(code, 'progress event evidence 无效');
   return value;
@@ -1459,7 +1909,17 @@ export async function controllerIngestCompletion(input) {
       const completedStages = completedStageIds(task);
       if (!Array.isArray(event.completedStages) || !Array.isArray(event.missingStages) || event.missingStages.length > 0 || JSON.stringify(event.completedStages) !== JSON.stringify(completedStages)) fail('EVENT_CONTRACT_MISMATCH', 'completion event 阶段摘要与台账不一致');
     }
-    return { ...task, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
+    let deliverableHistory = task.deliverableHistory;
+    if (task.resultProtocolVersion === RESULT_PROTOCOL_VERSION) {
+      if (!isObject(event.resultManifest) || !nonEmpty(event.resultManifest.resultManifestPath)) fail('RESULT_MANIFEST_REQUIRED', 'result protocol completion event 缺少成果包快照');
+      const currentResult = await loadResultManifest(input.projectRoot, event.resultManifest.resultManifestPath, task, event.candidateCommit);
+      if (currentResult.resultManifestDigest !== event.resultManifest.resultManifestDigest || JSON.stringify(currentResult) !== JSON.stringify(event.resultManifest)) fail('RESULT_MANIFEST_DRIFT', 'completion event 的成果包快照与当前文件不一致');
+      if (deliverableHistory.some((entry) => entry.attempt === task.attemptCount || entry.resultManifestDigest === currentResult.resultManifestDigest)) fail('RESULT_MANIFEST_REPLAY', '当前 attempt 或 result manifest 已入账');
+      deliverableHistory = [...deliverableHistory, { ...currentResult, recordedAt: event.createdAt, reviewStatus: 'pending', reviewReason: null, selectedArtifactIds: [], reviewedAt: null, deliveryStatus: 'candidate' }];
+    } else if (event.resultManifest !== undefined) {
+      fail('RESULT_MANIFEST_NOT_APPLICABLE', 'legacy completion event 不得伪造 result manifest');
+    }
+    return { ...task, deliverableHistory, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
   }});
 }
 
@@ -1570,6 +2030,7 @@ function staleHeartbeatResult(registry, state, input, reason, extra = {}) {
     pendingCleanupTasks: [],
     deferredCleanupTasks: [],
     threadActions: [],
+    reportNeedsRefresh: false,
     needsControllerAttention: false,
     shouldKeepHeartbeat: false,
     heartbeatAction: automationId === null ? { type: 'stale_heartbeat_identity_required', generation: requestedGeneration } : { type: 'delete_stale_automation', actionId: `stale_${requestedGeneration}_${createHash('sha256').update(automationId).digest('hex').slice(0, 12)}`, automationId, generation: requestedGeneration, currentGeneration: state?.generation ?? null, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, reason, requiresSnapshotGeneration: requestedGeneration, onTimeout: 'controller-record-heartbeat-action-failed' },
@@ -1656,6 +2117,7 @@ export async function controllerScanPendingEvents(input) {
   const deferredCleanupTasks = cleanupDebtTasks.filter((task) => task.actionability !== 'actionable');
   const threadActions = directTasks.flatMap((task) => threadActionsForTask(task, registry.tasks));
   const queues = controllerWorkQueues(registry.tasks, input.controllerThreadId);
+  const reportNeedsRefresh = await deliveryReportNeedsRefresh(paths, input.controllerThreadId, registry.updatedAt);
   return {
     projectKey: registry.projectKey,
     controllerThreadId: input.controllerThreadId,
@@ -1669,16 +2131,41 @@ export async function controllerScanPendingEvents(input) {
     pendingCleanupTasks,
     deferredCleanupTasks,
     threadActions,
+    reportNeedsRefresh,
+    deliveryReportPath: deliveryReportPath(paths.home, paths.projectKey, input.controllerThreadId),
     needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || threadActions.length > 0,
     shouldKeepHeartbeat: queues.shouldKeepHeartbeat,
   };
+}
+
+function reviewCurrentDeliverable(task, reviewStatus, reason, selectedArtifactIds = []) {
+  if (task.resultProtocolVersion !== RESULT_PROTOCOL_VERSION) return task.deliverableHistory;
+  const index = task.deliverableHistory.findLastIndex((entry) => entry.attempt === task.attemptCount && entry.candidateCommit === task.candidateCommit);
+  if (index < 0) fail('RESULT_REVIEW_MISSING', '当前 candidate 没有已入账成果包');
+  if (!nonEmpty(reason)) fail('RESULT_REVIEW_REASON_REQUIRED', '成果审查必须记录具体原因');
+  const current = task.deliverableHistory[index];
+  if (current.reviewStatus !== 'pending') fail('RESULT_REVIEW_ALREADY_RECORDED', '当前成果包已经审查');
+  const selected = [...new Set(selectedArtifactIds.map((id) => id.trim()).filter(nonEmpty))];
+  const artifactById = new Map(current.artifacts.map((artifact) => [artifact.id, artifact]));
+  if (selected.some((id) => !artifactById.has(id))) fail('RESULT_REVIEW_ARTIFACT_UNKNOWN', '选定展示 artifact 不属于当前成果包');
+  if (reviewStatus === 'accepted' && task.taskMode === 'visual_implementation' && !selected.some((id) => ['screenshot', 'contact_sheet'].includes(artifactById.get(id)?.type))) fail('RESULT_REVIEW_VISUAL_SELECTION_REQUIRED', '视觉成果接受时必须选择至少一张展示截图');
+  const reviewed = { ...current, reviewStatus, reviewReason: reason.trim(), selectedArtifactIds: selected, reviewedAt: new Date().toISOString(), deliveryStatus: reviewStatus === 'accepted' ? 'accepted_not_integrated' : 'rejected' };
+  return task.deliverableHistory.map((entry, position) => position === index ? reviewed : entry);
+}
+
+function integrateCurrentDeliverable(task) {
+  if (task.resultProtocolVersion !== RESULT_PROTOCOL_VERSION) return task.deliverableHistory;
+  const index = task.deliverableHistory.findLastIndex((entry) => entry.attempt === task.attemptCount && entry.candidateCommit === task.candidateCommit);
+  if (index < 0 || task.deliverableHistory[index].reviewStatus !== 'accepted') fail('RESULT_INTEGRATION_NOT_ACCEPTED', '只有已接受的当前成果包可以 integrated');
+  return task.deliverableHistory.map((entry, position) => position === index ? { ...entry, deliveryStatus: 'integrated' } : entry);
 }
 
 export async function controllerMarkChangesRequested(input) {
   if (!has(input.failureClass, FAILURE_CLASSES.filter((value) => value !== 'unclassified')) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'changes_requested 必须提供失败分类和原因');
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'executing' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 changes_requested`);
-    return { ...task, status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: input.failureClass, changesRequestedReason: input.reason.trim(), reviewVerdict: 'changes_requested', updatedAt: new Date().toISOString() };
+    const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
+    return { ...task, deliverableHistory, status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: input.failureClass, changesRequestedReason: input.reason.trim(), reviewVerdict: 'changes_requested', updatedAt: new Date().toISOString() };
   }});
 }
 
@@ -1695,7 +2182,8 @@ export async function controllerReclaimTask(input) {
   if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'reclaim reason 不能为空');
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'changes_requested' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 由主控收回`);
-    return { ...task, status: 'reclaimed', executionStatus: 'terminal', nextOwner: 'controller', reclaimedReason: input.reason.trim(), updatedAt: new Date().toISOString() };
+    const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
+    return { ...task, deliverableHistory, status: 'reclaimed', executionStatus: 'terminal', nextOwner: 'controller', reclaimedReason: input.reason.trim(), updatedAt: new Date().toISOString() };
   }});
 }
 
@@ -1703,21 +2191,24 @@ export async function controllerMarkBlocked(input) {
   if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'blocked reason 不能为空');
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'executing' && task.status !== 'changes_requested' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 blocked`);
-    return { ...task, status: 'blocked', executionStatus: 'terminal', nextOwner: 'none', blockedReason: input.reason.trim(), updatedAt: new Date().toISOString() };
+    const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
+    return { ...task, deliverableHistory, status: 'blocked', executionStatus: 'terminal', nextOwner: 'none', blockedReason: input.reason.trim(), updatedAt: new Date().toISOString() };
   }});
 }
 
 export async function controllerMarkAccepted(input) {
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'awaiting_review' || !nonEmpty(task.candidateCommit)) fail('TASK_TRANSITION_INVALID', '只有有 candidateCommit 的 awaiting_review 可以 accepted');
-    return { ...task, status: 'accepted', executionStatus: 'stopped', nextOwner: 'controller', reviewVerdict: 'accepted', updatedAt: new Date().toISOString() };
+    const deliverableHistory = reviewCurrentDeliverable(task, 'accepted', input.reason, input.selectedArtifactIds ?? []);
+    return { ...task, deliverableHistory, status: 'accepted', executionStatus: 'stopped', nextOwner: 'controller', reviewVerdict: 'accepted', updatedAt: new Date().toISOString() };
   }});
 }
 
 export async function controllerMarkIntegrated(input) {
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'accepted') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 integrated`);
-    return { ...task, status: 'integrated', executionStatus: 'terminal', nextOwner: 'none', reviewVerdict: 'accepted', integrationStatus: 'integrated', updatedAt: new Date().toISOString() };
+    const deliverableHistory = integrateCurrentDeliverable(task);
+    return { ...task, deliverableHistory, status: 'integrated', executionStatus: 'terminal', nextOwner: 'none', reviewVerdict: 'accepted', integrationStatus: 'integrated', updatedAt: new Date().toISOString() };
   }});
 }
 
@@ -1834,7 +2325,10 @@ export async function createCompletionEvent(input) {
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
   const summary = contractSummary(result.task);
   if (summary.missingStages.length > 0) fail('REQUIRED_STAGE_INCOMPLETE', `完成前仍缺少 required stage: ${summary.missingStages.join(', ')}`);
-  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, attemptCount: result.task.attemptCount, status: 'awaiting_review', candidateCommit: input.candidateCommit, ...summary, createdAt: new Date().toISOString() });
+  const resultManifest = result.task.resultProtocolVersion === RESULT_PROTOCOL_VERSION
+    ? await loadResultManifest(result.registry.projectRoot, input.resultManifestPath, result.task, input.candidateCommit)
+    : null;
+  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, attemptCount: result.task.attemptCount, status: 'awaiting_review', candidateCommit: input.candidateCommit, ...summary, ...(resultManifest === null ? {} : { resultManifest }), createdAt: new Date().toISOString() });
 }
 
 export async function createNotificationFailureReceipt(input) {
@@ -1889,15 +2383,19 @@ function parseEvidenceReferences(values) {
 
 function helpText() {
   return [
-    'codex-task-control v0.7.0',
+    'codex-task-control v0.8.0',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>]',
     '  progress --self <thread> --summary <text> [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
-    '  complete --self <thread> --candidate-commit <sha>',
+    '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json>',
+    '  controller-query-deliverables --project-root <root> --controller <id>',
+    '  controller-build-delivery-report --project-root <root> --controller <id>',
+    '  mark-accepted ... --reason <review-reason> [--selected-artifact <artifact-id> ...]',
     '  controller-confirm-heartbeat-action --project-root <root> --controller <id> --action-id <id> --automation-id <new-id>',
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
+    'implementation 成果包按 attempt 追加保存；HTML 报告确定性生成到 task-control/reports，刷新不维持 heartbeat。',
     'heartbeat 使用 prepare/create-new/confirm/switch/delete-old 两阶段协议；stale invocation 只返回受限自删除动作。',
   ].join('\n');
 }
@@ -1935,7 +2433,7 @@ export async function runCli(args = process.argv.slice(2)) {
   }
   else if (command === 'complete') {
     const selfThreadId = required(args, '--self');
-    const eventPath = await createCompletionEvent({ ...storage, selfThreadId, candidateCommit: required(args, '--candidate-commit'), status: option(args, '--status') });
+    const eventPath = await createCompletionEvent({ ...storage, selfThreadId, candidateCommit: required(args, '--candidate-commit'), resultManifestPath: option(args, '--result-manifest'), status: option(args, '--status') });
     const task = (await querySelf({ ...storage, selfThreadId })).task;
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildCompletionNotification(task), notificationRequired: true, notificationFailureRequiredOnSendError: true, ...contractSummary(task) };
   }
@@ -1951,6 +2449,8 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-ingest-progress') result = await controllerIngestProgress({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-completion') result = await controllerIngestCompletion({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-notification-failed') result = await controllerIngestNotificationFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
+  else if (command === 'controller-query-deliverables') result = await controllerQueryDeliverables({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
+  else if (command === 'controller-build-delivery-report') result = await controllerBuildDeliveryReport({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-scan-events') result = await controllerScanPendingEvents({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), heartbeatGeneration: option(args, '--heartbeat-generation'), heartbeatAutomationId: option(args, '--automation-id'), heartbeatActionId: option(args, '--heartbeat-action-id'), heartbeatOccurrence: option(args, '--heartbeat-occurrence'), heartbeatRrule: option(args, '--heartbeat-rrule'), heartbeatFiredAt: option(args, '--heartbeat-fired-at') });
   else if (command === 'controller-rearm-heartbeat') result = await controllerRearmHeartbeat({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: option(args, '--reason') ?? 'reconcile' });
   else if (command === 'controller-confirm-heartbeat-action') result = await controllerConfirmHeartbeatAction({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), observed: option(args, '--observed') === 'true' });
@@ -1962,7 +2462,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-dispatch-rework') result = await controllerDispatchRework({ ...controllerInput(args) });
   else if (command === 'controller-reclaim') result = await controllerReclaimTask({ ...controllerInput(args), reason: required(args, '--reason') });
   else if (command === 'mark-blocked') result = await controllerMarkBlocked({ ...controllerInput(args), reason: required(args, '--reason') });
-  else if (command === 'mark-accepted') result = await controllerMarkAccepted({ ...controllerInput(args) });
+  else if (command === 'mark-accepted') result = await controllerMarkAccepted({ ...controllerInput(args), reason: option(args, '--reason'), selectedArtifactIds: options(args, '--selected-artifact') });
   else if (command === 'mark-integrated') result = await controllerMarkIntegrated({ ...controllerInput(args) });
   else if (command === 'controller-record-title-synced') result = await controllerRecordTitleSynced({ ...controllerInput(args), title: required(args, '--title') });
   else if (command === 'controller-record-title-failed') result = await controllerRecordTitleFailed({ ...controllerInput(args), title: required(args, '--title'), reason: required(args, '--reason') });

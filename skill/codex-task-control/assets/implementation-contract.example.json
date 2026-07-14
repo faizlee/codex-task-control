@@ -44,5 +44,15 @@
       "Stop on any command failure or ERROR output.",
       "Do not weaken the acceptance criteria or change this policy."
     ]
+  },
+  "resultRequirements": {
+    "manifestSchemaVersion": 1,
+    "allowedArtifactRoots": [
+      "docs/test-reports",
+      "_scratch/task-results"
+    ],
+    "requiredArtifactTypes": [],
+    "requiredMilestones": [],
+    "presentationStageId": null
   }
 }

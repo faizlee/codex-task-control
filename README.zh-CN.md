@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.7.0 是 Windows-first preview。台账、合同校验、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
+> v0.8.0 是 Windows-first preview。台账、合同/成果校验、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,7 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.7.0 已经解决什么
+## v0.8.0 已经解决什么
 
 - 按项目根目录隔离任务注册表。
 - 记录直接父任务、controller、执行界面、模型等级、reasoning、额度理由和生命周期状态。
@@ -34,6 +34,10 @@
 - heartbeat 改为两阶段提交：本地 prepare、App 创建新 automation、确认并切换台账、最后删除旧 automation；App 失败时不会提前推进 confirmed generation。
 - automation 强制 `COUNT=1`；stale、错误 ID、过期、重复触发或 RRULE 错配只返回空队列的 `delete_stale_automation`，不再静默空转。
 - 持久记录最后成功 generation、automation ID、pending action、触发/stale/删除失败次数、熔断证据与一次性通知状态。
+- 新登记的 implementation 必须提交带 schema 版本的成果包，记录 candidate commit、用户可见摘要、实际改变、未完成项、测试/前后数值和带类型的 artifact 引用。
+- 视觉任务完成前校验 presentation stage、必需 artifact 类型/里程碑、任务归属、合同允许根目录、文件存在、非零尺寸、SHA-256 去重以及 PNG/JPEG/GIF 可解码尺寸。
+- 每个 attempt 的成果历史只追加不覆盖；reclaimed、blocked、changes_requested 证据明确显示为失败，并严格区分候选、已接受未集成、已集成。
+- 直接主控可确定性生成手机/桌面自适应 HTML：`$CODEX_HOME/task-control/reports/<project-key>/<controller-thread-id>/index.html`，不写项目仓库。
 - 自适应间隔为 Luna repeatable 3 分钟、Terra medium 5 分钟、Terra high 10 分钟、主控队列 5 分钟；多种义务并存时取最短间隔，旧 generation 触发时只允许清理它自己的 automation。
 - 把可执行清理与历史债务分开：标题/归档工具调用一旦记录失败，仍可审计，但不会反复生成动作或单独维持 heartbeat。
 - 只有登记的直接主控可以带原因显式重新排队失败的侧边栏动作。
@@ -45,13 +49,14 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.7.0 不做什么
+## v0.8.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止或 steer Codex task。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
 - 无法让 Codex App 原子地 compare-and-delete，也无法从 Skill 内部强制中断宿主工具调用；当前协议用 30 秒 pending deadline、保留旧 confirmed generation 和下一次触发自恢复来补偿，长期仍需要 App 原生 stale cleanup hook。
+- 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
 - 当前只对 Windows 项目路径做了完整验证。
 
 ## 安装
@@ -134,10 +139,20 @@ node $TaskControl controller-record-dispatched `
 
 node $TaskControl query-self --self "worker-1"
 node $TaskControl query-parent --self "worker-1"
-node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1"
+node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" --result-manifest "docs/test-reports/task-result.json"
 ```
 
 不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。
+
+新 implementation 合同还必须声明 `resultRequirements`。worker 完成时提交项目内成果 manifest，主控审查后生成专题历史页：
+
+```powershell
+node $TaskControl mark-accepted --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --reason "合同和视觉预言均通过。" --selected-artifact "after"
+node $TaskControl controller-query-deliverables --project-root "C:\work\example" --controller "controller-1"
+node $TaskControl controller-build-delivery-report --project-root "C:\work\example" --controller "controller-1"
+```
+
+非视觉成果包参考 [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json)，视觉成果包参考 [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json)。旧任务没有可信历史资料时只显示“历史证据不可用”，不会伪造截图或阻塞当前任务。
 
 如果侧边栏改名或归档工具调用失败，只记录一次失败。它会成为不再自动执行的审计债务；没有其他工作时 heartbeat 必须停止。登记的直接主控以后可以有意识地重新排队：
 
