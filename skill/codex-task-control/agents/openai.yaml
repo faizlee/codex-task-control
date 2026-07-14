@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Route visible tasks with contract and review gates"
-  default_prompt: "Use $codex-task-control to preflight Sol reasoning, bind implementation work to a versioned contract, route economical work only to registered visible tasks, require staged evidence, synchronize sidebar titles, and renew adaptive heartbeat leases from real progress."
+  short_description: "Route visible tasks with safe heartbeat commits"
+  default_prompt: "Use $codex-task-control to bind implementation work to staged contracts and manage visible-task heartbeats through prepare, create-new, confirm, switch, and stale self-cleanup without advancing the ledger before Codex App success."

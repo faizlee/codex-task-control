@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.6.0 是 Windows-first preview。台账、合同校验与路由预检完全保存在本地，不会调用模型 provider。
+> v0.7.0 是 Windows-first preview。台账、合同校验、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,7 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.6.0 已经解决什么
+## v0.7.0 已经解决什么
 
 - 按项目根目录隔离任务注册表。
 - 记录直接父任务、controller、执行界面、模型等级、reasoning、额度理由和生命周期状态。
@@ -31,8 +31,10 @@
 - 新增只读的终态归档积压审计，按登记的直接主控分组，生成后代优先的可执行动作，并识别旧版缺失的归档元数据。
 - 审查失败先进入停止的“待决”状态，只允许一次明确的机械返工，其他失败由主控收回。
 - 自动分配 `01`、`01.1` 这类层级编号，并把生命周期标题同步到 Codex 侧边栏。
-- 只有工作提示词真实派发后才启动一个可替换的单次 heartbeat；有效进度入账后续租，完成/审查收口后重排。
-- 自适应间隔为 Luna repeatable 3 分钟、Terra medium 5 分钟、Terra high 10 分钟、主控队列 5 分钟；多种义务并存时取最短间隔，旧 generation 触发时直接无操作退出。
+- heartbeat 改为两阶段提交：本地 prepare、App 创建新 automation、确认并切换台账、最后删除旧 automation；App 失败时不会提前推进 confirmed generation。
+- automation 强制 `COUNT=1`；stale、错误 ID、过期、重复触发或 RRULE 错配只返回空队列的 `delete_stale_automation`，不再静默空转。
+- 持久记录最后成功 generation、automation ID、pending action、触发/stale/删除失败次数、熔断证据与一次性通知状态。
+- 自适应间隔为 Luna repeatable 3 分钟、Terra medium 5 分钟、Terra high 10 分钟、主控队列 5 分钟；多种义务并存时取最短间隔，旧 generation 触发时只允许清理它自己的 automation。
 - 把可执行清理与历史债务分开：标题/归档工具调用一旦记录失败，仍可审计，但不会反复生成动作或单独维持 heartbeat。
 - 只有登记的直接主控可以带原因显式重新排队失败的侧边栏动作。
 - `integrated`、`blocked` 或 `reclaimed` 的可见任务按后代优先顺序归档，但完整台账历史永久保留。
@@ -43,12 +45,13 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.6.0 不做什么
+## v0.7.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止或 steer Codex task。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
+- 无法让 Codex App 原子地 compare-and-delete，也无法从 Skill 内部强制中断宿主工具调用；当前协议用 30 秒 pending deadline、保留旧 confirmed generation 和下一次触发自恢复来补偿，长期仍需要 App 原生 stale cleanup hook。
 - 当前只对 Windows 项目路径做了完整验证。
 
 ## 安装
@@ -122,8 +125,8 @@ node $TaskControl controller-record-title-synced `
   --thread "worker-1" `
   --title $Registration.desiredThreadTitle
 
-# 真实发送工作提示词成功后再执行，并把返回的 heartbeatAction
-# 应用为主控唯一的单次 automation。
+# 真实发送工作提示词成功后再执行。它只 prepare 新 heartbeat，
+# 不会提前推进 confirmed generation。
 node $TaskControl controller-record-dispatched `
   --project-root "C:\work\example" `
   --controller "controller-1" `
@@ -134,7 +137,7 @@ node $TaskControl query-parent --self "worker-1"
 node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1"
 ```
 
-不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每次返回的 heartbeatAction 都要替换主控当前的单次 automation；终态后代先归档，父任务后归档，台账历史不会删除。
+不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。
 
 如果侧边栏改名或归档工具调用失败，只记录一次失败。它会成为不再自动执行的审计债务；没有其他工作时 heartbeat 必须停止。登记的直接主控以后可以有意识地重新排队：
 

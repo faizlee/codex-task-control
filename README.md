@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.6.0 preview. The ledger, contract checks, and routing preflights are local and make zero model-provider calls.
+> Windows-first v0.7.0 preview. The ledger, contract checks, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,7 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.6.0 does
+## What v0.7.0 does
 
 - Keeps task registries isolated by normalized project root.
 - Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
@@ -42,8 +42,10 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Adds a read-only terminal archive-backlog audit grouped by registered direct controller, with descendant-first ready actions and legacy metadata detection.
 - Treats failed review as a stopped routing decision, not as running rework; permits one explicit mechanical retry and supports controller reclaim.
 - Assigns readable hierarchical keys such as `01` and `01.1`, then synchronizes lifecycle titles in the Codex sidebar.
-- Starts one replaceable heartbeat only after a real prompt dispatch, renews it from ingested progress, and recalculates it after completion/review work.
-- Uses adaptive one-shot cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval and stale generations no-op.
+- Uses two-phase heartbeat commit: prepare locally, create a new App automation, confirm/switch the ledger, then delete the retired automation. An App failure cannot advance the confirmed generation.
+- Uses adaptive `COUNT=1` cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval.
+- Turns stale, wrong-ID, expired, repeated, or misconfigured heartbeat invocations into an empty-queue `delete_stale_automation` path instead of a silent infinite loop.
+- Persists last successful generation, automation ID, pending action, trigger/stale/delete-failure counts, fuse evidence, and one-time notification state.
 - Separates actionable cleanup from historical debt: a failed title/archive tool action stays auditable but no longer re-emits itself or keeps a heartbeat alive.
 - Lets only the registered direct controller explicitly requeue a failed sidebar action with a recorded reason.
 - Archives `integrated`, `blocked`, and `reclaimed` visible tasks after their descendants while retaining the complete ledger history.
@@ -54,12 +56,13 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.6.0 does not do
+## What v0.7.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, or steer Codex tasks.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
+- It cannot make Codex App compare-and-delete an automation atomically or stop a tool call inside the host. The protocol preserves the old confirmed generation, uses a 30-second pending-action deadline, and self-recovers on the next trigger; a host-native stale cleanup hook remains the long-term fix.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
 ## Install
@@ -80,7 +83,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.6.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.7.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -151,8 +154,8 @@ node $TaskControl controller-record-title-synced `
   --thread "worker-1" `
   --title $Registration.desiredThreadTitle
 
-# Run only after the real work prompt was sent successfully. Apply the returned
-# replace_controller_heartbeat action as a one-shot controller automation.
+# Run only after the real work prompt was sent successfully. This prepares a
+# create_controller_heartbeat action but does not advance confirmed generation.
 node $TaskControl controller-record-dispatched `
   --project-root "C:\work\example" `
   --controller "controller-1" `
@@ -162,7 +165,7 @@ node $TaskControl query-self --self "worker-1"
 node $TaskControl query-parent --self "worker-1"
 ```
 
-Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. The worker may start only after `query-self` reports `dispatchAllowed: true`. Every returned heartbeat action replaces the controller's one-shot automation; terminal descendants archive before their parent while audit records remain on disk.
+Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.
 
 If a sidebar title/archive tool call fails, record the failure once. It becomes non-actionable audit debt and the heartbeat stops when no other work remains. The registered direct controller can deliberately requeue it later:
 
