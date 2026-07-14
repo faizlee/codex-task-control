@@ -333,9 +333,9 @@ describe('project-isolated task control', () => {
     const root = 'C:/work/archive-backlog';
     await register(codexHome, root, 'parent-task');
     await register(codexHome, root, 'child-task', { controllerThreadId: 'parent-task', parentThreadId: 'parent-task', title: 'nested terminal task' });
-    const parent = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'parent-task', reason: 'superseded parent' });
+    const parent = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'parent-task', reason: 'superseded parent', userSummary: 'The parent task is superseded.', blockerSource: 'superseded' });
     await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'parent-task', title: parent.desiredThreadTitle });
-    const child = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: 'parent-task', threadId: 'child-task', reason: 'superseded child' });
+    const child = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: 'parent-task', threadId: 'child-task', reason: 'superseded child', userSummary: 'The child task is superseded.', blockerSource: 'superseded' });
     await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: 'parent-task', threadId: 'child-task', title: child.desiredThreadTitle });
 
     const registryPath = join(codexHome, 'task-control', 'projects', projectKeyForRoot(root), 'task-registry.json');
@@ -358,7 +358,7 @@ describe('project-isolated task control', () => {
     const codexHome = await freshCodexHome();
     const root = 'C:/work/legacy-archive-backlog';
     await register(codexHome, root, 'legacy-terminal');
-    await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'legacy-terminal', reason: 'legacy terminal task' });
+    await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'legacy-terminal', reason: 'legacy terminal task', userSummary: 'The legacy terminal task is closed.', blockerSource: 'superseded' });
     const registryPath = join(codexHome, 'task-control', 'projects', projectKeyForRoot(root), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const task = registry.tasks[0];
@@ -379,7 +379,7 @@ describe('project-isolated task control', () => {
     const codexHome = await freshCodexHome();
     const root = 'C:/work/deferred-archive-debt';
     await register(codexHome, root, 'failed-archive');
-    const blocked = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'failed-archive', reason: 'superseded task' });
+    const blocked = await controllerMarkBlocked({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'failed-archive', reason: 'superseded task', userSummary: 'The task is superseded and ready for cleanup.', blockerSource: 'superseded' });
     await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'failed-archive', title: blocked.desiredThreadTitle });
     const failed = await controllerRecordArchiveFailed({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'failed-archive', reason: 'Inactive thread archive did not persist' });
     assert.ok(['create_controller_heartbeat', 'delete_controller_heartbeat'].includes(failed.heartbeatAction.type));
@@ -395,8 +395,9 @@ describe('project-isolated task control', () => {
     const scan = await controllerScanPendingEvents({ codexHome, projectRoot: root, controllerThreadId: defaultController });
     assert.deepEqual(scan.pendingCleanupTasks, []);
     assert.equal(scan.deferredCleanupTasks[0].actionability, 'archive_failed');
-    assert.equal(scan.needsControllerAttention, false);
-    assert.equal(scan.shouldKeepHeartbeat, false);
+    assert.equal(scan.needsControllerAttention, true);
+    assert.equal(scan.incidentQueue.length, 1);
+    assert.equal(scan.shouldKeepHeartbeat, true);
   });
 
   it('fails closed unless delegated work is decision-complete and testable', async () => {
@@ -431,7 +432,7 @@ describe('project-isolated task control', () => {
     await expectCode(() => createCompletionEvent({ codexHome, selfThreadId: 'worker', candidateCommit: 'candidate-2' }), 'TASK_DISPATCH_NOT_AUTHORIZED');
     await expectCode(() => controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker' }), 'REWORK_REQUIRES_CONTROLLER');
 
-    const reclaimed = await controllerReclaimTask({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', reason: 'The controller will resolve the contracts and implement the core fix.' });
+    const reclaimed = await controllerReclaimTask({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', reason: 'The controller will resolve the contracts and implement the core fix.', userSummary: 'The worker was stopped because the remaining work requires controller judgment.' });
     assert.equal(reclaimed.status, 'reclaimed');
     assert.equal(reclaimed.executionStatus, 'terminal');
     assert.equal(reclaimed.nextOwner, 'controller');

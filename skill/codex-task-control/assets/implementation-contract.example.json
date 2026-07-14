@@ -1,6 +1,10 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "contractRevision": "example-r1",
+  "allowedWritePaths": [
+    "src/existing/**",
+    "test/existing/**"
+  ],
   "reuseRequirements": [
     "Reuse the existing implementation path and named project fixtures."
   ],

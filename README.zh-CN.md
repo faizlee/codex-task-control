@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.8.0 是 Windows-first preview。台账、合同/成果校验、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
+> v0.9.0 是 Windows-first preview。台账、合同/成果校验、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,15 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.8.0 已经解决什么
+## v0.9.0 已经解决什么
+
+- worker 可以在 required stage 尚未完成时提交正式 `task_failed` / `task_blocked`，包含失败阶段、分类、命令摘要和证据引用。
+- 即使没有 completion 或普通消息，主控扫描也会根据 lease、最后进度、attempt 时长和 candidate 缺失识别停滞。
+- replacement 继承稳定 objective；连续两个 replacement 失败或时间预算耗尽后，r3/new dispatch 直接 fail closed。
+- 诊断缺少玩家影响、正常生命周期复现、增长趋势和阻塞价值时，只能登记为非阻塞技术债。
+- reclaim/blocked 后必须完成用户摘要通知和 delivery report 刷新，才能创建 replacement。
+- 可接收上下文健康回执；`handoff_required` 时禁止继续登记或派发 worker。
+- 新 implementation 合同升级为 schema v2，并明确 `allowedWritePaths`；旧 schema-v1 台账保持只读兼容。
 
 - 按项目根目录隔离任务注册表。
 - 记录直接父任务、controller、执行界面、模型等级、reasoning、额度理由和生命周期状态。
@@ -49,7 +57,7 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.8.0 不做什么
+## v0.9.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。

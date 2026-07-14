@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "controllerThreadId": "replace-with-controller-thread-id",
+  "status": "handoff_required",
+  "capturedAt": "2026-07-15T00:00:00.000Z",
+  "reportPath": "C:\\Users\\example\\.codex\\time-diagnostics\\controller-health.md",
+  "metrics": {
+    "peakContextRatio": 0.9,
+    "compactionCount": 2,
+    "unknownTimeRatio": 0.5
+  }
+}

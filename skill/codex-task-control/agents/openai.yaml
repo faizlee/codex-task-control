@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Route visible tasks with auditable delivery reports"
-  default_prompt: "Use $codex-task-control to bind visible implementation tasks to staged contracts, validate result artifacts, review attempts, and refresh the controller delivery HTML."
+  short_description: "Stop stalled visible tasks before quota burn"
+  default_prompt: "Use $codex-task-control to bind visible tasks to schema-v2 contracts, ingest first-class failure events, detect stalls and retry fuses, enforce controller handoff, and close incidents with a user summary plus delivery report."

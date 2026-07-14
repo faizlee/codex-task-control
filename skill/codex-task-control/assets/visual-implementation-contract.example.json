@@ -1,6 +1,10 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "contractRevision": "visual-example-r1",
+  "allowedWritePaths": [
+    "src/existing-ui/**",
+    "test/visual/**"
+  ],
   "reuseRequirements": [
     "Reuse the existing UI component and screenshot runner."
   ],

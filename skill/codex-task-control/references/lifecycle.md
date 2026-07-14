@@ -199,3 +199,19 @@ An adapter is a reference-only object:
 ```
 
 `rulesSources` must contain at least one project rule source. `workflowSources` may be empty, and `projectPolicySources` is optional. No copied rules, model values, commands, test lists, or acceptance policy belong in an adapter. Project adapters must not contain `modelRoutingSource` or any equivalent routing shadow because this skill is the sole source for work class, model, thinking, and lifecycle policy. If `nativeAdapter` is present, the loader must verify that the referenced file exists under `projectRoot`; omit it when the project has no native adapter.
+
+## v0.9 failure, stall, and objective protocol
+
+New implementation registrations require implementation-contract `schemaVersion: 2`. It adds non-empty controller-owned `allowedWritePaths`; schema-v1 tasks already present remain read-compatible and may finish their bound attempt. A worker cannot revise the contract, error policy, product-value classification, or acceptance oracle.
+
+Before all required stages finish, a dispatched worker may write one fresh `task_failed` or `task_blocked` artifact. It binds the current task/attempt/contract and records `attemptedStage`, `failureClass`, `failureDomain`, a bounded command summary, at least one registered evidence reference, and `mechanicalRetryEligible`. The artifact does not grant terminal authority. The direct controller ingests it into append-only `failureHistory` and transitions the task to stopped `changes_requested` for routing.
+
+Every current controller scan derives `stalledActiveTasks` from the lease, last real progress, attempt age, missing required stages, and absence of a candidate/completion. It also returns `objectiveFuses`, `incidentQueue`, and `contextHealth`. Ordinary task messages are not evidence and are not required for detection. A failure, stall, incomplete incident closeout, or `handoff_required` health state sets `needsControllerAttention` even when the completion queue is empty.
+
+Every v0.9 registration gets a stable objective ID, budget, and replacement ordinal. Replacements must name the terminal task they replace and inherit objective identity. The previous reclaim/block must first have a sent user notification and synced delivery report. Two failed replacements or an exhausted objective budget open the fuse; further registration or dispatch fails closed. After the incident summary/report are complete, a fuse waiting for a user decision does not by itself create an endless heartbeat.
+
+Diagnostics default to `technical_debt`. They may become `milestone_blocker` only when the direct controller records non-empty `playerImpact`, `normalLifecycleReproduction`, `growthTrend`, and `whyBlocking`. A diagnostic-sourced `mark-blocked` must reference such a record. This gate checks decision evidence, not whether the diagnosis is technically true.
+
+`reclaimed` and `blocked` require a user-visible incident summary and create a closeout with independent notification/report acknowledgements. Until both are complete, replacement fails closed and the incident remains actionable. Delivery HTML shows objective runtime, failures, diagnostic value decisions, and closeout status; attempt command details stay here rather than being copied into project plans.
+
+A context-health receipt has schema version 1, controller ID, `healthy|warning|handoff_required`, capture time, absolute report path, and metrics. The control plane hashes the referenced report but does not copy prompts or responses. `handoff_required` blocks registration and dispatch so the controller must produce a structured handoff and migrate before creating more workers.

@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.8.0 preview. The ledger, contract/result checks, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
+> Windows-first v0.9.0 preview. The ledger, contract/result checks, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,15 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.8.0 does
+## What v0.9.0 does
+
+- Lets a worker submit a first-class failed/blocked event before required stages finish, with attempted stage, classified cause, command summary, and evidence references.
+- Audits stalled execution from lease/progress/attempt evidence even when no completion or ordinary message arrives.
+- Preserves stable objective identity across replacements and fails closed before r3 after two failed replacements or an exhausted time budget.
+- Requires product-value evidence before a diagnostic may block a milestone; otherwise it remains non-blocking technical debt.
+- Requires reclaim/block closeout with a user notification and refreshed delivery report before replacement.
+- Ingests context-health receipts and blocks registration/dispatch when a controller requires a clean-thread handoff.
+- Requires schema-v2 implementation contracts with explicit controller-owned `allowedWritePaths`; legacy schema-v1 tasks remain read-compatible.
 
 - Keeps task registries isolated by normalized project root.
 - Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
@@ -60,7 +68,7 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.8.0 does not do
+## What v0.9.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
@@ -88,7 +96,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.8.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.9.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
