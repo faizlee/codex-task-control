@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   TaskControlError,
   auditControllerRouting,
+  controllerAssertBusinessReady,
   controllerConfirmHeartbeatAction,
   controllerBuildDeliveryReport,
   controllerDispatchRework,
@@ -33,6 +34,7 @@ import {
   controllerRecordTitleSynced,
   controllerRegisterTask,
   controllerRearmHeartbeat,
+  controllerFinalizeCycle,
   controllerRetryThreadAction,
   controllerScanPendingEvents,
   createCompletionEvent,
@@ -757,6 +759,10 @@ test('adaptive heartbeat starts on real dispatch, renews on progress, and reorde
     let scan = await controllerScanPendingEvents(input);
     assert.equal(scan.heartbeatState, null);
     assert.equal(scan.shouldKeepHeartbeat, false);
+    const awaitingDispatch = await controllerFinalizeCycle(input);
+    assert.equal(awaitingDispatch.phase, 'awaiting_dispatch');
+    assert.equal(awaitingDispatch.businessAllowed, true);
+    assert.equal(awaitingDispatch.heartbeatAction, null);
     await assert.rejects(createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'not actually dispatched' }), (error) => error instanceof TaskControlError && error.code === 'TASK_DISPATCH_NOT_AUTHORIZED');
 
     const dispatched = await controllerRecordDispatched(input);
@@ -883,6 +889,13 @@ test('a timed-out pending heartbeat action returns bounded compensation', async 
     assert.equal(scan.heartbeatAction.type, 'compensate_timed_out_heartbeat_action');
     assert.equal(scan.pendingEvents.length, 0);
     assert.equal(scan.needsControllerAttention, false);
+    await assert.rejects(
+      controllerMarkBlocked({ ...input, reason: 'This mutation must wait for heartbeat compensation.', userSummary: 'No lifecycle mutation was applied.', blockerSource: 'external' }),
+      (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED',
+    );
+    const finalization = await controllerFinalizeCycle(input);
+    assert.equal(finalization.phase, 'compensate_timed_out_heartbeat');
+    assert.equal(finalization.heartbeatAction.type, 'compensate_timed_out_heartbeat_action');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
@@ -964,7 +977,7 @@ test('repeated retired-automation delete failures open a bounded fuse', async ()
   }
 });
 
-test('current heartbeat delete failures force logical disable at the limit', async () => {
+test('current heartbeat delete failures fuse but keep business blocked until real deletion', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-current-delete-'));
   const projectRoot = 'E:\\work\\project\\heartbeat-current-delete-fuse';
   try {
@@ -981,16 +994,92 @@ test('current heartbeat delete failures force logical disable at the limit', asy
     assert.equal(deletePrepared.heartbeatAction.type, 'delete_controller_heartbeat');
     assert.equal(deletePrepared.heartbeatAction.automationId, 'heartbeat-current-auto-4');
     let failure;
+    let deleteAction = deletePrepared.heartbeatAction;
     for (let attempt = 1; attempt <= 3; attempt += 1) {
-      failure = await controllerRecordHeartbeatActionFailed({ ...input, actionId: deletePrepared.heartbeatAction.actionId, automationId: 'heartbeat-current-auto-4', reason: `current delete attempt ${attempt} timed out` });
+      failure = await controllerRecordHeartbeatActionFailed({ ...input, actionId: deleteAction.actionId, automationId: 'heartbeat-current-auto-4', reason: `current delete attempt ${attempt} timed out` });
+      deleteAction = failure.heartbeatAction;
     }
     assert.equal(failure.fuseOpen, true);
-    assert.equal(failure.heartbeatState.status, 'cancelled');
-    assert.equal(failure.heartbeatState.generation, deletePrepared.heartbeatAction.generation);
-    assert.equal(failure.heartbeatState.automationId, null);
+    assert.equal(failure.heartbeatState.status, 'armed');
+    assert.equal(failure.heartbeatState.generation, deletePrepared.heartbeatAction.generation - 1);
+    assert.equal(failure.heartbeatState.automationId, 'heartbeat-current-auto-4');
+    assert.equal(failure.heartbeatState.pendingAction.type, 'delete_controller_heartbeat');
+    assert.equal(failure.heartbeatAction.type, 'delete_controller_heartbeat');
+    await assert.rejects(controllerAssertBusinessReady(input), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
     const stale = await controllerScanPendingEvents({ ...input, heartbeatGeneration: deletePrepared.heartbeatAction.generation - 1, heartbeatAutomationId: 'heartbeat-current-auto-4', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=5;COUNT=1', heartbeatOccurrence: 4 });
     assert.equal(stale.heartbeatAction.type, 'delete_stale_automation');
     assert.equal(stale.pendingEvents.length, 0);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
+test('terminal closeout supersedes an unconfirmed create and blocks business until both heartbeat copies are deleted', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-terminal-finalize-'));
+  const projectRoot = 'E:\\work\\project\\heartbeat-terminal-finalize';
+  try {
+    const { input, dispatched } = await createHeartbeatFixture(taskControlHome, projectRoot, { threadId: 'terminal-worker' });
+    await controllerConfirmHeartbeatAction({ ...input, actionId: dispatched.heartbeatAction.actionId, automationId: 'heartbeat-confirmed-generation-155' });
+
+    const failurePath = await createFailureEvent({
+      taskControlHome,
+      selfThreadId: input.threadId,
+      eventType: 'task_blocked',
+      attemptedStage: 'runner',
+      failureClass: 'comprehension',
+      failureDomain: 'tooling',
+      commandSummary: 'The runner stopped before producing a candidate commit.',
+      mechanicalRetryEligible: false,
+      evidence: [{ id: 'runner-log', reference: 'logs/runner-blocked.txt' }],
+    });
+    const failed = await controllerIngestFailure({ ...input, eventPath: failurePath, eventType: 'task_blocked' });
+    assert.equal(failed.heartbeatAction.type, 'create_controller_heartbeat');
+    assert.equal(failed.heartbeatAction.previousAutomationId, 'heartbeat-confirmed-generation-155');
+    const supersededCreateActionId = failed.heartbeatAction.actionId;
+    const supersededCreateGeneration = failed.heartbeatAction.generation;
+
+    const reclaimed = await controllerReclaimTask({ ...input, reason: 'A second blocker requires controller recovery.', userSummary: 'The failed attempt was closed without another automatic replacement.' });
+    await controllerMarkCloseoutNotificationSent(input);
+    await controllerRefreshCloseoutReport(input);
+    await controllerRecordTitleSynced({ ...input, title: reclaimed.desiredThreadTitle });
+    const archived = await controllerRecordArchiveSucceeded(input);
+
+    assert.equal(archived.heartbeatAction.type, 'finalize_controller_cycle');
+    assert.deepEqual(archived.heartbeatAction.hostActions, [
+      { type: 'compare_and_delete_pending_create', actionId: supersededCreateActionId, generation: supersededCreateGeneration, requiresActionIdMatch: true },
+      { type: 'delete_confirmed_automation', automationId: 'heartbeat-confirmed-generation-155', generation: dispatched.heartbeatAction.generation },
+    ]);
+
+    const finalized = await controllerFinalizeCycle(input);
+    assert.equal(finalized.finalized, false);
+    assert.equal(finalized.businessAllowed, false);
+    assert.equal(finalized.phase, 'delete_heartbeat');
+    assert.equal(finalized.heartbeatAction.actionId, archived.heartbeatAction.actionId);
+    await assert.rejects(controllerAssertBusinessReady(input), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
+    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'forbidden-before-heartbeat-delete', parentThreadId: input.controllerThreadId }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
+
+    const retryCleanup = await controllerRecordHeartbeatActionFailed({
+      ...input,
+      actionId: archived.heartbeatAction.actionId,
+      automationId: 'heartbeat-confirmed-generation-155',
+      reason: 'host compare-and-delete timed out',
+    });
+    assert.equal(retryCleanup.heartbeatAction.type, 'finalize_controller_cycle');
+    assert.notEqual(retryCleanup.heartbeatAction.actionId, archived.heartbeatAction.actionId);
+    assert.deepEqual(retryCleanup.heartbeatAction.hostActions, archived.heartbeatAction.hostActions);
+    await assert.rejects(controllerAssertBusinessReady(input), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
+
+    const confirmed = await controllerConfirmHeartbeatAction({
+      ...input,
+      actionId: retryCleanup.heartbeatAction.actionId,
+      automationId: 'heartbeat-confirmed-generation-155',
+      pendingCreateCleanupOutcome: 'not_found',
+    });
+    assert.equal(confirmed.cycleFinalized, true);
+    assert.equal(confirmed.heartbeatState.status, 'cancelled');
+    assert.equal(confirmed.heartbeatState.automationId, null);
+    const ready = await controllerAssertBusinessReady(input);
+    assert.equal(ready.businessAllowed, true);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }

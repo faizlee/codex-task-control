@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.9.0 preview. The ledger, contract/result checks, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
+> Windows-first v0.10.0 preview. The ledger, contract/result checks, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,7 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.9.0 does
+## What v0.10.0 does
 
 - Lets a worker submit a first-class failed/blocked event before required stages finish, with attempted stage, classified cause, command summary, and evidence references.
 - Audits stalled execution from lease/progress/attempt evidence even when no completion or ordinary message arrives.
@@ -51,6 +51,8 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Treats failed review as a stopped routing decision, not as running rework; permits one explicit mechanical retry and supports controller reclaim.
 - Assigns readable hierarchical keys such as `01` and `01.1`, then synchronizes lifecycle titles in the Codex sidebar.
 - Uses two-phase heartbeat commit: prepare locally, create a new App automation, confirm/switch the ledger, then delete the retired automation. An App failure cannot advance the confirmed generation.
+- Finalizes each controller cycle through one entry point. A terminal/quiescent controller with an unconfirmed replacement create receives a bounded `finalize_controller_cycle` action that compare-deletes that pending create and deletes the last confirmed automation.
+- Reconciles an expired pending heartbeat action before later controller work. Registration, dispatch, rework, and the explicit business-readiness check fail closed while terminal heartbeat deletion remains unconfirmed.
 - Uses adaptive `COUNT=1` cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval.
 - Turns stale, wrong-ID, expired, repeated, or misconfigured heartbeat invocations into an empty-queue `delete_stale_automation` path instead of a silent infinite loop.
 - Persists last successful generation, automation ID, pending action, trigger/stale/delete-failure counts, fuse evidence, and one-time notification state.
@@ -68,13 +70,13 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.9.0 does not do
+## What v0.10.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, or steer Codex tasks.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
-- It cannot make Codex App compare-and-delete an automation atomically or stop a tool call inside the host. The protocol preserves the old confirmed generation, uses a 30-second pending-action deadline, and self-recovers on the next trigger; a host-native stale cleanup hook remains the long-term fix.
+- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. The skill now blocks later controlled business actions and returns bounded cleanup selectors, but a host-native compare-and-delete/defer hook remains the complete fix.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
@@ -96,7 +98,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.9.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.10.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -179,6 +181,20 @@ node $TaskControl query-parent --self "worker-1"
 ```
 
 Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.
+
+At the end of every controller reconciliation, call the single cycle finalizer before returning to project work:
+
+```powershell
+node $TaskControl controller-finalize-cycle `
+  --project-root "C:\work\example" `
+  --controller "controller-1"
+
+node $TaskControl controller-assert-business-ready `
+  --project-root "C:\work\example" `
+  --controller "controller-1"
+```
+
+Apply the finalizer's host action before continuing. For `finalize_controller_cycle`, compare-delete the superseded create by its exact action ID and generation, delete the exact previously confirmed automation ID, then confirm with `--pending-create-cleanup-outcome deleted|not_found`. If either host operation times out, record failure; do not register, dispatch, or resume project business under that controller.
 
 New implementation contracts must also include `resultRequirements`. At completion the worker supplies a project-owned result manifest; the controller then reviews and builds the historical report:
 

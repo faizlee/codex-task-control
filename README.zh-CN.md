@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.9.0 是 Windows-first preview。台账、合同/成果校验、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
+> v0.10.0 是 Windows-first preview。台账、合同/成果校验、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,7 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.9.0 已经解决什么
+## v0.10.0 已经解决什么
 
 - worker 可以在 required stage 尚未完成时提交正式 `task_failed` / `task_blocked`，包含失败阶段、分类、命令摘要和证据引用。
 - 即使没有 completion 或普通消息，主控扫描也会根据 lease、最后进度、attempt 时长和 candidate 缺失识别停滞。
@@ -40,6 +40,8 @@
 - 审查失败先进入停止的“待决”状态，只允许一次明确的机械返工，其他失败由主控收回。
 - 自动分配 `01`、`01.1` 这类层级编号，并把生命周期标题同步到 Codex 侧边栏。
 - heartbeat 改为两阶段提交：本地 prepare、App 创建新 automation、确认并切换台账、最后删除旧 automation；App 失败时不会提前推进 confirmed generation。
+- 每轮主控收口统一走一个入口。终态且已无业务队列时，如果仍有未确认的新 heartbeat create，会返回有界的 `finalize_controller_cycle`：按 action ID/generation 比较删除未确认 create，并删除最后一个 confirmed automation。
+- 任意后续主控业务动作前先处理已超时的 pending heartbeat action；终态心跳尚未确认删除时，登记、派发、返工和显式业务就绪检查全部 fail closed。
 - automation 强制 `COUNT=1`；stale、错误 ID、过期、重复触发或 RRULE 错配只返回空队列的 `delete_stale_automation`，不再静默空转。
 - 持久记录最后成功 generation、automation ID、pending action、触发/stale/删除失败次数、熔断证据与一次性通知状态。
 - 新登记的 implementation 必须提交带 schema 版本的成果包，记录 candidate commit、用户可见摘要、实际改变、未完成项、测试/前后数值和带类型的 artifact 引用。
@@ -57,13 +59,13 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.9.0 不做什么
+## v0.10.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止或 steer Codex task。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法让 Codex App 原子地 compare-and-delete，也无法从 Skill 内部强制中断宿主工具调用；当前协议用 30 秒 pending deadline、保留旧 confirmed generation 和下一次触发自恢复来补偿，长期仍需要 App 原生 stale cleanup hook。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能在主控 turn 进行中原子延后定时消息，或取消已经挂起的宿主工具调用。Skill 会阻止后续受控业务动作并返回有界清理选择器，但彻底解决仍需要宿主级 compare-and-delete/defer hook。
 - 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
 - 当前只对 Windows 项目路径做了完整验证。
 
@@ -151,6 +153,20 @@ node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" -
 ```
 
 不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。
+
+每轮主控事件处理、closeout、报告和侧边栏动作结束后，必须先通过单入口收口，再继续项目业务：
+
+```powershell
+node $TaskControl controller-finalize-cycle `
+  --project-root "C:\work\example" `
+  --controller "controller-1"
+
+node $TaskControl controller-assert-business-ready `
+  --project-root "C:\work\example" `
+  --controller "controller-1"
+```
+
+必须先真实执行 finalizer 返回的宿主动作。遇到 `finalize_controller_cycle` 时，按精确 action ID/generation 比较删除被取代的 create，再删除精确的旧 confirmed automation ID，最后用 `--pending-create-cleanup-outcome deleted|not_found` 确认。如果任一步超时就记录失败；在清理确认前不得登记、派发或继续该主控的项目业务。
 
 新 implementation 合同还必须声明 `resultRequirements`。worker 完成时提交项目内成果 manifest，主控审查后生成专题历史页：
 

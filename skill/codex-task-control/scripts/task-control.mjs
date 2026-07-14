@@ -36,7 +36,7 @@ export const DIAGNOSTIC_CLASSIFICATIONS = Object.freeze(['technical_debt', 'mile
 export const BLOCKER_SOURCES = Object.freeze(['diagnostic', 'external', 'contract', 'superseded']);
 export const HEARTBEAT_STATUSES = Object.freeze(['armed', 'cancelled']);
 export const HEARTBEAT_REASONS = Object.freeze(['dispatch', 'progress', 'completion', 'reconcile']);
-export const HEARTBEAT_ACTION_TYPES = Object.freeze(['create_controller_heartbeat', 'delete_controller_heartbeat']);
+export const HEARTBEAT_ACTION_TYPES = Object.freeze(['create_controller_heartbeat', 'delete_controller_heartbeat', 'finalize_controller_cycle']);
 export const HEARTBEAT_NOTIFICATION_STATUSES = Object.freeze(['not_required', 'pending', 'sent', 'failed']);
 export const HEARTBEAT_PROTOCOL_VERSION = 2;
 export const HEARTBEAT_ACTION_TIMEOUT_MS = 30 * 1000;
@@ -1000,9 +1000,44 @@ export function heartbeatIntervalForTask(task) {
 function controllerWorkQueues(tasks, controllerThreadId) {
   const directTasks = tasks.filter((task) => task.directControllerThreadId === controllerThreadId);
   const activeTasks = directTasks.filter((task) => task.status === 'executing' && currentAttemptDispatched(task));
+  const routingTasks = directTasks.filter((task) => task.status === 'executing' && !currentAttemptDispatched(task));
   const queuedTasks = directTasks.filter((task) => ['awaiting_review', 'accepted', 'changes_requested'].includes(task.status) || (task.closeout !== null && !closeoutComplete(task)));
   const cleanupTasks = directTasks.filter((task) => cleanupActionability(task, tasks) === 'actionable');
-  return { directTasks, activeTasks, queuedTasks, cleanupTasks, shouldKeepHeartbeat: activeTasks.length > 0 || queuedTasks.length > 0 || cleanupTasks.length > 0 };
+  return { directTasks, activeTasks, routingTasks, queuedTasks, cleanupTasks, shouldKeepHeartbeat: activeTasks.length > 0 || queuedTasks.length > 0 || cleanupTasks.length > 0 };
+}
+
+function controllerCycleGate(registry, controllerThreadId, now = Date.now()) {
+  const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId) ?? null;
+  const state = found === null ? null : heartbeatEvidenceDefaults(found);
+  if (state !== null && state.pendingAction !== null) {
+    const expired = now > Date.parse(state.pendingAction.expiresAt);
+    const pendingCreateCanOverlapActiveWork = state.pendingAction.type === 'create_controller_heartbeat' && (queues.shouldKeepHeartbeat || queues.routingTasks.length > 0) && !expired;
+    if (!pendingCreateCanOverlapActiveWork) {
+      return { businessAllowed: false, reason: expired ? 'pending_heartbeat_action_timed_out' : 'pending_heartbeat_action_unconfirmed', queues, heartbeatState: state, heartbeatAction: expired ? { type: 'compensate_timed_out_heartbeat_action', actionId: state.pendingAction.actionId, automationId: state.pendingAction.previousAutomationId, generation: state.pendingAction.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, command: 'controller-record-heartbeat-action-failed --reason host_timeout' } : heartbeatActionForPending(state, state.pendingAction) };
+    }
+    return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: heartbeatActionForPending(state, state.pendingAction) };
+  }
+  const undispatchedBootstrapOnly = state === null && queues.activeTasks.length === 0 && queues.cleanupTasks.length === 0 && queues.queuedTasks.length === 0 && queues.routingTasks.length > 0;
+  if (undispatchedBootstrapOnly) return { businessAllowed: true, reason: null, queues, heartbeatState: null, heartbeatAction: null };
+  if (queues.shouldKeepHeartbeat && (state === null || state.status !== 'armed' || !isSafeThreadId(state.automationId))) return { businessAllowed: false, reason: 'confirmed_heartbeat_missing', queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', command: 'controller-finalize-cycle' } };
+  if (!queues.shouldKeepHeartbeat && state?.status === 'armed' && isSafeThreadId(state.automationId)) return { businessAllowed: false, reason: 'terminal_heartbeat_delete_required', queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', automationId: state.automationId, generation: state.generation, command: 'controller-finalize-cycle' } };
+  return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: null };
+}
+
+function assertControllerCycleBusinessReady(registry, controllerThreadId, options = {}) {
+  const gate = controllerCycleGate(registry, controllerThreadId);
+  if (!gate.businessAllowed && options.allowHeartbeatBootstrap === true && gate.reason === 'confirmed_heartbeat_missing' && gate.heartbeatState?.pendingAction == null) return gate;
+  if (!gate.businessAllowed) fail('CONTROLLER_CYCLE_RECONCILE_REQUIRED', `${gate.reason}; 先执行 controller-finalize-cycle 并真实完成返回的 host heartbeat action`);
+  return gate;
+}
+
+function assertNoExpiredPendingHeartbeat(registry, controllerThreadId, now = Date.now()) {
+  const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId) ?? null;
+  const pendingAction = found === null ? null : heartbeatEvidenceDefaults(found).pendingAction;
+  if (pendingAction !== null && now > Date.parse(pendingAction.expiresAt)) {
+    fail('CONTROLLER_CYCLE_RECONCILE_REQUIRED', 'pending_heartbeat_action_timed_out; 先执行 controller-finalize-cycle 并记录返回的 compensation，再继续任何生命周期变更');
+  }
 }
 
 function heartbeatEvidenceDefaults(state) {
@@ -1042,10 +1077,37 @@ function heartbeatDesiredState(controllerThreadId, generation, queues, reason, t
 }
 
 function heartbeatActionForPending(state, pendingAction) {
+  if (pendingAction.type === 'finalize_controller_cycle') {
+    const hostActions = [
+      { type: 'compare_and_delete_pending_create', actionId: pendingAction.supersededCreateActionId, generation: pendingAction.supersededCreateGeneration, requiresActionIdMatch: true },
+      ...(pendingAction.previousAutomationId === null ? [] : [{ type: 'delete_confirmed_automation', automationId: pendingAction.previousAutomationId, generation: pendingAction.previousGeneration }]),
+    ];
+    return { type: pendingAction.type, controllerThreadId: state.controllerThreadId, actionId: pendingAction.actionId, generation: pendingAction.generation, hostActions, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, onSuccess: 'controller-confirm-heartbeat-action --pending-create-cleanup-outcome deleted|not_found', onTimeout: 'controller-record-heartbeat-action-failed' };
+  }
   if (pendingAction.type === 'delete_controller_heartbeat') {
     return { type: pendingAction.type, controllerThreadId: state.controllerThreadId, actionId: pendingAction.actionId, automationId: pendingAction.previousAutomationId, generation: pendingAction.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, onTimeout: 'controller-record-heartbeat-action-failed' };
   }
   return { type: pendingAction.type, controllerThreadId: state.controllerThreadId, actionId: pendingAction.actionId, generation: pendingAction.generation, dueAt: pendingAction.dueAt, intervalMs: pendingAction.intervalMs, mode: 'one_shot', maxOccurrences: HEARTBEAT_MAX_OCCURRENCES, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, previousAutomationId: pendingAction.previousAutomationId, onSuccess: 'controller-confirm-heartbeat-action', onTimeout: 'controller-record-heartbeat-action-failed' };
+}
+
+function pendingCycleFinalizationAction(state, supersededCreate, desired, now) {
+  return {
+    actionId: randomUUID().replaceAll('-', ''),
+    type: 'finalize_controller_cycle',
+    generation: desired.generation,
+    previousGeneration: state.generation,
+    previousAutomationId: state.automationId,
+    supersededCreateActionId: supersededCreate.actionId,
+    supersededCreateGeneration: supersededCreate.generation,
+    dueAt: null,
+    intervalMs: null,
+    desiredStatus: 'cancelled',
+    reason: desired.reason,
+    triggerTaskThreadId: desired.triggerTaskThreadId,
+    preparedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + HEARTBEAT_ACTION_TIMEOUT_MS).toISOString(),
+    maxOccurrences: HEARTBEAT_MAX_OCCURRENCES,
+  };
 }
 
 function pendingHeartbeatAction(state, desired, now) {
@@ -1072,10 +1134,16 @@ function rearmControllerHeartbeatInRegistry(registry, controllerThreadId, reason
   const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
   const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId);
   const base = found ? heartbeatEvidenceDefaults(found) : heartbeatEvidenceDefaults({ controllerThreadId, generation: 0, status: 'cancelled', dueAt: null, intervalMs: null, reason, triggerTaskThreadId: null, updatedAt: now.toISOString() });
+  const desired = heartbeatDesiredState(controllerThreadId, base.generation + 1, queues, reason, triggerTaskThreadId, now);
+  if (base.pendingAction?.type === 'create_controller_heartbeat' && desired.status === 'cancelled') {
+    const pendingAction = pendingCycleFinalizationAction(base, base.pendingAction, desired, now);
+    const state = { ...base, pendingAction, updatedAt: now.toISOString(), actionHistory: appendHeartbeatActionHistory(base, base.pendingAction, 'failed', 'pending create superseded by quiescent terminal controller cycle', now.toISOString()) };
+    const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
+    return { registry: { ...registry, controllerHeartbeats, updatedAt: now.toISOString() }, state, pendingState: desired, heartbeatAction: heartbeatActionForPending(state, pendingAction), reusedPendingAction: false };
+  }
   if (base.pendingAction !== null) {
     return { registry, state: base, pendingState: { ...base.pendingAction }, heartbeatAction: heartbeatActionForPending(base, base.pendingAction), reusedPendingAction: true };
   }
-  const desired = heartbeatDesiredState(controllerThreadId, base.generation + 1, queues, reason, triggerTaskThreadId, now);
   const pendingAction = pendingHeartbeatAction(base, desired, now);
   const state = { ...base, pendingAction, updatedAt: now.toISOString() };
   const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
@@ -1092,6 +1160,10 @@ function validatePendingHeartbeatAction(value, state) {
   const required = ['actionId', 'type', 'generation', 'previousGeneration', 'previousAutomationId', 'dueAt', 'intervalMs', 'desiredStatus', 'reason', 'triggerTaskThreadId', 'preparedAt', 'expiresAt', 'maxOccurrences'];
   if (!required.every((key) => key in value) || !isSafeThreadId(value.actionId) || !has(value.type, HEARTBEAT_ACTION_TYPES) || !Number.isInteger(value.generation) || value.generation !== state.generation + 1 || value.previousGeneration !== state.generation || (value.previousAutomationId !== null && !isSafeThreadId(value.previousAutomationId)) || !has(value.desiredStatus, HEARTBEAT_STATUSES) || !has(value.reason, HEARTBEAT_REASONS) || !isTimestamp(value.preparedAt) || !isTimestamp(value.expiresAt) || value.maxOccurrences !== HEARTBEAT_MAX_OCCURRENCES) fail('REGISTRY_INVALID', 'pending heartbeat action 字段无效');
   if (value.triggerTaskThreadId !== null) assertSafeThreadId(value.triggerTaskThreadId, 'pendingHeartbeat.triggerTaskThreadId');
+  if (value.type === 'finalize_controller_cycle') {
+    if (value.desiredStatus !== 'cancelled' || value.dueAt !== null || value.intervalMs !== null || !isSafeThreadId(value.supersededCreateActionId) || !Number.isInteger(value.supersededCreateGeneration) || value.supersededCreateGeneration !== value.generation) fail('REGISTRY_INVALID', 'controller cycle finalization action 无效');
+    return { ...value };
+  }
   if (value.desiredStatus === 'armed') {
     if (value.type !== 'create_controller_heartbeat' || !isTimestamp(value.dueAt) || !Number.isInteger(value.intervalMs) || value.intervalMs <= 0) fail('REGISTRY_INVALID', 'armed pending heartbeat 必须创建单次 automation');
   } else if (value.type !== 'delete_controller_heartbeat' || value.dueAt !== null || value.intervalMs !== null) {
@@ -1481,6 +1553,7 @@ async function mutateController({ codexHome, taskControlHome, projectRoot, contr
   return withExclusiveLock(paths.registryPath, async () => {
     const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
     const controlledRegistry = { ...registry, tasks: ensureTaskControls(registry.tasks, registry.rootControllerThreadIds) };
+    assertNoExpiredPendingHeartbeat(controlledRegistry, controllerThreadId);
     const current = taskOrThrow(controlledRegistry, threadId);
     assertTaskController(current, controllerThreadId);
     const mutatedTask = await mutate(current, controlledRegistry);
@@ -1512,6 +1585,52 @@ export async function controllerRearmHeartbeat(input) {
     await atomicWriteJson(paths.registryPath, next);
     return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, heartbeatState: heartbeat.state, pendingHeartbeatState: heartbeat.pendingState, heartbeatAction: heartbeat.heartbeatAction, reusedPendingHeartbeatAction: heartbeat.reusedPendingAction };
   });
+}
+
+export async function controllerFinalizeCycle(input) {
+  const resolvedHome = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(resolvedHome, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const rawRegistry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const registry = { ...rawRegistry, tasks: ensureTaskControls(rawRegistry.tasks, rawRegistry.rootControllerThreadIds) };
+    const controllerKnown = registry.rootControllerThreadIds.includes(input.controllerThreadId) || registry.tasks.some((task) => task.threadId === input.controllerThreadId);
+    if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
+    const before = controllerCycleGate(registry, input.controllerThreadId);
+    const unresolvedCloseouts = before.queues.directTasks.filter((task) => task.closeout !== null && !closeoutComplete(task)).map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, notificationStatus: task.closeout.notificationStatus, reportStatus: task.closeout.reportStatus }));
+    const requiredThreadActions = before.queues.directTasks.flatMap((task) => threadActionsForTask(task, registry.tasks));
+    const routingOnly = before.queues.routingTasks.length > 0 && unresolvedCloseouts.length === 0 && requiredThreadActions.length === 0 && !before.queues.shouldKeepHeartbeat;
+    if (routingOnly) {
+      if (before.heartbeatState !== null && before.heartbeatState.pendingAction !== null) return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, finalized: false, businessAllowed: before.businessAllowed, phase: Date.now() > Date.parse(before.heartbeatState.pendingAction.expiresAt) ? 'compensate_timed_out_heartbeat' : 'resolve_heartbeat_action', heartbeatState: before.heartbeatState, heartbeatAction: before.heartbeatAction, unresolvedCloseouts: [], requiredThreadActions: [] };
+      return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, finalized: false, businessAllowed: true, phase: 'awaiting_dispatch', heartbeatState: before.heartbeatState, heartbeatAction: null, unresolvedCloseouts: [], requiredThreadActions: [] };
+    }
+    if (unresolvedCloseouts.length > 0 || requiredThreadActions.length > 0 || before.queues.shouldKeepHeartbeat) {
+      if (before.heartbeatState !== null && before.heartbeatState.pendingAction !== null) return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, finalized: false, businessAllowed: false, phase: Date.now() > Date.parse(before.heartbeatState.pendingAction.expiresAt) ? 'compensate_timed_out_heartbeat' : 'resolve_heartbeat_action', heartbeatState: before.heartbeatState, heartbeatAction: before.heartbeatAction, unresolvedCloseouts, requiredThreadActions };
+      const heartbeat = rearmControllerHeartbeatInRegistry(registry, input.controllerThreadId, 'reconcile', null);
+      const next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
+      await atomicWriteJson(paths.registryPath, next);
+      return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, finalized: false, businessAllowed: false, phase: 'resolve_heartbeat_action', heartbeatState: heartbeat.state, heartbeatAction: heartbeat.heartbeatAction, unresolvedCloseouts, requiredThreadActions };
+    }
+    const settled = before.heartbeatState === null || (before.heartbeatState.pendingAction === null && before.heartbeatState.status === 'cancelled' && before.heartbeatState.automationId === null);
+    if (settled) return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, finalized: true, businessAllowed: true, phase: 'finalized', heartbeatState: before.heartbeatState, heartbeatAction: null, unresolvedCloseouts: [], requiredThreadActions: [] };
+    const heartbeat = rearmControllerHeartbeatInRegistry(registry, input.controllerThreadId, 'reconcile', null);
+    const next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, finalized: false, businessAllowed: false, phase: 'delete_heartbeat', heartbeatState: heartbeat.state, heartbeatAction: heartbeat.heartbeatAction, unresolvedCloseouts: [], requiredThreadActions: [] };
+  });
+}
+
+export async function controllerAssertBusinessReady(input) {
+  const resolvedHome = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(resolvedHome, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  const rawRegistry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+  const registry = { ...rawRegistry, tasks: ensureTaskControls(rawRegistry.tasks, rawRegistry.rootControllerThreadIds) };
+  const controllerKnown = registry.rootControllerThreadIds.includes(input.controllerThreadId) || registry.tasks.some((task) => task.threadId === input.controllerThreadId);
+  if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
+  const gate = controllerCycleGate(registry, input.controllerThreadId);
+  if (!gate.businessAllowed) fail('CONTROLLER_CYCLE_RECONCILE_REQUIRED', `${gate.reason}; 先执行 controller-finalize-cycle 并真实完成返回的 host heartbeat action`);
+  return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, businessAllowed: true, heartbeatState: gate.heartbeatState };
 }
 
 function appendHeartbeatActionHistory(state, pending, outcome, detail, recordedAt = new Date().toISOString()) {
@@ -1549,6 +1668,9 @@ export async function controllerConfirmHeartbeatAction(input) {
       assertSafeThreadId(input.automationId, 'automationId');
       if (pending.previousAutomationId !== null && input.automationId === pending.previousAutomationId) fail('HEARTBEAT_IN_PLACE_REPLACE_FORBIDDEN', 'heartbeat 必须 create-new/confirm/switch，禁止原 id 原地替换');
       automationId = input.automationId;
+    } else if (pending.type === 'finalize_controller_cycle') {
+      if (!['deleted', 'not_found'].includes(input.pendingCreateCleanupOutcome)) fail('HEARTBEAT_FINALIZATION_EVIDENCE_REQUIRED', 'cycle finalization 必须记录 pending create cleanup outcome=deleted|not_found');
+      if (pending.previousAutomationId !== null && input.automationId !== pending.previousAutomationId) fail('HEARTBEAT_AUTOMATION_MISMATCH', 'cycle finalization 的 confirmed automation 与待删除对象不一致');
     } else if (pending.previousAutomationId !== null && input.automationId !== pending.previousAutomationId) {
       fail('HEARTBEAT_AUTOMATION_MISMATCH', '删除确认的 automationId 与待删除对象不一致');
     }
@@ -1578,13 +1700,13 @@ export async function controllerConfirmHeartbeatAction(input) {
       disabledAt: null,
       disableReason: null,
       notificationStatus: 'not_required',
-      actionHistory: appendHeartbeatActionHistory(state, pending, 'confirmed', input.observed === true ? 'automation trigger proved create success' : 'host automation action confirmed'),
+      actionHistory: appendHeartbeatActionHistory(state, pending, 'confirmed', pending.type === 'finalize_controller_cycle' ? `pending create cleanup=${input.pendingCreateCleanupOutcome}; confirmed automation deleted` : input.observed === true ? 'automation trigger proved create success' : 'host automation action confirmed'),
       retiredAutomationIds,
     };
     const cleanupHeartbeatAction = pending.type === 'create_controller_heartbeat' && pending.previousAutomationId !== null
       ? { type: 'delete_retired_automation', actionId: randomUUID().replaceAll('-', ''), automationId: pending.previousAutomationId, generation: pending.previousGeneration, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, onTimeout: 'controller-record-heartbeat-action-failed' }
       : null;
-    return { state: nextState, output: { confirmedGeneration: pending.generation, cleanupHeartbeatAction } };
+    return { state: nextState, output: { confirmedGeneration: pending.generation, cycleFinalized: pending.type === 'finalize_controller_cycle', cleanupHeartbeatAction } };
   });
 }
 
@@ -1592,16 +1714,19 @@ export async function controllerRecordHeartbeatActionFailed(input) {
   if (!isSafeThreadId(input.actionId) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'heartbeat action failure 必须提供 actionId 和 reason');
   return mutateControllerHeartbeat(input, async (state) => {
     const pending = state.pendingAction?.actionId === input.actionId ? state.pendingAction : null;
-    const retiredFailure = pending === null && isSafeThreadId(input.automationId) && (state.retiredAutomationIds.includes(input.automationId) || input.automationId !== state.automationId || state.actionHistory.some((entry) => entry.actionId === input.actionId && entry.type === 'delete_controller_heartbeat'));
+    const retiredFailure = pending === null && state.pendingAction === null && isSafeThreadId(input.automationId) && (state.retiredAutomationIds.includes(input.automationId) || input.automationId !== state.automationId || state.actionHistory.some((entry) => entry.actionId === input.actionId && entry.type === 'delete_controller_heartbeat'));
     if (pending === null && !retiredFailure) fail('HEARTBEAT_ACTION_STALE', '失败 action 既不是当前 pending，也不是已登记 retired automation');
     const failed = pending ?? { actionId: input.actionId, type: 'delete_controller_heartbeat', generation: state.generation, previousGeneration: state.generation, previousAutomationId: input.automationId };
     const now = new Date().toISOString();
     const actionFailureCount = state.actionFailureCount + 1;
-    const deleteFailureCount = state.deleteFailureCount + (failed.type === 'delete_controller_heartbeat' ? 1 : 0);
+    const deleteFailureCount = state.deleteFailureCount + (['delete_controller_heartbeat', 'finalize_controller_cycle'].includes(failed.type) ? 1 : 0);
     const fuseOpen = deleteFailureCount >= HEARTBEAT_STALE_LIMIT;
-    let nextState = {
+    const retryCurrentCleanup = pending !== null && ['delete_controller_heartbeat', 'finalize_controller_cycle'].includes(failed.type)
+      ? { ...failed, actionId: randomUUID().replaceAll('-', ''), preparedAt: now, expiresAt: new Date(Date.parse(now) + HEARTBEAT_ACTION_TIMEOUT_MS).toISOString() }
+      : null;
+    const nextState = {
       ...state,
-      pendingAction: pending === null ? state.pendingAction : null,
+      pendingAction: retryCurrentCleanup,
       updatedAt: now,
       actionFailureCount,
       deleteFailureCount,
@@ -1610,13 +1735,13 @@ export async function controllerRecordHeartbeatActionFailed(input) {
       notificationStatus: fuseOpen && state.notificationStatus === 'not_required' ? 'pending' : state.notificationStatus,
       actionHistory: appendHeartbeatActionHistory(state, failed, fuseOpen ? 'fused' : 'failed', input.reason.trim(), now),
     };
-    const targetAutomationId = failed.type === 'delete_controller_heartbeat'
+    const targetAutomationId = ['delete_controller_heartbeat', 'finalize_controller_cycle'].includes(failed.type)
       ? (failed.previousAutomationId ?? input.automationId ?? null)
       : (isSafeThreadId(input.automationId) && input.automationId !== state.automationId ? input.automationId : null);
-    if (fuseOpen && failed.type === 'delete_controller_heartbeat' && targetAutomationId !== null && targetAutomationId === state.automationId) {
-      nextState = { ...nextState, generation: pending?.generation ?? state.generation + 1, status: 'cancelled', dueAt: null, intervalMs: null, automationId: null, retiredAutomationIds: [...new Set([...nextState.retiredAutomationIds, targetAutomationId])] };
-    }
-    return { state: nextState, output: { fuseOpen, notificationRequired: nextState.notificationStatus === 'pending', heartbeatAction: targetAutomationId === null ? null : { type: 'delete_stale_automation', actionId: input.actionId, automationId: targetAutomationId, generation: failed.previousGeneration, currentGeneration: nextState.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, reason: fuseOpen ? 'delete_failure_limit' : 'host_action_failed', onTimeout: 'controller-record-heartbeat-action-failed' } } };
+    const heartbeatAction = retryCurrentCleanup !== null
+      ? heartbeatActionForPending(nextState, retryCurrentCleanup)
+      : targetAutomationId === null ? null : { type: 'delete_stale_automation', actionId: input.actionId, automationId: targetAutomationId, generation: failed.previousGeneration, currentGeneration: nextState.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, reason: fuseOpen ? 'delete_failure_limit' : 'host_action_failed', onTimeout: 'controller-record-heartbeat-action-failed' };
+    return { state: nextState, output: { fuseOpen, notificationRequired: nextState.notificationStatus === 'pending', heartbeatAction } };
   });
 }
 
@@ -1629,6 +1754,7 @@ export async function controllerMarkHeartbeatNotificationSent(input) {
 
 export async function controllerRecordDispatched(input) {
   return mutateController({ ...input, heartbeatReason: 'dispatch', mutate: async (task, registry) => {
+    assertControllerCycleBusinessReady(registry, input.controllerThreadId, { allowHeartbeatBootstrap: true });
     assertControllerHealthyForDispatch(registry, input.controllerThreadId);
     if (!dispatchAllowed(task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '只有 executing、标题已同步且实施合同完整的任务可以登记派发');
     if (task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION) {
@@ -1714,6 +1840,7 @@ export async function controllerRegisterTask(input) {
   const { paths } = await ensureProject(home, input.projectRoot, input.controllerThreadId);
   return withExclusiveLock(paths.registryPath, async () => {
     const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    assertControllerCycleBusinessReady({ ...registry, tasks: ensureTaskControls(registry.tasks, registry.rootControllerThreadIds) }, input.controllerThreadId);
     assertControllerHealthyForDispatch(registry, input.controllerThreadId);
     if (registry.tasks.some((task) => task.threadId === input.threadId)) fail('DUPLICATE_THREAD', `重复 threadId: ${input.threadId}`);
     if (input.threadId === input.controllerThreadId) fail('DUPLICATE_THREAD', '任务不能等于 direct controller');
@@ -2378,7 +2505,8 @@ export async function controllerMarkChangesRequested(input) {
 }
 
 export async function controllerDispatchRework(input) {
-  return mutateController({ ...input, mutate: (task) => {
+  return mutateController({ ...input, mutate: (task, registry) => {
+    assertControllerCycleBusinessReady(registry, input.controllerThreadId);
     if (task.status !== 'changes_requested') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 重新派发`);
     if (task.failureClass !== 'mechanical') fail('REWORK_REQUIRES_CONTROLLER', `${task.failureClass} 失败不得继续交给原 worker；必须由主控收回并重新分类`);
     if ((task.attemptCount ?? 1) >= 2) fail('REWORK_LIMIT_REACHED', '同一可见任务只允许一次机械返工；必须由主控收回');
@@ -2665,7 +2793,7 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.9.0',
+    'codex-task-control v0.10.0',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>]',
@@ -2677,11 +2805,13 @@ function helpText() {
     '  controller-ingest-context-health --project-root <root> --controller <id> --receipt <json>',
     '  controller-record-diagnostic ... --diagnostic-id <id> --classification technical_debt|milestone_blocker --summary <text> ...',
     '  mark-accepted ... --reason <review-reason> [--selected-artifact <artifact-id> ...]',
-    '  controller-confirm-heartbeat-action --project-root <root> --controller <id> --action-id <id> --automation-id <new-id>',
+    '  controller-confirm-heartbeat-action --project-root <root> --controller <id> --action-id <id> [--automation-id <new-or-deleted-id>] [--pending-create-cleanup-outcome deleted|not_found]',
+    '  controller-finalize-cycle --project-root <root> --controller <id>',
+    '  controller-assert-business-ready --project-root <root> --controller <id>',
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
     'implementation 成果包按 attempt 追加保存；HTML 报告确定性生成到 task-control/reports，刷新不维持 heartbeat。',
-    'heartbeat 使用 prepare/create-new/confirm/switch/delete-old 两阶段协议；stale invocation 只返回受限自删除动作。',
+    'heartbeat 使用 prepare/create-new/confirm/switch/delete-old 两阶段协议；终态必须 finalize 并确认删除，stale invocation 只返回受限自删除动作。',
   ].join('\n');
 }
 
@@ -2748,7 +2878,9 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-ingest-context-health') result = await controllerIngestContextHealth({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
   else if (command === 'controller-scan-events') result = await controllerScanPendingEvents({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), heartbeatGeneration: option(args, '--heartbeat-generation'), heartbeatAutomationId: option(args, '--automation-id'), heartbeatActionId: option(args, '--heartbeat-action-id'), heartbeatOccurrence: option(args, '--heartbeat-occurrence'), heartbeatRrule: option(args, '--heartbeat-rrule'), heartbeatFiredAt: option(args, '--heartbeat-fired-at') });
   else if (command === 'controller-rearm-heartbeat') result = await controllerRearmHeartbeat({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: option(args, '--reason') ?? 'reconcile' });
-  else if (command === 'controller-confirm-heartbeat-action') result = await controllerConfirmHeartbeatAction({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), observed: option(args, '--observed') === 'true' });
+  else if (command === 'controller-confirm-heartbeat-action') result = await controllerConfirmHeartbeatAction({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), observed: option(args, '--observed') === 'true', pendingCreateCleanupOutcome: option(args, '--pending-create-cleanup-outcome') });
+  else if (command === 'controller-finalize-cycle') result = await controllerFinalizeCycle({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
+  else if (command === 'controller-assert-business-ready') result = await controllerAssertBusinessReady({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-record-heartbeat-action-failed') result = await controllerRecordHeartbeatActionFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), reason: required(args, '--reason') });
   else if (command === 'controller-mark-heartbeat-notification-sent') result = await controllerMarkHeartbeatNotificationSent({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-record-dispatched') result = await controllerRecordDispatched({ ...controllerInput(args) });
