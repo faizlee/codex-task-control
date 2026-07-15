@@ -50,6 +50,13 @@ export const CONTROLLER_MESSAGE_STATUSES = Object.freeze(['deferred_local', 'pre
 export const CONTROLLER_MESSAGE_INTERRUPT_AUTHORITIES = Object.freeze(['user_explicit', 'controller_safety']);
 export const CONTROLLER_MESSAGE_MAX_LENGTH = 4000;
 export const CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS = 30 * 1000;
+export const PARALLEL_BATCH_PROTOCOL_VERSION = 1;
+export const PARALLEL_BATCH_STATUSES = Object.freeze(['planned', 'dispatching', 'running', 'reconciling', 'frozen', 'closed']);
+export const PARALLEL_LANES = Object.freeze(['implementation', 'qa', 'no_code', 'readonly']);
+export const PARALLEL_DISPATCH_AUTHORITIES = Object.freeze(['user_explicit', 'controller_resolved']);
+export const PARALLEL_DEGRADATION_REASONS = Object.freeze(['insufficient_independent_candidates', 'unresolved_dependencies', 'conflict_domain_saturated', 'review_capacity_exhausted', 'user_serial_constraint', 'safety_gate', 'context_handoff', 'no_code_candidate_not_valuable']);
+export const PARALLEL_CANDIDATE_STATES = Object.freeze(['proposed', 'deferred', 'eligible', 'registered', 'dispatching', 'running', 'awaiting_review', 'changes_requested', 'accepted', 'integrated', 'reclaimed', 'blocked']);
+export const PARALLEL_POLICY_MODES = Object.freeze(['legacy_compat', 'batch_v1']);
 export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
@@ -262,6 +269,92 @@ function windowsPathInside(filePath, rootPath) {
   const normalizedFile = win32.resolve(filePath).toLowerCase();
   const normalizedRoot = win32.resolve(rootPath).toLowerCase();
   return normalizedFile === normalizedRoot || normalizedFile.startsWith(`${normalizedRoot}\\`);
+}
+
+function parallelStringArray(value, field, { allowEmpty = true } = {}) {
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0) || !value.every(nonEmpty)) fail('PARALLEL_BATCH_INVALID', `${field} 必须是${allowEmpty ? '' : '非空'}字符串数组`);
+  const normalized = value.map((entry) => entry.trim());
+  if (new Set(normalized).size !== normalized.length) fail('PARALLEL_BATCH_INVALID', `${field} 不得包含重复值`);
+  return normalized;
+}
+
+function validateParallelWorktreeIdentity(value, projectRoot) {
+  if (!isObject(value)) fail('PARALLEL_BATCH_INVALID', 'implementation candidate 必须记录 worktreeIdentity');
+  const allowed = new Set(['baseCommit', 'worktreePath', 'branch', 'lastMainSyncCommit', 'cleanupOwner']);
+  if (Object.keys(value).some((key) => !allowed.has(key)) || ![value.baseCommit, value.worktreePath, value.branch, value.lastMainSyncCommit, value.cleanupOwner].every(nonEmpty)) fail('PARALLEL_BATCH_INVALID', 'worktreeIdentity 字段不完整');
+  if (!win32.isAbsolute(value.worktreePath.replaceAll('/', '\\'))) fail('PARALLEL_BATCH_INVALID', 'worktreePath 必须是绝对路径');
+  if (!isSafeThreadId(value.cleanupOwner)) fail('PARALLEL_BATCH_INVALID', 'cleanupOwner 必须是安全的 thread/controller id');
+  const normalizedProject = win32.resolve(projectRoot.replaceAll('/', '\\')).toLowerCase();
+  const normalizedWorktree = win32.resolve(value.worktreePath.replaceAll('/', '\\')).toLowerCase();
+  if (normalizedWorktree === normalizedProject) fail('PARALLEL_BATCH_INVALID', 'implementation candidate 必须使用独立 worktree，不能把 project main 当候选工作树');
+  return { baseCommit: value.baseCommit.trim(), worktreePath: win32.resolve(value.worktreePath.replaceAll('/', '\\')), branch: value.branch.trim(), lastMainSyncCommit: value.lastMainSyncCommit.trim(), cleanupOwner: value.cleanupOwner.trim() };
+}
+
+function validateParallelDegradation(value) {
+  if (value === null || value === undefined) return null;
+  if (!isObject(value) || !has(value.reason, PARALLEL_DEGRADATION_REASONS) || !nonEmpty(value.summary)) fail('PARALLEL_BATCH_INVALID', 'degradationReceipt 必须记录允许的 reason 和具体 summary');
+  const evidence = parallelStringArray(value.evidence, 'degradationReceipt.evidence', { allowEmpty: false });
+  return { reason: value.reason, summary: value.summary.trim(), evidence };
+}
+
+export function validateParallelBatchManifest(value, projectRoot) {
+  const allowed = new Set(['schemaVersion', 'batchId', 'objective', 'dispatchAuthority', 'reviewCapacity', 'wipLimits', 'dirtyConflictDomains', 'degradationReceipt', 'candidates']);
+  if (!isObject(value) || value.schemaVersion !== PARALLEL_BATCH_PROTOCOL_VERSION || Object.keys(value).some((key) => !allowed.has(key))) fail('PARALLEL_BATCH_INVALID', `parallel batch manifest 必须使用 schemaVersion=${PARALLEL_BATCH_PROTOCOL_VERSION} 且不得包含未知字段`);
+  if (!isSafeThreadId(value.batchId) || !nonEmpty(value.objective) || !has(value.dispatchAuthority, PARALLEL_DISPATCH_AUTHORITIES)) fail('PARALLEL_BATCH_INVALID', 'batchId/objective/dispatchAuthority 无效');
+  if (!Number.isInteger(value.reviewCapacity) || value.reviewCapacity < 1) fail('PARALLEL_BATCH_INVALID', 'reviewCapacity 必须是正整数');
+  if (!isObject(value.wipLimits)) fail('PARALLEL_BATCH_INVALID', 'wipLimits 必须是对象');
+  const wipKeys = ['total', ...PARALLEL_LANES];
+  if (Object.keys(value.wipLimits).some((key) => !wipKeys.includes(key)) || !wipKeys.every((key) => Number.isInteger(value.wipLimits[key]) && value.wipLimits[key] >= 0) || value.wipLimits.total < 1) fail('PARALLEL_BATCH_INVALID', 'wipLimits 必须包含 total 和每个 lane 的非负整数上限');
+  const dirtyConflictDomains = parallelStringArray(value.dirtyConflictDomains ?? [], 'dirtyConflictDomains');
+  const degradationReceipt = validateParallelDegradation(value.degradationReceipt);
+  if (!Array.isArray(value.candidates) || value.candidates.length === 0) fail('PARALLEL_BATCH_INVALID', 'candidates 必须是非空数组');
+  const candidateIds = new Set();
+  const candidates = value.candidates.map((candidate) => {
+    const candidateAllowed = new Set(['candidateId', 'title', 'lane', 'workClass', 'taskMode', 'conflictDomains', 'dependencies', 'reviewCost', 'estimatedMinutes', 'blockingReasons', 'persistentLane', 'worktreeIdentity']);
+    if (!isObject(candidate) || Object.keys(candidate).some((key) => !candidateAllowed.has(key)) || !isSafeThreadId(candidate.candidateId) || candidateIds.has(candidate.candidateId) || !nonEmpty(candidate.title) || !has(candidate.lane, PARALLEL_LANES) || !has(candidate.workClass, WORK_CLASSES) || !REGISTER_TASK_MODES.includes(candidate.taskMode)) fail('PARALLEL_BATCH_INVALID', 'candidate identity/lane/workClass/taskMode 无效');
+    candidateIds.add(candidate.candidateId);
+    const conflictDomains = parallelStringArray(candidate.conflictDomains, `candidate ${candidate.candidateId}.conflictDomains`, { allowEmpty: candidate.lane !== 'implementation' });
+    const blockingReasons = parallelStringArray(candidate.blockingReasons ?? [], `candidate ${candidate.candidateId}.blockingReasons`);
+    if (!Array.isArray(candidate.dependencies)) fail('PARALLEL_BATCH_INVALID', `candidate ${candidate.candidateId}.dependencies 必须是数组`);
+    const dependencyIds = new Set();
+    const dependencies = candidate.dependencies.map((dependency) => {
+      if (!isObject(dependency) || !isSafeThreadId(dependency.candidateId) || dependency.candidateId === candidate.candidateId || dependency.requiredState !== 'integrated' || dependencyIds.has(dependency.candidateId)) fail('PARALLEL_BATCH_INVALID', `candidate ${candidate.candidateId} dependency 无效`);
+      dependencyIds.add(dependency.candidateId);
+      return { candidateId: dependency.candidateId, requiredState: 'integrated' };
+    });
+    if (!Number.isInteger(candidate.reviewCost) || candidate.reviewCost < 1 || !Number.isInteger(candidate.estimatedMinutes) || candidate.estimatedMinutes < 1 || typeof candidate.persistentLane !== 'boolean') fail('PARALLEL_BATCH_INVALID', `candidate ${candidate.candidateId} reviewCost/estimatedMinutes/persistentLane 无效`);
+    const implementationMode = ['implementation', 'visual_implementation'].includes(candidate.taskMode);
+    if (candidate.lane === 'implementation' && !implementationMode) fail('PARALLEL_BATCH_INVALID', `implementation lane candidate ${candidate.candidateId} 必须使用 implementation 或 visual_implementation taskMode`);
+    const worktreeIdentity = implementationMode ? validateParallelWorktreeIdentity(candidate.worktreeIdentity, projectRoot) : null;
+    if (!implementationMode && candidate.worktreeIdentity !== null && candidate.worktreeIdentity !== undefined) fail('PARALLEL_BATCH_INVALID', `control_only candidate ${candidate.candidateId} 不得伪造 worktreeIdentity`);
+    return { candidateId: candidate.candidateId, title: candidate.title.trim(), lane: candidate.lane, workClass: candidate.workClass, taskMode: candidate.taskMode, conflictDomains, dependencies, reviewCost: candidate.reviewCost, estimatedMinutes: candidate.estimatedMinutes, blockingReasons, persistentLane: candidate.persistentLane, worktreeIdentity, threadId: null, registeredAt: null };
+  });
+  for (const candidate of candidates) for (const dependency of candidate.dependencies) if (!candidateIds.has(dependency.candidateId)) fail('PARALLEL_BATCH_INVALID', `candidate ${candidate.candidateId} 引用了未知 dependency ${dependency.candidateId}`);
+  const visiting = new Set();
+  const visited = new Set();
+  const byCandidateId = new Map(candidates.map((candidate) => [candidate.candidateId, candidate]));
+  const visit = (candidateId) => {
+    if (visiting.has(candidateId)) fail('PARALLEL_BATCH_INVALID', `parallel candidate dependency 存在循环: ${candidateId}`);
+    if (visited.has(candidateId)) return;
+    visiting.add(candidateId);
+    for (const dependency of byCandidateId.get(candidateId).dependencies) visit(dependency.candidateId);
+    visiting.delete(candidateId);
+    visited.add(candidateId);
+  };
+  for (const candidate of candidates) visit(candidate.candidateId);
+  return { protocolVersion: PARALLEL_BATCH_PROTOCOL_VERSION, batchId: value.batchId, objective: value.objective.trim(), dispatchAuthority: value.dispatchAuthority, reviewCapacity: value.reviewCapacity, wipLimits: Object.fromEntries(wipKeys.map((key) => [key, value.wipLimits[key]])), dirtyConflictDomains, degradationReceipt, candidates };
+}
+
+export async function loadParallelBatchManifest(projectRoot, reference) {
+  if (!nonEmpty(reference)) fail('PARALLEL_BATCH_MANIFEST_REQUIRED', '必须提供 project-relative parallel batch manifest');
+  const root = win32.resolve(projectRoot.replaceAll('/', '\\'));
+  const manifestPath = win32.resolve(root, reference.replaceAll('/', '\\'));
+  if (!windowsPathInside(manifestPath, root)) fail('PARALLEL_BATCH_OUTSIDE_PROJECT', 'parallel batch manifest 必须位于项目根目录内');
+  let raw;
+  try { raw = await readFile(manifestPath, 'utf8'); } catch (error) { fail('PARALLEL_BATCH_READ_FAILED', `无法读取 ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`); }
+  let value;
+  try { value = JSON.parse(raw); } catch (error) { fail('PARALLEL_BATCH_INVALID', `parallel batch JSON 无效: ${error instanceof Error ? error.message : String(error)}`); }
+  return { manifestPath, manifestDigest: createHash('sha256').update(raw, 'utf8').digest('hex'), ...validateParallelBatchManifest(value, projectRoot) };
 }
 
 function imageDimensions(buffer) {
@@ -754,6 +847,18 @@ function ensureObjectiveControl(tasks) {
   } : { ...task, ...objectiveDefaults(task) });
 }
 
+function parallelTaskDefaults() {
+  return { parallelProtocolVersion: 0, parallelBatchId: null, parallelCandidateId: null, parallelLane: null, parallelConflictDomains: [], parallelReviewCost: null, parallelWorktreeIdentity: null };
+}
+
+function ensureParallelTaskControl(tasks) {
+  return tasks.map((task) => 'parallelProtocolVersion' in task ? {
+    ...task,
+    parallelConflictDomains: Array.isArray(task.parallelConflictDomains) ? task.parallelConflictDomains : [],
+    parallelWorktreeIdentity: task.parallelWorktreeIdentity ?? null,
+  } : { ...task, ...parallelTaskDefaults() });
+}
+
 function controllerHealthFor(registry, controllerThreadId) {
   return (registry.controllerHealth ?? []).find((entry) => entry.controllerThreadId === controllerThreadId) ?? null;
 }
@@ -935,7 +1040,136 @@ function ensureThreadControl(tasks, rootControllers) {
 }
 
 function ensureTaskControls(tasks, rootControllers) {
-  return ensureDispatchControl(ensureExecutionControl(ensureObjectiveControl(ensureImplementationControl(ensureThreadControl(tasks, rootControllers)))));
+  return ensureParallelTaskControl(ensureDispatchControl(ensureExecutionControl(ensureObjectiveControl(ensureImplementationControl(ensureThreadControl(tasks, rootControllers))))));
+}
+
+function parallelTaskState(task) {
+  if (!task) return 'proposed';
+  if (task.status === 'executing') return currentAttemptDispatched(task) ? 'running' : 'registered';
+  if (PARALLEL_CANDIDATE_STATES.includes(task.status)) return task.status;
+  return 'deferred';
+}
+
+function activeParallelTask(task) {
+  return task.parallelProtocolVersion === PARALLEL_BATCH_PROTOCOL_VERSION && ['executing', 'awaiting_review', 'changes_requested', 'accepted'].includes(task.status) && (task.status !== 'executing' || currentAttemptDispatched(task));
+}
+
+function validateParallelBatchRecord(value, tasks, knownControllers, projectRoot) {
+  if (!isObject(value) || value.protocolVersion !== PARALLEL_BATCH_PROTOCOL_VERSION || !isSafeThreadId(value.controllerThreadId) || !knownControllers.has(value.controllerThreadId) || !has(value.status, PARALLEL_BATCH_STATUSES)) fail('REGISTRY_INVALID', 'parallel batch identity/status 无效');
+  if (!Array.isArray(value.candidates)) fail('REGISTRY_INVALID', 'parallel batch candidates 无效');
+  const manifest = validateParallelBatchManifest({ schemaVersion: value.protocolVersion, batchId: value.batchId, objective: value.objective, dispatchAuthority: value.dispatchAuthority, reviewCapacity: value.reviewCapacity, wipLimits: value.wipLimits, dirtyConflictDomains: value.dirtyConflictDomains, degradationReceipt: value.degradationReceipt, candidates: value.candidates.map((candidate) => ({ candidateId: candidate.candidateId, title: candidate.title, lane: candidate.lane, workClass: candidate.workClass, taskMode: candidate.taskMode, conflictDomains: candidate.conflictDomains, dependencies: candidate.dependencies, reviewCost: candidate.reviewCost, estimatedMinutes: candidate.estimatedMinutes, blockingReasons: candidate.blockingReasons, persistentLane: candidate.persistentLane, worktreeIdentity: candidate.worktreeIdentity })) }, projectRoot);
+  if (!nonEmpty(value.manifestPath) || !win32.isAbsolute(value.manifestPath) || !windowsPathInside(value.manifestPath, projectRoot) || !/^[0-9a-f]{64}$/.test(value.manifestDigest ?? '')) fail('REGISTRY_INVALID', 'parallel batch manifest path/digest 无效');
+  if (!Array.isArray(value.pendingDispatchCandidateIds) || new Set(value.pendingDispatchCandidateIds).size !== value.pendingDispatchCandidateIds.length || value.pendingDispatchCandidateIds.some((id) => !manifest.candidates.some((candidate) => candidate.candidateId === id))) fail('REGISTRY_INVALID', 'parallel batch pendingDispatchCandidateIds 无效');
+  if ((value.dispatchWaveId !== null && !isSafeThreadId(value.dispatchWaveId)) || !isTimestamp(value.createdAt) || !isTimestamp(value.updatedAt) || (value.closedAt !== null && !isTimestamp(value.closedAt))) fail('REGISTRY_INVALID', 'parallel batch wave/time 无效');
+  if (value.status === 'dispatching' && (value.pendingDispatchCandidateIds.length === 0 || value.dispatchWaveId === null)) fail('REGISTRY_INVALID', 'dispatching batch 必须保留 pending wave');
+  if (value.status !== 'dispatching' && value.pendingDispatchCandidateIds.length > 0) fail('REGISTRY_INVALID', '非 dispatching batch 不得保留 pending wave');
+  if (value.status === 'closed' && value.closedAt === null) fail('REGISTRY_INVALID', 'closed batch 必须记录 closedAt');
+  const threadIds = new Set();
+  const candidates = manifest.candidates.map((candidate, index) => {
+    const stored = value.candidates[index];
+    if (stored.threadId !== null) {
+      if (!isSafeThreadId(stored.threadId) || threadIds.has(stored.threadId)) fail('REGISTRY_INVALID', 'parallel candidate threadId 无效或重复');
+      threadIds.add(stored.threadId);
+      const task = tasks.find((entry) => entry.threadId === stored.threadId);
+      if (!task || task.directControllerThreadId !== value.controllerThreadId || task.parallelProtocolVersion !== PARALLEL_BATCH_PROTOCOL_VERSION || task.parallelBatchId !== value.batchId || task.parallelCandidateId !== stored.candidateId) fail('REGISTRY_INVALID', 'parallel candidate 与 task 绑定不一致');
+      if (!isTimestamp(stored.registeredAt)) fail('REGISTRY_INVALID', 'parallel candidate registeredAt 无效');
+    } else if (stored.registeredAt !== null) fail('REGISTRY_INVALID', '未绑定 candidate 不得记录 registeredAt');
+    return { ...candidate, threadId: stored.threadId, registeredAt: stored.registeredAt };
+  });
+  return { ...value, ...manifest, controllerThreadId: value.controllerThreadId, status: value.status, manifestPath: value.manifestPath, manifestDigest: value.manifestDigest, pendingDispatchCandidateIds: [...value.pendingDispatchCandidateIds], dispatchWaveId: value.dispatchWaveId, createdAt: value.createdAt, updatedAt: value.updatedAt, closedAt: value.closedAt, candidates };
+}
+
+function parallelBatchRuntime(registry, batch) {
+  const controllerTasks = registry.tasks.filter((task) => task.directControllerThreadId === batch.controllerThreadId);
+  const activeTasks = controllerTasks.filter(activeParallelTask);
+  const activeConflictDomains = new Set(activeTasks.flatMap((task) => task.parallelConflictDomains));
+  const usedReviewCapacity = activeTasks.reduce((sum, task) => sum + (task.parallelReviewCost ?? 0), 0);
+  const activeLaneCounts = Object.fromEntries(PARALLEL_LANES.map((lane) => [lane, activeTasks.filter((task) => task.parallelLane === lane).length]));
+  const stateByCandidate = new Map();
+  for (const candidate of batch.candidates) {
+    const task = candidate.threadId === null ? null : registry.tasks.find((entry) => entry.threadId === candidate.threadId);
+    let state = parallelTaskState(task);
+    const blockers = [...candidate.blockingReasons];
+    const dependenciesIntegrated = candidate.dependencies.every((dependency) => {
+      const dependencyCandidate = batch.candidates.find((entry) => entry.candidateId === dependency.candidateId);
+      const dependencyTask = dependencyCandidate?.threadId === null ? null : registry.tasks.find((entry) => entry.threadId === dependencyCandidate.threadId);
+      return dependencyTask?.status === 'integrated';
+    });
+    if (!dependenciesIntegrated) blockers.push('unresolved_dependencies');
+    if (candidate.conflictDomains.some((domain) => batch.dirtyConflictDomains.includes(domain))) blockers.push('dirty_conflict_domain');
+    if (['proposed', 'registered'].includes(state) && blockers.length > 0) state = 'deferred';
+    else if (state === 'proposed') state = 'eligible';
+    stateByCandidate.set(candidate.candidateId, { candidate, task, state, blockers: [...new Set(blockers)] });
+  }
+  const selectable = batch.candidates.filter((candidate) => ['eligible', 'registered'].includes(stateByCandidate.get(candidate.candidateId).state));
+  const implementationCandidates = selectable.filter((candidate) => candidate.lane === 'implementation');
+  const independentCandidates = selectable.filter((candidate) => candidate.lane !== 'implementation');
+  const priorityCandidates = implementationCandidates.length > 0 && independentCandidates.length > 0
+    ? [implementationCandidates[0], independentCandidates[0], ...selectable.filter((candidate) => ![implementationCandidates[0].candidateId, independentCandidates[0].candidateId].includes(candidate.candidateId))]
+    : selectable;
+  const selected = [];
+  let remainingTotal = Math.max(0, batch.wipLimits.total - activeTasks.length);
+  let remainingReview = Math.max(0, batch.reviewCapacity - usedReviewCapacity);
+  const selectedDomains = new Set();
+  for (const candidate of priorityCandidates) {
+    const runtime = stateByCandidate.get(candidate.candidateId);
+    if (!['eligible', 'registered'].includes(runtime.state) || remainingTotal < 1 || remainingReview < candidate.reviewCost) continue;
+    if (activeLaneCounts[candidate.lane] + selected.filter((entry) => entry.lane === candidate.lane).length >= batch.wipLimits[candidate.lane]) continue;
+    if (candidate.conflictDomains.some((domain) => activeConflictDomains.has(domain) || selectedDomains.has(domain))) continue;
+    selected.push(candidate);
+    remainingTotal -= 1;
+    remainingReview -= candidate.reviewCost;
+    for (const domain of candidate.conflictDomains) selectedDomains.add(domain);
+  }
+  const requiredFanoutCandidateIds = selected.length >= 2 ? selected.map((candidate) => candidate.candidateId) : [];
+  const eligibleCandidates = [...stateByCandidate.values()].filter((entry) => ['eligible', 'registered'].includes(entry.state)).map((entry) => ({ candidateId: entry.candidate.candidateId, title: entry.candidate.title, lane: entry.candidate.lane, threadId: entry.candidate.threadId, state: entry.state, blockers: entry.blockers }));
+  const candidateStates = [...stateByCandidate.values()].map((entry) => ({ candidateId: entry.candidate.candidateId, title: entry.candidate.title, lane: entry.candidate.lane, threadId: entry.candidate.threadId, state: entry.state, blockers: entry.blockers }));
+  const singleCandidateNeedsDegradation = selected.length === 1 && batch.degradationReceipt === null;
+  const fanoutBlockers = [];
+  if (remainingTotal === 0 && selected.length === 0) fanoutBlockers.push('wip_capacity_exhausted');
+  if (remainingReview === 0 && selected.length === 0) fanoutBlockers.push('review_capacity_exhausted');
+  if (singleCandidateNeedsDegradation) fanoutBlockers.push('degradation_receipt_required');
+  return {
+    batchId: batch.batchId,
+    status: batch.status,
+    controllerThreadId: batch.controllerThreadId,
+    candidateStates,
+    eligibleCandidates,
+    requiredFanoutCandidateIds,
+    fanoutRequired: requiredFanoutCandidateIds.length >= 2,
+    singleDispatchAllowed: selected.length === 1 && batch.degradationReceipt !== null,
+    selectedCandidateIds: selected.map((candidate) => candidate.candidateId),
+    idleConcurrencySlots: Math.max(0, batch.wipLimits.total - activeTasks.length),
+    usedReviewCapacity,
+    reviewCapacity: batch.reviewCapacity,
+    activeLaneCounts,
+    fanoutBlockers,
+    pendingDispatchCandidateIds: [...batch.pendingDispatchCandidateIds],
+    dispatchWaveId: batch.dispatchWaveId,
+  };
+}
+
+function controllerParallelRuntime(registry, controllerThreadId) {
+  const batches = (registry.parallelBatches ?? []).filter((batch) => batch.controllerThreadId === controllerThreadId && !['closed', 'frozen'].includes(batch.status)).map((batch) => parallelBatchRuntime(registry, batch));
+  const pendingDispatches = batches.flatMap((batch) => batch.pendingDispatchCandidateIds.map((candidateId) => ({ batchId: batch.batchId, candidateId, dispatchWaveId: batch.dispatchWaveId })));
+  const fanoutRequired = batches.some((batch) => batch.fanoutRequired);
+  const actionableCandidates = batches.flatMap((batch) => batch.eligibleCandidates).length;
+  const singleDispatchReady = batches.some((batch) => batch.singleDispatchAllowed);
+  const postDispatchFanout = batches.some((batch) => ['running', 'reconciling'].includes(batch.status) && (batch.fanoutRequired || batch.singleDispatchAllowed));
+  return { batches, pendingDispatches, fanoutRequired, actionableCandidates, singleDispatchReady, shouldKeepHeartbeat: pendingDispatches.length > 0 || postDispatchFanout };
+}
+
+function controllerThreadDebt(registry, controllerThreadId) {
+  const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const directMessages = (registry.controllerMessages ?? []).filter((message) => message.controllerThreadId === controllerThreadId);
+  const heartbeat = (registry.controllerHeartbeats ?? []).find((entry) => entry.controllerThreadId === controllerThreadId);
+  const reasons = [];
+  if (queues.queuedTasks.length > 0) reasons.push('review_routing_or_closeout_pending');
+  if (queues.cleanupTasks.length > 0) reasons.push('actionable_thread_action_pending');
+  if (directMessages.some((message) => message.status === 'prepared')) reasons.push('message_action_pending');
+  if (heartbeatEvidenceDefaults(heartbeat ?? { controllerThreadId, generation: 0, status: 'cancelled', dueAt: null, intervalMs: null, reason: 'reconcile', triggerTaskThreadId: null, updatedAt: new Date().toISOString() }).pendingAction !== null) reasons.push('heartbeat_action_pending');
+  if (controllerHealthFor(registry, controllerThreadId)?.status === 'handoff_required') reasons.push('context_handoff_required');
+  return { blocked: reasons.length > 0, reasons: [...new Set(reasons)] };
 }
 
 function refreshThreadControl(task, previousTask) {
@@ -1015,7 +1249,9 @@ function controllerWorkQueues(tasks, controllerThreadId) {
 }
 
 function controllerCycleGate(registry, controllerThreadId, now = Date.now()) {
-  const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const taskQueues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const parallel = controllerParallelRuntime(registry, controllerThreadId);
+  const queues = { ...taskQueues, parallel, shouldKeepHeartbeat: taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat };
   const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId) ?? null;
   const state = found === null ? null : heartbeatEvidenceDefaults(found);
   if (state !== null && state.pendingAction !== null) {
@@ -1024,8 +1260,10 @@ function controllerCycleGate(registry, controllerThreadId, now = Date.now()) {
     if (!pendingCreateCanOverlapActiveWork) {
       return { businessAllowed: false, reason: expired ? 'pending_heartbeat_action_timed_out' : 'pending_heartbeat_action_unconfirmed', queues, heartbeatState: state, heartbeatAction: expired ? { type: 'compensate_timed_out_heartbeat_action', actionId: state.pendingAction.actionId, automationId: state.pendingAction.previousAutomationId, generation: state.pendingAction.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, command: 'controller-record-heartbeat-action-failed --reason host_timeout' } : heartbeatActionForPending(state, state.pendingAction) };
     }
+    if (parallel.pendingDispatches.length > 0) return { businessAllowed: false, reason: 'parallel_dispatch_wave_incomplete', queues, heartbeatState: state, heartbeatAction: heartbeatActionForPending(state, state.pendingAction) };
     return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: heartbeatActionForPending(state, state.pendingAction) };
   }
+  if (parallel.pendingDispatches.length > 0) return { businessAllowed: false, reason: 'parallel_dispatch_wave_incomplete', queues, heartbeatState: state, heartbeatAction: null };
   const undispatchedBootstrapOnly = state === null && queues.activeTasks.length === 0 && queues.cleanupTasks.length === 0 && queues.queuedTasks.length === 0 && queues.routingTasks.length > 0;
   if (undispatchedBootstrapOnly) return { businessAllowed: true, reason: null, queues, heartbeatState: null, heartbeatAction: null };
   if (queues.shouldKeepHeartbeat && (state === null || state.status !== 'armed' || !isSafeThreadId(state.automationId))) return { businessAllowed: false, reason: 'confirmed_heartbeat_missing', queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', command: 'controller-finalize-cycle' } };
@@ -1139,7 +1377,9 @@ function pendingHeartbeatAction(state, desired, now) {
 
 function rearmControllerHeartbeatInRegistry(registry, controllerThreadId, reason, triggerTaskThreadId = null, now = new Date()) {
   if (!has(reason, HEARTBEAT_REASONS)) fail('CLI_INVALID_ARGUMENTS', `heartbeat reason 无效: ${reason}`);
-  const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const taskQueues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const parallel = controllerParallelRuntime(registry, controllerThreadId);
+  const queues = { ...taskQueues, parallel, shouldKeepHeartbeat: taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat };
   const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId);
   const base = found ? heartbeatEvidenceDefaults(found) : heartbeatEvidenceDefaults({ controllerThreadId, generation: 0, status: 'cancelled', dueAt: null, intervalMs: null, reason, triggerTaskThreadId: null, updatedAt: now.toISOString() });
   const desired = heartbeatDesiredState(controllerThreadId, base.generation + 1, queues, reason, triggerTaskThreadId, now);
@@ -1406,6 +1646,19 @@ function validateTask(value, projectRoot) {
     if (value.lastDispatchedAttempt > 0 && !isTimestamp(value.lastDispatchedAt)) fail('REGISTRY_INVALID', '已派发任务必须有 lastDispatchedAt');
     if (value.status !== 'executing' && value.lastDispatchedAttempt !== (value.attemptCount ?? 1)) fail('REGISTRY_INVALID', '非 executing 任务必须已登记当前轮派发');
   }
+  const parallelFields = ['parallelProtocolVersion', 'parallelBatchId', 'parallelCandidateId', 'parallelLane', 'parallelConflictDomains', 'parallelReviewCost', 'parallelWorktreeIdentity'];
+  const presentParallelFields = parallelFields.filter((key) => key in value);
+  if (presentParallelFields.length !== 0 && presentParallelFields.length !== parallelFields.length) fail('REGISTRY_INVALID', 'parallel task 控制字段必须同时存在');
+  if (presentParallelFields.length === parallelFields.length) {
+    if (![0, PARALLEL_BATCH_PROTOCOL_VERSION].includes(value.parallelProtocolVersion)) fail('REGISTRY_INVALID', 'parallelProtocolVersion 无效');
+    if (value.parallelProtocolVersion === 0) {
+      if (value.parallelBatchId !== null || value.parallelCandidateId !== null || value.parallelLane !== null || value.parallelConflictDomains.length > 0 || value.parallelReviewCost !== null || value.parallelWorktreeIdentity !== null) fail('REGISTRY_INVALID', 'legacy task 不得伪造 parallel batch 数据');
+    } else {
+      if (!isSafeThreadId(value.parallelBatchId) || !isSafeThreadId(value.parallelCandidateId) || !has(value.parallelLane, PARALLEL_LANES) || !Array.isArray(value.parallelConflictDomains) || !value.parallelConflictDomains.every(nonEmpty) || !Number.isInteger(value.parallelReviewCost) || value.parallelReviewCost < 1) fail('REGISTRY_INVALID', 'parallel task batch/candidate/lane/conflict/review 数据无效');
+      if (implementationTask(value) && !isObject(value.parallelWorktreeIdentity)) fail('REGISTRY_INVALID', 'parallel implementation task 缺少 worktreeIdentity');
+      if (!implementationTask(value) && value.parallelWorktreeIdentity !== null) fail('REGISTRY_INVALID', 'parallel control_only task 不得携带 worktreeIdentity');
+    }
+  }
   const progressFields = ['progressEventCreatedAt', 'lastProgressSummary'];
   const presentProgressFields = progressFields.filter((key) => key in value);
   if (presentProgressFields.length !== 0 && presentProgressFields.length !== progressFields.length) fail('REGISTRY_INVALID', '进度字段必须同时存在');
@@ -1532,7 +1785,16 @@ export function validateRegistry(value, expectedProjectKey, expectedProjectRoot)
     messageIds.add(validated.messageId);
     return validated;
   });
-  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), controllerMessages, updatedAt: value.updatedAt, tasks };
+  const parallelValues = value.parallelBatches ?? [];
+  if (!Array.isArray(parallelValues)) fail('REGISTRY_INVALID', 'parallelBatches 必须是数组');
+  const parallelIds = new Set();
+  const parallelBatches = parallelValues.map((batch) => {
+    const validated = validateParallelBatchRecord(batch, tasks, knownControllers, value.projectRoot);
+    if (parallelIds.has(validated.batchId)) fail('REGISTRY_INVALID', `重复 parallel batch: ${validated.batchId}`);
+    parallelIds.add(validated.batchId);
+    return validated;
+  });
+  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), controllerMessages, parallelBatches, updatedAt: value.updatedAt, tasks };
 }
 
 async function readIndex(home) {
@@ -1576,7 +1838,7 @@ async function ensureProject(home, projectRoot, controllerThreadId) {
   } catch (error) {
     if (!(error instanceof TaskControlError) || !/ENOENT/.test(error.message)) throw error;
     if (!controllerThreadId) fail('TASK_NOT_REGISTERED', '项目注册表不存在');
-    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], controllerHealth: [], controllerMessages: [], updatedAt: new Date().toISOString(), tasks: [] };
+    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], controllerHealth: [], controllerMessages: [], parallelBatches: [], updatedAt: new Date().toISOString(), tasks: [] };
     return { paths, registry: await withExclusiveLock(paths.registryPath, async () => {
       try {
         return validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
@@ -1826,10 +2088,129 @@ export async function controllerMarkHeartbeatNotificationSent(input) {
   });
 }
 
-export async function controllerRecordDispatched(input) {
-  return mutateController({ ...input, heartbeatReason: 'dispatch', mutate: async (task, registry) => {
-    assertControllerCycleBusinessReady(registry, input.controllerThreadId, { allowHeartbeatBootstrap: true });
+export async function controllerPlanParallelBatch(input) {
+  const home = resolveTaskControlHome(input);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  const manifest = input.manifest ?? await loadParallelBatchManifest(input.projectRoot, input.manifestPath);
+  const normalized = input.manifest ? { manifestPath: win32.resolve(input.projectRoot, input.manifestPath ?? `.task-control/${manifest.batchId}.json`), manifestDigest: createHash('sha256').update(JSON.stringify(input.manifest), 'utf8').digest('hex'), ...validateParallelBatchManifest(input.manifest, input.projectRoot) } : manifest;
+  const { paths } = await ensureProject(home, input.projectRoot, input.controllerThreadId);
+  return withExclusiveLock(paths.registryPath, async () => {
+    const raw = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const rootControllerThreadIds = raw.rootControllerThreadIds.includes(input.controllerThreadId) || raw.tasks.some((task) => task.threadId === input.controllerThreadId) ? raw.rootControllerThreadIds : [...raw.rootControllerThreadIds, input.controllerThreadId];
+    const registry = { ...raw, rootControllerThreadIds, tasks: ensureTaskControls(raw.tasks, rootControllerThreadIds) };
+    assertControllerCycleBusinessReady(registry, input.controllerThreadId);
     assertControllerHealthyForDispatch(registry, input.controllerThreadId);
+    const debt = controllerThreadDebt(registry, input.controllerThreadId);
+    if (debt.blocked) fail('PARALLEL_THREAD_DEBT_BLOCKED', `必须先收口主控债务: ${debt.reasons.join(', ')}`);
+    if (registry.parallelBatches.some((batch) => batch.batchId === normalized.batchId)) fail('PARALLEL_BATCH_DUPLICATE', `parallel batch 已存在: ${normalized.batchId}`);
+    const now = new Date().toISOString();
+    const batch = { ...normalized, controllerThreadId: input.controllerThreadId, status: 'planned', pendingDispatchCandidateIds: [], dispatchWaveId: null, createdAt: now, updatedAt: now, closedAt: null };
+    const next = validateRegistry({ ...registry, parallelBatches: [...registry.parallelBatches, batch], updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, batch: parallelBatchRuntime(next, next.parallelBatches.find((entry) => entry.batchId === batch.batchId)), threadDebt: debt };
+  });
+}
+
+export async function controllerEvaluateParallelBatch(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  assertSafeThreadId(input.batchId, 'batchId');
+  const raw = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+  const registry = { ...raw, tasks: ensureTaskControls(raw.tasks, raw.rootControllerThreadIds) };
+  const batch = registry.parallelBatches.find((entry) => entry.batchId === input.batchId);
+  if (!batch || batch.controllerThreadId !== input.controllerThreadId) fail('PARALLEL_BATCH_NOT_FOUND', 'parallel batch 不存在或不属于当前直接主控');
+  return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, batch: parallelBatchRuntime(registry, batch), threadDebt: controllerThreadDebt(registry, input.controllerThreadId) };
+}
+
+export async function controllerPrepareParallelDispatch(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  assertSafeThreadId(input.batchId, 'batchId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const raw = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const registry = { ...raw, tasks: ensureTaskControls(raw.tasks, raw.rootControllerThreadIds) };
+    assertNoExpiredPendingHeartbeat(registry, input.controllerThreadId);
+    assertControllerHealthyForDispatch(registry, input.controllerThreadId);
+    const batch = registry.parallelBatches.find((entry) => entry.batchId === input.batchId);
+    if (!batch || batch.controllerThreadId !== input.controllerThreadId) fail('PARALLEL_BATCH_NOT_FOUND', 'parallel batch 不存在或不属于当前直接主控');
+    if (!['planned', 'running', 'reconciling'].includes(batch.status)) fail('PARALLEL_BATCH_STATE_INVALID', `batch ${batch.batchId} 当前不能准备派发: ${batch.status}`);
+    const debt = controllerThreadDebt(registry, input.controllerThreadId);
+    if (debt.blocked) fail('PARALLEL_THREAD_DEBT_BLOCKED', `必须先收口主控债务: ${debt.reasons.join(', ')}`);
+    const runtime = parallelBatchRuntime(registry, batch);
+    let selectedIds = runtime.requiredFanoutCandidateIds;
+    if (selectedIds.length === 0 && runtime.singleDispatchAllowed) selectedIds = runtime.selectedCandidateIds;
+    if (selectedIds.length === 0) fail('PARALLEL_FANOUT_REQUIRED', `当前不能退化为单任务派发: ${runtime.fanoutBlockers.join(', ') || 'no dispatchable candidates'}`);
+    const candidates = selectedIds.map((candidateId) => batch.candidates.find((candidate) => candidate.candidateId === candidateId));
+    const tasks = candidates.map((candidate) => candidate?.threadId === null ? null : registry.tasks.find((task) => task.threadId === candidate.threadId));
+    if (tasks.some((task) => task === null || !dispatchAllowed(task))) fail('PARALLEL_FANOUT_REGISTRATION_INCOMPLETE', '本波次所有候选必须先登记、完成语义改名并满足合同门禁');
+    const now = new Date();
+    const dispatchWaveId = `wave_${createHash('sha256').update(`${batch.batchId}:${now.toISOString()}:${selectedIds.join(',')}`).digest('hex').slice(0, 16)}`;
+    const prepared = { ...batch, status: 'dispatching', pendingDispatchCandidateIds: selectedIds, dispatchWaveId, updatedAt: now.toISOString() };
+    let next = validateRegistry({ ...registry, parallelBatches: registry.parallelBatches.map((entry) => entry.batchId === batch.batchId ? prepared : entry), updatedAt: now.toISOString() }, paths.projectKey, paths.projectRoot);
+    const heartbeat = rearmControllerHeartbeatInRegistry(next, input.controllerThreadId, 'dispatch', null, now);
+    next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, batchId: batch.batchId, dispatchWaveId, requiredDispatches: candidates.map((candidate) => ({ candidateId: candidate.candidateId, threadId: candidate.threadId, lane: candidate.lane })), heartbeatState: heartbeat.state, pendingHeartbeatState: heartbeat.pendingState, heartbeatAction: heartbeat.heartbeatAction };
+  });
+}
+
+export async function controllerCloseParallelBatch(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  assertSafeThreadId(input.batchId, 'batchId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const raw = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const registry = { ...raw, tasks: ensureTaskControls(raw.tasks, raw.rootControllerThreadIds) };
+    const batch = registry.parallelBatches.find((entry) => entry.batchId === input.batchId);
+    if (!batch || batch.controllerThreadId !== input.controllerThreadId) fail('PARALLEL_BATCH_NOT_FOUND', 'parallel batch 不存在或不属于当前直接主控');
+    const runtime = parallelBatchRuntime(registry, batch);
+    if (batch.pendingDispatchCandidateIds.length > 0 || runtime.candidateStates.some((candidate) => ['running', 'awaiting_review', 'changes_requested', 'accepted', 'registered'].includes(candidate.state)) || runtime.eligibleCandidates.length > 0) fail('PARALLEL_BATCH_CLOSE_BLOCKED', 'batch 仍有派发、执行、审查或可继续 fan-out 的候选');
+    const now = new Date().toISOString();
+    const closed = { ...batch, status: 'closed', closedAt: now, updatedAt: now, pendingDispatchCandidateIds: [], dispatchWaveId: null };
+    const next = validateRegistry({ ...registry, parallelBatches: registry.parallelBatches.map((entry) => entry.batchId === batch.batchId ? closed : entry), updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, batch: parallelBatchRuntime(next, closed), finalizeRequired: true, command: 'controller-finalize-cycle' };
+  });
+}
+
+export async function auditParallelRouting(input = {}) {
+  const home = resolveTaskControlHome(input);
+  const index = await readIndex(home);
+  const violations = [];
+  let activeTaskCount = 0;
+  let batchCount = 0;
+  for (const project of index.projects) {
+    const { registry: raw } = await readProjectRegistry(home, project);
+    const registry = { ...raw, tasks: ensureTaskControls(raw.tasks, raw.rootControllerThreadIds) };
+    batchCount += registry.parallelBatches.length;
+    for (const task of registry.tasks.filter((entry) => !isTerminalTask(entry))) {
+      activeTaskCount += 1;
+      if (task.parallelProtocolVersion !== PARALLEL_BATCH_PROTOCOL_VERSION) violations.push({ projectKey: registry.projectKey, threadId: task.threadId, directControllerThreadId: task.directControllerThreadId, reason: 'legacy_parallel_contract_missing' });
+    }
+    for (const batch of registry.parallelBatches.filter((entry) => !['closed', 'frozen'].includes(entry.status))) {
+      const runtime = parallelBatchRuntime(registry, batch);
+      if (runtime.selectedCandidateIds.length === 1 && batch.degradationReceipt === null) violations.push({ projectKey: registry.projectKey, batchId: batch.batchId, directControllerThreadId: batch.controllerThreadId, reason: 'single_candidate_without_degradation_receipt' });
+      if (runtime.pendingDispatchCandidateIds.length > 0) violations.push({ projectKey: registry.projectKey, batchId: batch.batchId, directControllerThreadId: batch.controllerThreadId, reason: 'incomplete_dispatch_wave' });
+    }
+  }
+  return { compliant: violations.length === 0, activeTaskCount, batchCount, violationCount: violations.length, violations, auditedAt: new Date().toISOString() };
+}
+
+export async function controllerRecordDispatched(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  return withExclusiveLock(paths.registryPath, async () => {
+    const raw = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const registry = { ...raw, tasks: ensureTaskControls(raw.tasks, raw.rootControllerThreadIds) };
+    assertNoExpiredPendingHeartbeat(registry, input.controllerThreadId);
+    const task = taskOrThrow(registry, input.threadId);
+    assertTaskController(task, input.controllerThreadId);
+    assertControllerHealthyForDispatch(registry, input.controllerThreadId);
+    const gate = controllerCycleGate(registry, input.controllerThreadId);
+    if (!gate.businessAllowed && gate.reason !== 'parallel_dispatch_wave_incomplete') fail('CONTROLLER_CYCLE_RECONCILE_REQUIRED', `${gate.reason}; 先完成 controller cycle reconciliation`);
     if (!dispatchAllowed(task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '只有 executing、标题已同步且实施合同完整的任务可以登记派发');
     if (task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION) {
       const runtime = objectiveRuntime(registry.tasks, task.objectiveId);
@@ -1837,9 +2218,21 @@ export async function controllerRecordDispatched(input) {
     }
     if (currentAttemptDispatched(task)) fail('TASK_DISPATCH_ALREADY_RECORDED', `第 ${task.attemptCount} 轮派发已登记`);
     await assertImplementationContractCurrent(task, input.projectRoot);
-    const now = new Date().toISOString();
-    return { ...task, lastDispatchedAttempt: task.attemptCount, lastDispatchedAt: now, updatedAt: now };
-  }});
+    let parallelBatches = registry.parallelBatches;
+    if (task.parallelProtocolVersion === PARALLEL_BATCH_PROTOCOL_VERSION) {
+      const batch = registry.parallelBatches.find((entry) => entry.batchId === task.parallelBatchId && entry.controllerThreadId === input.controllerThreadId);
+      if (!batch || batch.status !== 'dispatching' || !batch.pendingDispatchCandidateIds.includes(task.parallelCandidateId)) fail('PARALLEL_DISPATCH_NOT_PREPARED', 'batch task 必须先通过 controller-prepare-parallel-dispatch 进入同一 dispatch wave');
+      const remaining = batch.pendingDispatchCandidateIds.filter((candidateId) => candidateId !== task.parallelCandidateId);
+      parallelBatches = registry.parallelBatches.map((entry) => entry.batchId === batch.batchId ? { ...batch, status: remaining.length === 0 ? 'running' : 'dispatching', pendingDispatchCandidateIds: remaining, dispatchWaveId: remaining.length === 0 ? null : batch.dispatchWaveId, updatedAt: new Date().toISOString() } : entry);
+    }
+    const now = new Date();
+    const nextTask = { ...task, lastDispatchedAttempt: task.attemptCount, lastDispatchedAt: now.toISOString(), updatedAt: now.toISOString() };
+    let next = validateRegistry({ ...registry, tasks: registry.tasks.map((entry) => entry.threadId === task.threadId ? nextTask : entry), parallelBatches, updatedAt: now.toISOString() }, paths.projectKey, paths.projectRoot);
+    const heartbeat = rearmControllerHeartbeatInRegistry(next, input.controllerThreadId, 'dispatch', task.threadId, now);
+    next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return controllerMutationResult(nextTask, next.tasks, heartbeat);
+  });
 }
 
 export function auditControllerRouting(input = {}) {
@@ -1903,6 +2296,11 @@ export async function controllerRegisterTask(input) {
   if (![input.scope, input.acceptance, input.forbiddenDecisions].every(nonEmpty)) fail('DELEGATION_EVIDENCE_REQUIRED', '必须提供明确 scope、acceptance 和 forbiddenDecisions');
   if (!nonEmpty(input.taskMode)) fail('TASK_MODE_REQUIRED', 'v0.6.0 新登记必须显式提供 taskMode=control_only|implementation|visual_implementation；旧 registry 会安全迁移为 legacy_unclassified');
   if (!REGISTER_TASK_MODES.includes(input.taskMode)) fail('TASK_MODE_INVALID', `新登记 taskMode 无效: ${input.taskMode}`);
+  const parallelPolicy = input.parallelPolicy ?? 'legacy_compat';
+  if (!has(parallelPolicy, PARALLEL_POLICY_MODES)) fail('PARALLEL_POLICY_INVALID', `parallel policy 无效: ${parallelPolicy}`);
+  const hasBatchBinding = nonEmpty(input.parallelBatchId) || nonEmpty(input.parallelCandidateId);
+  if (hasBatchBinding && (!nonEmpty(input.parallelBatchId) || !nonEmpty(input.parallelCandidateId))) fail('PARALLEL_BATCH_BINDING_INCOMPLETE', 'batch-id 与 candidate-id 必须同时提供');
+  if (parallelPolicy === 'batch_v1' && !hasBatchBinding) fail('PARALLEL_BATCH_BINDING_REQUIRED', 'batch_v1 registration 必须绑定 batch-id 和 candidate-id');
   let contractControl;
   if (input.taskMode === 'control_only') {
     if (nonEmpty(input.implementationContractPath)) fail('IMPLEMENTATION_CONTRACT_NOT_APPLICABLE', 'control_only 任务不得绑定实施合同');
@@ -1928,6 +2326,24 @@ export async function controllerRegisterTask(input) {
       if (!rootControllers.includes(input.controllerThreadId)) rootControllers.push(input.controllerThreadId);
     }
     const now = new Date().toISOString();
+    let parallelControl = parallelTaskDefaults();
+    let parallelBatches = registry.parallelBatches;
+    if (hasBatchBinding) {
+      assertSafeThreadId(input.parallelBatchId, 'parallelBatchId');
+      assertSafeThreadId(input.parallelCandidateId, 'parallelCandidateId');
+      const batch = registry.parallelBatches.find((entry) => entry.batchId === input.parallelBatchId);
+      if (!batch || batch.controllerThreadId !== input.controllerThreadId) fail('PARALLEL_BATCH_NOT_FOUND', 'parallel batch 不存在或不属于当前直接主控');
+      if (!['planned', 'running', 'reconciling'].includes(batch.status)) fail('PARALLEL_BATCH_STATE_INVALID', `batch ${batch.batchId} 当前不能登记候选: ${batch.status}`);
+      const candidate = batch.candidates.find((entry) => entry.candidateId === input.parallelCandidateId);
+      if (!candidate || candidate.threadId !== null) fail('PARALLEL_CANDIDATE_NOT_AVAILABLE', 'parallel candidate 不存在或已经绑定 task');
+      if (candidate.title !== input.title.trim().replace(/\s+/g, ' ') || candidate.workClass !== input.workClass || candidate.taskMode !== input.taskMode) fail('PARALLEL_CANDIDATE_CONTRACT_MISMATCH', 'register title/workClass/taskMode 必须匹配候选矩阵');
+      const runtime = parallelBatchRuntime(registry, batch);
+      const runtimeCandidate = runtime.candidateStates.find((entry) => entry.candidateId === candidate.candidateId);
+      if (!runtimeCandidate || !['eligible', 'registered'].includes(runtimeCandidate.state)) fail('PARALLEL_CANDIDATE_NOT_ELIGIBLE', `candidate ${candidate.candidateId} 当前不可登记: ${(runtimeCandidate?.blockers ?? []).join(', ')}`);
+      parallelControl = { parallelProtocolVersion: PARALLEL_BATCH_PROTOCOL_VERSION, parallelBatchId: batch.batchId, parallelCandidateId: candidate.candidateId, parallelLane: candidate.lane, parallelConflictDomains: [...candidate.conflictDomains], parallelReviewCost: candidate.reviewCost, parallelWorktreeIdentity: candidate.worktreeIdentity };
+      const boundBatch = { ...batch, candidates: batch.candidates.map((entry) => entry.candidateId === candidate.candidateId ? { ...entry, threadId: input.threadId, registeredAt: now } : entry), updatedAt: now };
+      parallelBatches = registry.parallelBatches.map((entry) => entry.batchId === batch.batchId ? boundBatch : entry);
+    }
     const replacementOfThreadId = nonEmpty(input.replacementOfThreadId) ? input.replacementOfThreadId.trim() : null;
     if (replacementOfThreadId !== null) assertSafeThreadId(replacementOfThreadId, 'replacementOfThreadId');
     const replaced = replacementOfThreadId === null ? null : controlledTasks.find((task) => task.threadId === replacementOfThreadId);
@@ -1943,10 +2359,10 @@ export async function controllerRegisterTask(input) {
     const objectiveCreatedAt = replaced?.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? replaced.objectiveCreatedAt : now;
     const runtime = objectiveRuntime(controlledTasks, objectiveId);
     if (runtime.fuseOpen) fail('OBJECTIVE_RETRY_FUSE_OPEN', `objective ${objectiveId} 已熔断: ${runtime.reasons.join(', ')}`);
-    const draft = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: now };
+    const draft = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, ...parallelControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: now };
     const tasks = ensureTaskControls([...controlledTasks, draft], rootControllers);
     const task = tasks.find((candidate) => candidate.threadId === input.threadId);
-    const next = validateRegistry({ ...registry, rootControllerThreadIds: rootControllers, updatedAt: new Date().toISOString(), tasks }, paths.projectKey, paths.projectRoot);
+    const next = validateRegistry({ ...registry, rootControllerThreadIds: rootControllers, parallelBatches, updatedAt: new Date().toISOString(), tasks }, paths.projectKey, paths.projectRoot);
     await atomicWriteJson(paths.registryPath, next);
     return controllerMutationResult(task, next.tasks);
   });
@@ -2644,7 +3060,9 @@ export async function controllerScanPendingEvents(input) {
     const target = registry.tasks.find((task) => task.threadId === message.targetThreadId);
     return target === undefined || target.status !== 'executing' || target.executionStatus !== 'running';
   });
-  const queues = controllerWorkQueues(registry.tasks, input.controllerThreadId);
+  const taskQueues = controllerWorkQueues(registry.tasks, input.controllerThreadId);
+  const parallel = controllerParallelRuntime(registry, input.controllerThreadId);
+  const queues = { ...taskQueues, shouldKeepHeartbeat: taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat };
   const reportNeedsRefresh = await deliveryReportNeedsRefresh(paths, input.controllerThreadId, registry.updatedAt);
   return {
     projectKey: registry.projectKey,
@@ -2665,10 +3083,17 @@ export async function controllerScanPendingEvents(input) {
     deferredMessages,
     pendingMessageActions,
     staleDeferredMessages,
+    parallelBatches: parallel.batches,
+    idleConcurrencySlots: parallel.batches.reduce((sum, batch) => sum + batch.idleConcurrencySlots, 0),
+    eligibleCandidates: parallel.batches.flatMap((batch) => batch.eligibleCandidates.map((candidate) => ({ batchId: batch.batchId, ...candidate }))),
+    fanoutRequired: parallel.fanoutRequired,
+    fanoutBlockers: parallel.batches.flatMap((batch) => batch.fanoutBlockers.map((reason) => ({ batchId: batch.batchId, reason }))),
+    pendingParallelDispatches: parallel.pendingDispatches,
+    batchNeedsReplan: parallel.batches.some((batch) => ['running', 'reconciling'].includes(batch.status) && (batch.fanoutRequired || batch.singleDispatchAllowed)),
     threadActions,
     reportNeedsRefresh,
     deliveryReportPath: deliveryReportPath(paths.home, paths.projectKey, input.controllerThreadId),
-    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0,
+    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0 || parallel.fanoutRequired || parallel.singleDispatchReady || parallel.pendingDispatches.length > 0,
     shouldKeepHeartbeat: queues.shouldKeepHeartbeat,
   };
 }
@@ -2994,10 +3419,15 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.11.0',
+    'codex-task-control v0.12.0',
     '',
     '实施合同命令：',
-    '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>]',
+    '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
+    '  controller-plan-parallel-batch --project-root <root> --controller <id> --manifest <project-relative-json>',
+    '  controller-evaluate-fanout --project-root <root> --controller <id> --batch-id <id>',
+    '  controller-prepare-parallel-dispatch --project-root <root> --controller <id> --batch-id <id>',
+    '  controller-close-parallel-batch --project-root <root> --controller <id> --batch-id <id>',
+    '  audit-parallel-routing [--codex-home <CODEX_HOME>]',
     '  progress --self <thread> --summary <text> [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
     '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--evidence-ref <id=reference> ...]',
     '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json>',
@@ -3015,6 +3445,7 @@ function helpText() {
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
     'implementation 成果包按 attempt 追加保存；HTML 报告确定性生成到 task-control/reports，刷新不维持 heartbeat。',
+    'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
     'heartbeat 使用 prepare/create-new/confirm/switch/delete-old 两阶段协议；终态必须 finalize 并确认删除，stale invocation 只返回受限自删除动作。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
   ].join('\n');
@@ -3047,6 +3478,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'audit-model-routing') result = await auditModelRouting(storage);
   else if (command === 'audit-thinking-routing') result = await auditThinkingRouting(storage);
   else if (command === 'audit-archive-backlog') result = await auditArchiveBacklog(storage);
+  else if (command === 'audit-parallel-routing') result = await auditParallelRouting(storage);
   else if (command === 'query-self') {
     const task = (await querySelf({ ...storage, selfThreadId: required(args, '--self') })).task;
     result = { ...task, dispatchAllowed: dispatchAllowed(task) };
@@ -3073,7 +3505,11 @@ export async function runCli(args = process.argv.slice(2)) {
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildFailureNotification(task, eventType, attemptedStage), notificationRequired: true, ...contractSummary(task) };
   }
   else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason') });
-  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions'), taskMode: option(args, '--task-mode'), implementationContractPath: option(args, '--implementation-contract'), replacementOfThreadId: option(args, '--replacement-of'), objectiveId: option(args, '--objective-id'), objectiveBudgetMinutes: option(args, '--objective-budget-minutes') });
+  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions'), taskMode: option(args, '--task-mode'), implementationContractPath: option(args, '--implementation-contract'), replacementOfThreadId: option(args, '--replacement-of'), objectiveId: option(args, '--objective-id'), objectiveBudgetMinutes: option(args, '--objective-budget-minutes'), parallelPolicy: option(args, '--parallel-policy'), parallelBatchId: option(args, '--batch-id'), parallelCandidateId: option(args, '--candidate-id') });
+  else if (command === 'controller-plan-parallel-batch') result = await controllerPlanParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), manifestPath: required(args, '--manifest') });
+  else if (command === 'controller-evaluate-fanout') result = await controllerEvaluateParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
+  else if (command === 'controller-prepare-parallel-dispatch') result = await controllerPrepareParallelDispatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
+  else if (command === 'controller-close-parallel-batch') result = await controllerCloseParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
   else if (command === 'controller-ingest-progress') result = await controllerIngestProgress({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-completion') result = await controllerIngestCompletion({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-failure') result = await controllerIngestFailure({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event'), eventType: required(args, '--event-type') });

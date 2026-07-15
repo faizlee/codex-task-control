@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.11.0 是 Windows-first preview。台账、合同/成果校验、主控消息队列、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
+> v0.12.0 是 Windows-first preview。并发批次、台账、合同/成果校验、主控消息队列、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,13 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.11.0 已经解决什么
+## v0.12.0 已经解决什么
+
+- 创建 task 前先登记 schema-v1 `parallel_batch`，记录候选车道、依赖、冲突域、动态 WIP、review 容量和 implementation worktree 身份链。
+- 有两个安全候选时强制 fan-out；只有一个时必须提交带类型、说明和证据的退化回执。代码候选与无冲突 QA/no-code/readonly 候选同时存在时，禁止只派代码任务。
+- 所有候选改名完成后先准备整批 dispatch wave，再逐个真实发送并登记；宿主中途失败会留下明确的未完成波次，禁止主控悄悄继续其他业务。
+- 生命周期边界后重新计算候选，并在扫描中返回空闲并发槽、可派候选、fan-out blocker、待完成派发和 batch replan 状态。
+- 每个直接主控仍只有一个 heartbeat，监管整个批次；仅计划未派发或缺少退化证据时不会制造空心跳。
 
 - worker 可以在 required stage 尚未完成时提交正式 `task_failed` / `task_blocked`，包含失败阶段、分类、命令摘要和证据引用。
 - 即使没有 completion 或普通消息，主控扫描也会根据 lease、最后进度、attempt 时长和 candidate 缺失识别停滞。
@@ -61,12 +67,12 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.11.0 不做什么
+## v0.12.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer 参数，也不返回“已进入队列”的回执。因此 v0.11.0 在任务运行中使用本地延后，不会伪称消息已经进入 App 队列；未来宿主提供原生 queue + ack 后才能替换这层安全回退。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.12.0 用本地 dispatch wave 和消息延后做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
 - 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能在主控 turn 进行中原子延后定时消息，或取消已经挂起的宿主工具调用。Skill 会阻止后续受控业务动作并返回有界清理选择器，但彻底解决仍需要宿主级 compare-and-delete/defer hook。
 - 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
@@ -92,13 +98,13 @@ pwsh -File .\scripts\install.ps1 -Force
 
 然后把 [`examples/AGENTS.md`](examples/AGENTS.md) 中适用的控制规则加入你的用户级或项目级 `AGENTS.md`。
 
-核心规则：绝不使用内部 subagent 或 `spawn_agent`；委派只能创建用户可见的 Codex task/thread。任务必须用语义标题登记、完成真实侧边栏改名并确认 `dispatchAllowed: true`，才能发送工作提示词。可见任务可以并行或嵌套，但每一个都必须独立登记、可供用户检查。后续普通消息必须先经过 `controller-prepare-message`；运行中不直接调用宿主发送，确认 idle 后才 release，interrupt 只用于有权限的停止/取消。
+核心规则：绝不使用内部 subagent 或 `spawn_agent`；委派只能创建用户可见的 Codex task/thread。先规划并发批次，默认至少保留两个安全候选；单任务必须登记退化证据。每个候选都要独立登记和真实改名，整批通过 `controller-prepare-parallel-dispatch` 后才逐个发送并记录。后续普通消息必须先经过 `controller-prepare-message`；运行中不直接调用宿主发送，确认 idle 后才 release，interrupt 只用于有权限的停止/取消。
 
 Sol 主控默认使用 high；medium 只用于边界明确的短控制工作。xhigh 必须记录允许的升级触发条件和具体原因；max 只允许用户明确授权或 xhigh 仍未解决的最终仲裁。搜索、格式化、命令、重复测试和机械实现不得使用 Sol xhigh/max。
 
 ## 快速开始
 
-实施任务先把 [`implementation-contract.example.json`](skill/codex-task-control/assets/implementation-contract.example.json) 复制到项目内，替换成项目自己的路径、阶段、命令和错误策略，并赋予明确 revision 或 commit。视觉任务可以直接从 [`visual-implementation-contract.example.json`](skill/codex-task-control/assets/visual-implementation-contract.example.json) 开始。控制面只校验结构与摘要身份，具体实施规则仍由项目文档负责。
+先把 [`parallel-batch.example.json`](skill/codex-task-control/assets/parallel-batch.example.json) 复制到项目内，替换候选、冲突域、依赖、容量和 worktree 身份。实施任务还要复制 [`implementation-contract.example.json`](skill/codex-task-control/assets/implementation-contract.example.json)，替换项目路径、阶段、命令和错误策略，并赋予明确 revision 或 commit。视觉任务可以从 [`visual-implementation-contract.example.json`](skill/codex-task-control/assets/visual-implementation-contract.example.json) 开始。
 
 ```powershell
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
@@ -111,25 +117,33 @@ node $TaskControl audit-controller-routing `
   --escalation-trigger "cross_module_contract_conflict" `
   --reason "多个模块存在互相冲突的合同边界，需要前沿主控仲裁。"
 
+node $TaskControl controller-plan-parallel-batch `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --manifest "docs/codex-parallel-batch.json"
+
 $Registration = node $TaskControl register `
   --project-root "C:\work\example" `
   --controller "controller-1" `
   --thread "worker-1" `
   --parent "controller-1" `
-  --title "Audit authentication flow" `
-  --model "gpt-5.6-luna" `
+  --title "Implement bounded authentication change" `
+  --model "gpt-5.6-terra" `
   --thinking "medium" `
   --delegation "explicit" `
   --execution-surface "visible_task" `
   --model-class "economical" `
-  --quota-reason "Mechanical work is cheaper than using the frontier controller." `
-  --work-class "repeatable" `
+  --quota-reason "Bounded implementation is cheaper than using the frontier controller." `
+  --work-class "bounded_reasoning" `
   --decision-status "resolved" `
   --scope "Only update the named authentication tests." `
   --acceptance "Run the targeted authentication test successfully." `
   --forbidden-decisions "Do not change authentication contracts or error policy." `
   --task-mode "implementation" `
-  --implementation-contract "docs/codex-task-contract.json"
+  --implementation-contract "docs/codex-task-contract.json" `
+  --parallel-policy "batch_v1" `
+  --batch-id "auth-batch" `
+  --candidate-id "auth-code"
 
 $Registration = $Registration | ConvertFrom-Json
 ```
@@ -143,8 +157,13 @@ node $TaskControl controller-record-title-synced `
   --thread "worker-1" `
   --title $Registration.desiredThreadTitle
 
-# 真实发送工作提示词成功后再执行。它只 prepare 新 heartbeat，
-# 不会提前推进 confirmed generation。
+# 对 fan-out 选中的每个候选重复登记和真实改名，然后先准备整批派发波次。
+node $TaskControl controller-prepare-parallel-dispatch `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --batch-id "auth-batch"
+
+# 真实发送每个返回任务的提示词；每次成功后分别登记。
 node $TaskControl controller-record-dispatched `
   --project-root "C:\work\example" `
   --controller "controller-1" `

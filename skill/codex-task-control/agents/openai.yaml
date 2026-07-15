@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Queue messages and stop quota-burning task loops"
-  default_prompt: "Use $codex-task-control to bind visible tasks to schema-v2 contracts, defer ordinary messages until the target is idle, ingest first-class failure events, detect stalls and retry fuses, enforce controller handoff, close incidents with a delivery report, and finalize terminal heartbeat cleanup before more project work."
+  short_description: "Fan out visible tasks without quota-burning loops"
+  default_prompt: "Use $codex-task-control to plan a schema-v1 parallel batch, enforce safe multi-task fan-out and WIP, bind every visible task to its candidate and implementation contract, queue ordinary messages, detect failures and stalls, review outcomes, and finalize the shared controller heartbeat before more project work."

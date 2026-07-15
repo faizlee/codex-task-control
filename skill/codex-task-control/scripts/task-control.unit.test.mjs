@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   TaskControlError,
   auditControllerRouting,
+  auditParallelRouting,
   controllerAssertBusinessReady,
   controllerConfirmHeartbeatAction,
   controllerBuildDeliveryReport,
@@ -23,6 +24,9 @@ import {
   controllerMarkCloseoutNotificationSent,
   controllerQueryDeliverables,
   controllerPrepareMessage,
+  controllerPlanParallelBatch,
+  controllerEvaluateParallelBatch,
+  controllerPrepareParallelDispatch,
   controllerReleaseMessage,
   controllerRecordMessageDelivery,
   controllerRecordDiagnostic,
@@ -102,6 +106,65 @@ function implementationInput(taskControlHome, projectRoot, overrides = {}) {
     forbiddenDecisions: 'Do not change the contract, error policy, or acceptance oracle.',
     taskMode: overrides.taskMode ?? 'implementation',
     implementationContractPath: overrides.implementationContractPath,
+  };
+}
+
+function parallelCandidate({ candidateId, title, lane, workClass, taskMode, projectRoot, conflictDomains = [], dependencies = [], reviewCost = 1, blockingReasons = [] }) {
+  return {
+    candidateId,
+    title,
+    lane,
+    workClass,
+    taskMode,
+    conflictDomains,
+    dependencies,
+    reviewCost,
+    estimatedMinutes: 30,
+    blockingReasons,
+    persistentLane: false,
+    worktreeIdentity: ['implementation', 'visual_implementation'].includes(taskMode) ? { baseCommit: 'base-commit', worktreePath: join(projectRoot, `worktree-${candidateId}`), branch: `task/${candidateId}`, lastMainSyncCommit: 'base-commit', cleanupOwner: 'parallel-controller' } : null,
+  };
+}
+
+function parallelManifest(projectRoot, candidates, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    batchId: overrides.batchId ?? 'batch-1',
+    objective: overrides.objective ?? 'Execute independent implementation and verification lanes concurrently.',
+    dispatchAuthority: 'controller_resolved',
+    reviewCapacity: overrides.reviewCapacity ?? 3,
+    wipLimits: overrides.wipLimits ?? { total: 3, implementation: 1, qa: 1, no_code: 1, readonly: 1 },
+    dirtyConflictDomains: overrides.dirtyConflictDomains ?? [],
+    degradationReceipt: overrides.degradationReceipt ?? null,
+    candidates,
+  };
+}
+
+function parallelRegistration(taskControlHome, projectRoot, candidate, threadId, overrides = {}) {
+  const bounded = candidate.workClass === 'bounded_reasoning';
+  return {
+    taskControlHome,
+    projectRoot,
+    controllerThreadId: 'parallel-controller',
+    parentThreadId: 'parallel-controller',
+    threadId,
+    title: candidate.title,
+    model: bounded ? 'gpt-5.6-terra' : 'gpt-5.6-luna',
+    thinking: 'medium',
+    delegationMode: 'explicit',
+    executionSurface: 'visible_task',
+    modelClass: 'economical',
+    quotaReason: 'Parallel bounded work saves frontier quota and wall-clock time.',
+    workClass: candidate.workClass,
+    decisionStatus: 'resolved',
+    scope: 'Only execute the candidate scope recorded in the parallel batch.',
+    acceptance: 'Return the candidate evidence required by the batch contract.',
+    forbiddenDecisions: 'Do not change contracts, conflict domains, dependencies, or review capacity.',
+    taskMode: candidate.taskMode,
+    implementationContractPath: overrides.implementationContractPath,
+    parallelPolicy: 'batch_v1',
+    parallelBatchId: overrides.batchId ?? 'batch-1',
+    parallelCandidateId: candidate.candidateId,
   };
 }
 
@@ -316,6 +379,183 @@ test('project adapter supports ordinary project policy references and rejects le
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('parallel batch requires and dispatches an implementation plus independent QA candidate as one wave', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-project-'));
+  try {
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    const code = parallelCandidate({ candidateId: 'code', title: 'Implement bounded module', lane: 'implementation', workClass: 'bounded_reasoning', taskMode: 'implementation', projectRoot, conflictDomains: ['module-a'] });
+    const qa = parallelCandidate({ candidateId: 'qa', title: 'Verify independent acceptance', lane: 'qa', workClass: 'repeatable', taskMode: 'control_only', projectRoot });
+    const manifest = parallelManifest(projectRoot, [code, qa]);
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const planned = await controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' });
+    assert.equal(planned.batch.fanoutRequired, true);
+    assert.deepEqual(planned.batch.requiredFanoutCandidateIds, ['code', 'qa']);
+
+    const codeInput = parallelRegistration(taskControlHome, projectRoot, code, 'parallel-code', { implementationContractPath: 'implementation-contract.json' });
+    const codeTask = await controllerRegisterTask(codeInput);
+    await controllerRecordTitleSynced({ ...codeInput, title: codeTask.desiredThreadTitle });
+    const qaInput = parallelRegistration(taskControlHome, projectRoot, qa, 'parallel-qa');
+    const qaTask = await controllerRegisterTask(qaInput);
+    await controllerRecordTitleSynced({ ...qaInput, title: qaTask.desiredThreadTitle });
+
+    const evaluated = await controllerEvaluateParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', batchId: 'batch-1' });
+    assert.equal(evaluated.batch.fanoutRequired, true);
+    const prepared = await controllerPrepareParallelDispatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', batchId: 'batch-1' });
+    assert.equal(prepared.requiredDispatches.length, 2);
+    assert.deepEqual(prepared.requiredDispatches.map((entry) => entry.candidateId), ['code', 'qa']);
+    const duringWave = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller' });
+    assert.equal(duringWave.pendingParallelDispatches.length, 2);
+    assert.equal(duringWave.shouldKeepHeartbeat, true);
+
+    await controllerRecordDispatched(codeInput);
+    const halfWave = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller' });
+    assert.equal(halfWave.pendingParallelDispatches.length, 1);
+    await controllerRecordDispatched(qaInput);
+    const running = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller' });
+    assert.equal(running.pendingParallelDispatches.length, 0);
+    assert.equal(running.activeTasks.length, 2);
+    assert.equal((await auditParallelRouting({ taskControlHome })).compliant, true);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('single candidate dispatch fails closed without a schema-v1 degradation receipt', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-single-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-single-project-'));
+  try {
+    const qa = parallelCandidate({ candidateId: 'qa-only', title: 'Run the only safe QA task', lane: 'qa', workClass: 'repeatable', taskMode: 'control_only', projectRoot });
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(parallelManifest(projectRoot, [qa]), null, 2)}\n`, 'utf8');
+    await controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' });
+    const input = parallelRegistration(taskControlHome, projectRoot, qa, 'qa-only-thread');
+    const task = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: task.desiredThreadTitle });
+    await assert.rejects(controllerPrepareParallelDispatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', batchId: 'batch-1' }), (error) => error instanceof TaskControlError && error.code === 'PARALLEL_FANOUT_REQUIRED');
+    const audit = await auditParallelRouting({ taskControlHome });
+    assert.equal(audit.compliant, false);
+    assert.equal(audit.violations.some((entry) => entry.reason === 'single_candidate_without_degradation_receipt'), true);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('recorded degradation permits one bounded dispatch while preserving evidence', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-degraded-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-degraded-project-'));
+  try {
+    const qa = parallelCandidate({ candidateId: 'qa-only', title: 'Run bounded serial QA', lane: 'qa', workClass: 'repeatable', taskMode: 'control_only', projectRoot });
+    const degradationReceipt = { reason: 'insufficient_independent_candidates', summary: 'Every other candidate still depends on an unresolved controller decision.', evidence: ['candidate-matrix:only-qa-eligible'] };
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(parallelManifest(projectRoot, [qa], { degradationReceipt }), null, 2)}\n`, 'utf8');
+    await controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' });
+    const input = parallelRegistration(taskControlHome, projectRoot, qa, 'qa-degraded-thread');
+    const task = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: task.desiredThreadTitle });
+    const prepared = await controllerPrepareParallelDispatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', batchId: 'batch-1' });
+    assert.deepEqual(prepared.requiredDispatches.map((entry) => entry.candidateId), ['qa-only']);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('conflict domains and review capacity prevent unsafe fan-out', async () => {
+  for (const mode of ['conflict', 'review']) {
+    const taskControlHome = await mkdtemp(join(tmpdir(), `codex-task-control-parallel-${mode}-home-`));
+    const projectRoot = await mkdtemp(join(tmpdir(), `codex-task-control-parallel-${mode}-project-`));
+    try {
+      const first = parallelCandidate({ candidateId: 'qa-a', title: 'Run QA A', lane: 'qa', workClass: 'repeatable', taskMode: 'control_only', projectRoot, conflictDomains: mode === 'conflict' ? ['shared-runner'] : [] });
+      const second = parallelCandidate({ candidateId: 'qa-b', title: 'Run QA B', lane: 'readonly', workClass: 'repeatable', taskMode: 'control_only', projectRoot, conflictDomains: mode === 'conflict' ? ['shared-runner'] : [] });
+      const manifest = parallelManifest(projectRoot, [first, second], mode === 'review' ? { reviewCapacity: 1 } : {});
+      await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+      const planned = await controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' });
+      assert.equal(planned.batch.fanoutRequired, false);
+      assert.equal(planned.batch.selectedCandidateIds.length, 1);
+      assert.equal(planned.batch.fanoutBlockers.includes('degradation_receipt_required'), true);
+    } finally {
+      await rm(taskControlHome, { recursive: true, force: true });
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('dependencies and dirty worktree domains defer only affected candidates without starting an empty heartbeat', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-dependency-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-dependency-project-'));
+  try {
+    const first = parallelCandidate({ candidateId: 'source', title: 'Produce source candidate', lane: 'qa', workClass: 'repeatable', taskMode: 'control_only', projectRoot });
+    const dependent = parallelCandidate({ candidateId: 'dependent', title: 'Consume integrated source', lane: 'readonly', workClass: 'repeatable', taskMode: 'control_only', projectRoot, dependencies: [{ candidateId: 'source', requiredState: 'integrated' }] });
+    const dirty = parallelCandidate({ candidateId: 'dirty', title: 'Inspect dirty domain', lane: 'no_code', workClass: 'repeatable', taskMode: 'control_only', projectRoot, conflictDomains: ['dirty-domain'] });
+    const manifest = parallelManifest(projectRoot, [first, dependent, dirty], { dirtyConflictDomains: ['dirty-domain'] });
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const planned = await controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' });
+    assert.equal(planned.batch.candidateStates.find((entry) => entry.candidateId === 'dependent').state, 'deferred');
+    assert.equal(planned.batch.candidateStates.find((entry) => entry.candidateId === 'dependent').blockers.includes('unresolved_dependencies'), true);
+    assert.equal(planned.batch.candidateStates.find((entry) => entry.candidateId === 'dirty').blockers.includes('dirty_conflict_domain'), true);
+    const scan = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller' });
+    assert.equal(scan.shouldKeepHeartbeat, false);
+    assert.equal(scan.heartbeatState, null);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('implementation candidates require a separate worktree identity chain', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-worktree-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-worktree-project-'));
+  try {
+    const candidate = parallelCandidate({ candidateId: 'code', title: 'Implement code', lane: 'implementation', workClass: 'bounded_reasoning', taskMode: 'implementation', projectRoot, conflictDomains: ['module-a'] });
+    candidate.worktreeIdentity = null;
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(parallelManifest(projectRoot, [candidate]), null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' }), (error) => error instanceof TaskControlError && error.code === 'PARALLEL_BATCH_INVALID');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('thread debt gate blocks a new batch while direct review work is pending', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-debt-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-debt-project-'));
+  try {
+    const { input, dispatched } = await createHeartbeatFixture(taskControlHome, projectRoot, { controllerThreadId: 'parallel-controller', threadId: 'debt-worker' });
+    await controllerConfirmHeartbeatAction({ ...input, actionId: dispatched.heartbeatAction.actionId, automationId: 'parallel-debt-heartbeat-1' });
+    await delay();
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'debt-candidate' });
+    const ingested = await controllerIngestCompletion({ ...input, eventPath: completion });
+    await controllerConfirmHeartbeatAction({ ...input, actionId: ingested.heartbeatAction.actionId, automationId: 'parallel-debt-heartbeat-2' });
+    const qa = parallelCandidate({ candidateId: 'qa', title: 'Run later QA', lane: 'qa', workClass: 'repeatable', taskMode: 'control_only', projectRoot });
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(parallelManifest(projectRoot, [qa], { degradationReceipt: { reason: 'insufficient_independent_candidates', summary: 'Only the QA lane is currently safe.', evidence: ['candidate-matrix:qa-only'] } }), null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' }), (error) => error instanceof TaskControlError && error.code === 'PARALLEL_THREAD_DEBT_BLOCKED');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy registrations remain readable but the parallel audit labels their migration debt', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-legacy-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-legacy-project-'));
+  try {
+    const input = {
+      taskControlHome, projectRoot, controllerThreadId: 'legacy-controller', parentThreadId: 'legacy-controller', threadId: 'legacy-worker', title: 'Legacy compatible worker', model: 'gpt-5.6-luna', thinking: 'medium', delegationMode: 'explicit', executionSurface: 'visible_task', modelClass: 'economical', quotaReason: 'Legacy compatibility remains explicit during schema migration.', workClass: 'repeatable', decisionStatus: 'resolved', scope: 'Only run the named legacy check.', acceptance: 'The legacy check exits with code zero.', forbiddenDecisions: 'Do not change contracts or routing.', taskMode: 'control_only',
+    };
+    const task = await controllerRegisterTask(input);
+    assert.equal(task.parallelProtocolVersion, 0);
+    assert.equal((await querySelf({ taskControlHome, selfThreadId: input.threadId })).task.parallelProtocolVersion, 0);
+    const audit = await auditParallelRouting({ taskControlHome });
+    assert.equal(audit.compliant, false);
+    assert.equal(audit.violations[0].reason, 'legacy_parallel_contract_missing');
+    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'batch-required', parallelPolicy: 'batch_v1' }), (error) => error instanceof TaskControlError && error.code === 'PARALLEL_BATCH_BINDING_REQUIRED');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
   }
 });
 

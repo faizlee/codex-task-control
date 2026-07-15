@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "batchId": "auth-batch",
+  "objective": "Implement the approved authentication change while independently verifying its acceptance contract.",
+  "dispatchAuthority": "controller_resolved",
+  "reviewCapacity": 3,
+  "wipLimits": {
+    "total": 3,
+    "implementation": 1,
+    "qa": 1,
+    "no_code": 1,
+    "readonly": 1
+  },
+  "dirtyConflictDomains": [],
+  "degradationReceipt": null,
+  "candidates": [
+    {
+      "candidateId": "auth-code",
+      "title": "Implement bounded authentication change",
+      "lane": "implementation",
+      "workClass": "bounded_reasoning",
+      "taskMode": "implementation",
+      "conflictDomains": [
+        "auth-runtime"
+      ],
+      "dependencies": [],
+      "reviewCost": 2,
+      "estimatedMinutes": 45,
+      "blockingReasons": [],
+      "persistentLane": false,
+      "worktreeIdentity": {
+        "baseCommit": "replace-with-main-commit",
+        "worktreePath": "C:\\worktrees\\example-auth-code",
+        "branch": "task/auth-code",
+        "lastMainSyncCommit": "replace-with-main-commit",
+        "cleanupOwner": "controller-1"
+      }
+    },
+    {
+      "candidateId": "auth-qa",
+      "title": "Verify authentication acceptance independently",
+      "lane": "qa",
+      "workClass": "repeatable",
+      "taskMode": "control_only",
+      "conflictDomains": [],
+      "dependencies": [],
+      "reviewCost": 1,
+      "estimatedMinutes": 20,
+      "blockingReasons": [],
+      "persistentLane": false,
+      "worktreeIdentity": null
+    }
+  ]
+}

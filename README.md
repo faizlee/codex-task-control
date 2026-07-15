@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.11.0 preview. The ledger, contract/result checks, controller message queue, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
+> Windows-first v0.12.0 preview. Parallel batches, the ledger, contract/result checks, controller message queue, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights are local and make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,13 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.11.0 does
+## What v0.12.0 does
+
+- Plans schema-v1 `parallel_batch` objects before task creation, with candidate lanes, dependencies, conflict domains, WIP limits, review capacity, and implementation worktree identity.
+- Requires at least two independent candidates when capacity allows. A single-task fallback needs a typed degradation receipt with evidence; an implementation plus independent QA/no-code/readonly candidate cannot silently collapse to one code task.
+- Prepares a durable multi-task dispatch wave before prompts are sent. A partial host send remains visible and blocks unrelated controlled work until every required task is recorded.
+- Recomputes fan-out after lifecycle boundaries and exposes idle slots, eligible candidates, blockers, pending dispatches, and batch replan state in controller scans.
+- Keeps exactly one heartbeat per direct controller for the entire batch. Merely planned or unresolved single-candidate work does not create an empty wake-up loop.
 
 - Lets a worker submit a first-class failed/blocked event before required stages finish, with attempted stage, classified cause, command summary, and evidence references.
 - Audits stalled execution from lease/progress/attempt evidence even when no completion or ordinary message arrives.
@@ -72,12 +78,12 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.11.0 does not do
+## What v0.12.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode or a queue acknowledgement. Therefore v0.11.0 safely defers a running-task message locally instead of claiming it reached the App queue. A future host API can replace this fallback with native queue delivery plus an explicit receipt.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.12.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
 - It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. The skill now blocks later controlled business actions and returns bounded cleanup selectors, but a host-native compare-and-delete/defer hook remains the complete fix.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
@@ -101,7 +107,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.11.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.12.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -115,6 +121,8 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 
 - Never use internal Codex subagents or `spawn_agent`.
 - Delegate only through a user-visible Codex task/thread.
+- Plan a parallel batch before task shells. Require two safe candidates by default, or record a typed and evidenced degradation reason.
+- Register every selected candidate, sync all titles, then prepare and complete one dispatch wave. Do not silently send only the first candidate.
 - Register the visible task with a semantic title, synchronize the returned title action, send its work prompt, and record the successful dispatch to start the heartbeat.
 - Route later controller messages through `controller-prepare-message`. While a target turn is running or unknown, do not call the host send tool; release only after a real idle observation. Reserve interrupt for authorized stop/cancel.
 - Classify the task explicitly; code/resource/UI/test changes require a project-owned implementation contract, and visual work also requires a visual oracle.
@@ -128,7 +136,7 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 
 Set a project root and the controller/child task IDs supplied by your Codex workflow:
 
-For implementation work, first copy [`implementation-contract.example.json`](skill/codex-task-control/assets/implementation-contract.example.json) into the project, replace its project-specific paths, stages, commands, and error policy, and commit or revision it. Visual work can start from [`visual-implementation-contract.example.json`](skill/codex-task-control/assets/visual-implementation-contract.example.json). The control plane validates structure and digest identity; project sources remain responsible for the actual implementation rules.
+First copy [`parallel-batch.example.json`](skill/codex-task-control/assets/parallel-batch.example.json) into the project and replace its candidates, conflict domains, dependencies, capacity, and worktree identities. For implementation work, also copy [`implementation-contract.example.json`](skill/codex-task-control/assets/implementation-contract.example.json), replace its project-specific paths/stages/commands/error policy, and commit or revision it. Visual work can start from [`visual-implementation-contract.example.json`](skill/codex-task-control/assets/visual-implementation-contract.example.json).
 
 ```powershell
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
@@ -141,25 +149,33 @@ node $TaskControl audit-controller-routing `
   --escalation-trigger "cross_module_contract_conflict" `
   --reason "Multiple modules encode incompatible contract boundaries."
 
+node $TaskControl controller-plan-parallel-batch `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --manifest "docs/codex-parallel-batch.json"
+
 $Registration = node $TaskControl register `
   --project-root "C:\work\example" `
   --controller "controller-1" `
   --thread "worker-1" `
   --parent "controller-1" `
-  --title "Audit authentication flow" `
-  --model "gpt-5.6-luna" `
+  --title "Implement bounded authentication change" `
+  --model "gpt-5.6-terra" `
   --thinking "medium" `
   --delegation "explicit" `
   --execution-surface "visible_task" `
   --model-class "economical" `
-  --quota-reason "Mechanical work is cheaper than using the frontier controller." `
-  --work-class "repeatable" `
+  --quota-reason "Bounded implementation is cheaper than using the frontier controller." `
+  --work-class "bounded_reasoning" `
   --decision-status "resolved" `
   --scope "Only update the named authentication tests." `
   --acceptance "Run the targeted authentication test successfully." `
   --forbidden-decisions "Do not change authentication contracts or error policy." `
   --task-mode "implementation" `
-  --implementation-contract "docs/codex-task-contract.json"
+  --implementation-contract "docs/codex-task-contract.json" `
+  --parallel-policy "batch_v1" `
+  --batch-id "auth-batch" `
+  --candidate-id "auth-code"
 
 $Registration = $Registration | ConvertFrom-Json
 ```
@@ -173,8 +189,14 @@ node $TaskControl controller-record-title-synced `
   --thread "worker-1" `
   --title $Registration.desiredThreadTitle
 
-# Run only after the real work prompt was sent successfully. This prepares a
-# create_controller_heartbeat action but does not advance confirmed generation.
+# Repeat registration and title sync for every candidate selected by the fan-out
+# gate, then prepare one durable dispatch wave before sending any prompt.
+node $TaskControl controller-prepare-parallel-dispatch `
+  --project-root "C:\work\example" `
+  --controller "controller-1" `
+  --batch-id "auth-batch"
+
+# Send every returned task prompt. Record each only after its real send succeeds.
 node $TaskControl controller-record-dispatched `
   --project-root "C:\work\example" `
   --controller "controller-1" `
