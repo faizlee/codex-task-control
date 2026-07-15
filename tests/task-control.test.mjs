@@ -15,6 +15,7 @@ import {
   controllerIngestCompletion,
   controllerIngestNotificationFailed,
   controllerDispatchRework,
+  controllerConfirmReworkDispatched,
   controllerMarkAccepted,
   controllerMarkBlocked,
   controllerMarkChangesRequested,
@@ -227,8 +228,8 @@ describe('project-isolated task control', () => {
     const pendingDecision = await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', failureClass: 'mechanical', reason: 'A dedicated test was omitted.' });
     assert.equal(pendingDecision.desiredThreadTitle, '待决｜01 same task');
     const rework = await controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
-    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', title: rework.desiredThreadTitle });
-    await controllerRecordDispatched({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
+    const resumed = await controllerConfirmReworkDispatched({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', actionId: rework.pendingRework.actionId, hostReceipt: 'host-send-ok' });
+    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', title: resumed.desiredThreadTitle });
     const secondEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-2' });
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: secondEvent });
     await controllerMarkNotificationSent({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
@@ -448,12 +449,15 @@ describe('project-isolated task control', () => {
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: completion });
     await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', failureClass: 'mechanical', reason: 'One expected assertion is missing.' });
     const rework = await controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker' });
-    assert.equal(rework.executionStatus, 'running');
-    assert.equal(rework.nextOwner, 'worker');
-    assert.equal(rework.attemptCount, 2);
-    assert.equal(rework.desiredThreadTitle, '返工｜01 same task');
-    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', title: rework.desiredThreadTitle });
-    await controllerRecordDispatched({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker' });
+    assert.equal(rework.executionStatus, 'stopped');
+    assert.equal(rework.attemptCount, 1);
+    assert.equal(rework.hostAction.receiptRequired, true);
+    const resumed = await controllerConfirmReworkDispatched({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', actionId: rework.pendingRework.actionId, hostReceipt: 'host-send-ok' });
+    assert.equal(resumed.executionStatus, 'running');
+    assert.equal(resumed.nextOwner, 'worker');
+    assert.equal(resumed.attemptCount, 2);
+    assert.equal(resumed.desiredThreadTitle, '返工｜01 same task');
+    await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'worker', title: resumed.desiredThreadTitle });
 
     completion = await createCompletionEvent({ codexHome, selfThreadId: 'worker', candidateCommit: 'candidate-2' });
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: completion });

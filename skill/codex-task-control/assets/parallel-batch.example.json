@@ -17,6 +17,7 @@
     {
       "candidateId": "auth-code",
       "title": "Implement bounded authentication change",
+      "incrementalValue": "Produces the candidate implementation commit required for the approved authentication change.",
       "lane": "implementation",
       "workClass": "bounded_reasoning",
       "taskMode": "implementation",
@@ -39,6 +40,7 @@
     {
       "candidateId": "auth-qa",
       "title": "Verify authentication acceptance independently",
+      "incrementalValue": "Produces an independent acceptance result that can reject an incorrect implementation without editing its worktree.",
       "lane": "qa",
       "workClass": "repeatable",
       "taskMode": "control_only",

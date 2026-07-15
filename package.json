@@ -1,8 +1,8 @@
 {
   "name": "codex-task-control",
-  "version": "0.13.2",
+  "version": "0.14.0",
   "private": true,
-  "description": "A quota-aware controller with parallel fan-out, lightweight lifecycle receipts, on-demand timing diagnostics, review gates, and visible-task-only delegation.",
+  "description": "A quota-aware visible-task controller with receipt-confirmed lifecycle state, valuable parallel fan-out, recoverable host actions, and on-demand diagnostics.",
   "type": "module",
   "scripts": {
     "check": "node --check skill/codex-task-control/scripts/task-control.mjs",

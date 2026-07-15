@@ -13,6 +13,9 @@ import {
   controllerConfirmHeartbeatAction,
   controllerBuildDeliveryReport,
   controllerDispatchRework,
+  controllerConfirmReworkDispatched,
+  controllerCancelPreparedRework,
+  controllerRecoverUndispatchedAttempt,
   controllerIngestCompletion,
   controllerIngestContextHealth,
   controllerIngestFailure,
@@ -146,6 +149,7 @@ function parallelCandidate({ candidateId, title, lane, workClass, taskMode, proj
   return {
     candidateId,
     title,
+    incrementalValue: `Produces an independently reviewable ${lane} result for ${candidateId}.`,
     lane,
     workClass,
     taskMode,
@@ -452,6 +456,24 @@ test('parallel batch requires and dispatches an implementation plus independent 
     assert.equal(running.pendingParallelDispatches.length, 0);
     assert.equal(running.activeTasks.length, 2);
     assert.equal((await auditParallelRouting({ taskControlHome })).compliant, true);
+
+    await delay();
+    const qaCompletion = await createCompletionEvent({ taskControlHome, selfThreadId: qaInput.threadId, candidateCommit: 'qa-result-1' });
+    await controllerIngestCompletion({ ...qaInput, eventPath: qaCompletion });
+    await controllerMarkAccepted({ ...qaInput, reason: 'Independent QA passed.' });
+    await controllerMarkIntegrated(qaInput);
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const codeRecord = registry.tasks.find((entry) => entry.threadId === codeInput.threadId);
+    codeRecord.lastDispatchedAttempt = 0;
+    codeRecord.lastDispatchedAt = null;
+    codeRecord.updatedAt = new Date().toISOString();
+    registry.updatedAt = codeRecord.updatedAt;
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+    const shrunk = await controllerEvaluateParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', batchId: 'batch-1' });
+    assert.equal(shrunk.batch.naturalBatchShrink, true);
+    assert.equal(shrunk.batch.singleDispatchAllowed, true);
+    assert.equal((await auditParallelRouting({ taskControlHome })).compliant, true);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
@@ -547,6 +569,20 @@ test('implementation candidates require a separate worktree identity chain', asy
     candidate.worktreeIdentity = null;
     await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(parallelManifest(projectRoot, [candidate]), null, 2)}\n`, 'utf8');
     await assert.rejects(controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' }), (error) => error instanceof TaskControlError && error.code === 'PARALLEL_BATCH_INVALID');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('parallel candidates must state independent incremental value instead of padding the count', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-value-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parallel-value-project-'));
+  try {
+    const qa = parallelCandidate({ candidateId: 'padding-qa', title: 'Ceremonial QA', lane: 'qa', workClass: 'repeatable', taskMode: 'control_only', projectRoot });
+    delete qa.incrementalValue;
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(parallelManifest(projectRoot, [qa], { degradationReceipt: { reason: 'insufficient_independent_candidates', summary: 'Only one candidate is currently safe.', evidence: ['candidate-matrix'] } }), null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' }), (error) => error instanceof TaskControlError && error.code === 'PARALLEL_CANDIDATE_VALUE_REQUIRED');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
@@ -737,7 +773,7 @@ test('worker failure is first-class before required stages complete and wakes th
     const registered = await controllerRegisterTask(input);
     await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
     await controllerRecordDispatched(input);
-    const eventPath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The fixed test runner exited before collecting results.', mechanicalRetryEligible: true, evidence: [{ id: 'inspection', reference: 'logs/runner-failure.txt' }] });
+    const eventPath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The fixed test runner exited before collecting results.', evidenceCommandId: 'inspection', mechanicalRetryEligible: true, evidence: [{ id: 'inspection', reference: 'logs/runner-failure.txt' }] });
     const scan = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
     assert.equal(scan.pendingEvents[0].type, 'task_failed');
     assert.equal(scan.needsControllerAttention, true);
@@ -748,6 +784,71 @@ test('worker failure is first-class before required stages complete and wakes th
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('contract-external failure stays diagnostic and cannot stop or rework an implementation task', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-failure-authority-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-failure-authority-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  try {
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    const diagnosticPath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'An ad-hoc check-only command failed outside the contract.', mechanicalRetryEligible: true, evidence: [{ id: 'adhoc-check', reference: 'logs/adhoc.txt' }] });
+    const diagnostic = await controllerIngestFailure({ ...input, eventPath: diagnosticPath, eventType: 'task_failed' });
+    assert.equal(diagnostic.status, 'executing');
+    assert.equal(diagnostic.failureHistory.at(-1).authority, 'non_authoritative_diagnostic');
+    await assert.rejects(controllerDispatchRework(input), (error) => error instanceof TaskControlError && error.code === 'TASK_TRANSITION_INVALID');
+    await delay();
+    const authoritativePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The contract-bound inspection command failed.', evidenceCommandId: 'inspection', mechanicalRetryEligible: true, evidence: [{ id: 'inspection', reference: 'logs/inspection.txt' }] });
+    const authoritative = await controllerIngestFailure({ ...input, eventPath: authoritativePath, eventType: 'task_failed' });
+    assert.equal(authoritative.status, 'changes_requested');
+    assert.equal(authoritative.failureHistory.at(-1).authority, 'contract_evidence');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('prepared rework changes no attempt until host receipt and zombie attempts have a gate-independent recovery', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-rework-recovery-'));
+  const projectRoot = 'E:\\work\\project\\rework-recovery';
+  try {
+    const { input } = await createHeartbeatFixture(taskControlHome, projectRoot, { threadId: 'rework-recovery-worker' });
+    await controllerMarkChangesRequested({ ...input, failureClass: 'mechanical', reason: 'A mechanical check needs one bounded retry.' });
+    const prepared = await controllerDispatchRework(input);
+    assert.equal(prepared.attemptCount, 1);
+    assert.equal(prepared.status, 'changes_requested');
+    assert.equal(prepared.hostAction.receiptRequired, true);
+    const cancelled = await controllerCancelPreparedRework({ ...input, reason: 'host send failed' });
+    assert.equal(cancelled.attemptCount, 1);
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const task = registry.tasks.find((entry) => entry.threadId === input.threadId);
+    task.status = 'executing';
+    task.executionStatus = 'running';
+    task.nextOwner = 'worker';
+    task.attemptCount = 2;
+    task.reviewVerdict = 'pending';
+    task.notificationStatus = 'pending';
+    task.executionEndedAt = null;
+    task.desiredThreadTitle = `返工｜${task.displayKey} ${task.title}`;
+    task.titleSyncStatus = 'pending';
+    task.titleSyncError = null;
+    task.pendingRework = null;
+    task.updatedAt = new Date().toISOString();
+    registry.updatedAt = task.updatedAt;
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+    const scan = await controllerScanPendingEvents(input);
+    assert.equal(scan.zombieAttempts.length, 1);
+    const recovered = await controllerRecoverUndispatchedAttempt({ ...input, reason: 'Attempt two had no host delivery receipt.' });
+    assert.equal(recovered.status, 'changes_requested');
+    assert.equal(recovered.attemptCount, 1);
+    assert.equal(recovered.lastDispatchedAttempt, 1);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
   }
 });
 
@@ -1127,10 +1228,9 @@ test('deliverable history appends attempts and reclaimed visual work stays red i
     let completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'visual-attempt-1', resultManifestPath: manifestPath });
     await controllerIngestCompletion({ ...input, eventPath: completion });
     await controllerMarkChangesRequested({ ...input, failureClass: 'mechanical', reason: 'One required label is missing.' });
-    await controllerDispatchRework(input);
-    const executing = (await querySelf({ taskControlHome, selfThreadId: input.threadId })).task;
+    const preparedRework = await controllerDispatchRework(input);
+    const executing = await controllerConfirmReworkDispatched({ ...input, actionId: preparedRework.pendingRework.actionId, hostReceipt: 'host-send-ok-2' });
     await controllerRecordTitleSynced({ ...input, title: executing.desiredThreadTitle });
-    await controllerRecordDispatched(input);
     await delay();
     const reuse = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Existing path retained for attempt two.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'git-diff-check-2.txt' }] });
     await controllerIngestProgress({ ...input, eventPath: reuse });
@@ -1178,6 +1278,28 @@ test('legacy tasks without result fields remain readable and report historical e
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('HTML executive summary never presents control-only review as a business delivery', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-control-summary-'));
+  const projectRoot = 'E:\\work\\project\\control-summary';
+  try {
+    const { input } = await createHeartbeatFixture(taskControlHome, projectRoot, { threadId: 'control-summary-worker' });
+    await delay();
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'control-summary-candidate' });
+    await controllerIngestCompletion({ ...input, eventPath: completion });
+    await controllerMarkAccepted({ ...input, reason: 'The read-only control review is correct.' });
+    await controllerMarkIntegrated(input);
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(report.businessDeliverableCount, 0);
+    assert.equal(report.controlReviewPassedCount, 1);
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /本专题没有可验证的业务交付/);
+    assert.match(html, /控制审查已通过/);
+    assert.match(html, /控制任务通过不等于产品功能已经交付/);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
   }
 });
 
@@ -1342,7 +1464,7 @@ test('controller scan discovers a fresh completion and keeps the heartbeat', asy
   });
 });
 
-test('adaptive heartbeat starts on real dispatch, renews on progress, and reorders after completion', async () => {
+test('adaptive heartbeat starts on dispatch, renews a logical lease on progress, and only reschedules at a real boundary', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-'));
   const projectRoot = 'E:\\work\\project\\adaptive-heartbeat';
   const input = {
@@ -1393,26 +1515,16 @@ test('adaptive heartbeat starts on real dispatch, renews on progress, and reorde
     scan = await controllerScanPendingEvents(input);
     assert.deepEqual(scan.pendingEvents.map((event) => event.type), ['task_progress']);
     const progressed = await controllerIngestProgress({ ...input, eventPath: progressPath });
-    assert.equal(progressed.heartbeatState.generation, dispatchGeneration, 'progress prepares but does not commit the next generation');
-    assert.ok(progressed.heartbeatAction.generation > dispatchGeneration);
-    assert.ok(Date.parse(progressed.heartbeatAction.dueAt) > Date.parse(dispatchDueAt));
-    const progressGeneration = progressed.heartbeatAction.generation;
-    const confirmedProgress = await controllerConfirmHeartbeatAction({ ...input, actionId: progressed.heartbeatAction.actionId, automationId: 'heartbeat-auto-2' });
-    assert.equal(confirmedProgress.heartbeatState.generation, progressGeneration);
-    assert.equal(confirmedProgress.cleanupHeartbeatAction.automationId, 'heartbeat-auto-1');
-
-    const stale = await controllerScanPendingEvents({ ...input, heartbeatGeneration: dispatchGeneration, heartbeatAutomationId: 'heartbeat-auto-1', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 1 });
-    assert.equal(stale.staleHeartbeat, true);
-    assert.equal(stale.needsControllerAttention, false);
-    assert.equal(stale.heartbeatAction.type, 'delete_stale_automation');
-    assert.equal(stale.heartbeatAction.automationId, 'heartbeat-auto-1');
+    assert.equal(progressed.heartbeatState.generation, dispatchGeneration);
+    assert.equal(progressed.heartbeatAction, null, 'progress must not replace the physical App automation');
+    assert.ok(Date.parse(progressed.heartbeatState.logicalLeaseDueAt) > Date.parse(dispatchDueAt));
 
     await delay();
     const completionPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'adaptive-candidate-1' });
     const completed = await controllerIngestCompletion({ ...input, eventPath: completionPath });
-    assert.equal(completed.heartbeatState.generation, progressGeneration);
+    assert.equal(completed.heartbeatState.generation, dispatchGeneration);
     assert.equal(completed.heartbeatAction.intervalMs, 5 * 60 * 1000);
-    assert.ok(completed.heartbeatAction.generation > progressGeneration);
+    assert.ok(completed.heartbeatAction.generation > dispatchGeneration);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
@@ -1430,8 +1542,10 @@ test('heartbeat replacement failure does not advance the confirmed generation', 
     const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'bounded check reached a real checkpoint' });
     const prepared = await controllerIngestProgress({ ...input, eventPath: progressPath });
     assert.equal(prepared.heartbeatState.generation, 1);
-    assert.equal(prepared.heartbeatAction.generation, 2);
-    const failed = await controllerRecordHeartbeatActionFailed({ ...input, actionId: prepared.heartbeatAction.actionId, reason: 'automation_update timed out' });
+    assert.equal(prepared.heartbeatAction, null);
+    const replacement = await controllerRearmHeartbeat({ ...input, reason: 'reconcile' });
+    assert.equal(replacement.heartbeatAction.generation, 2);
+    const failed = await controllerRecordHeartbeatActionFailed({ ...input, actionId: replacement.heartbeatAction.actionId, reason: 'automation_update timed out' });
     assert.equal(failed.heartbeatState.generation, 1);
     assert.equal(failed.heartbeatState.automationId, 'heartbeat-2pc-auto-1');
     assert.equal(failed.heartbeatState.pendingAction, null);
@@ -1491,6 +1605,7 @@ test('a timed-out pending heartbeat action returns bounded compensation', async 
     await delay();
     const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'checkpoint before a hanging host call' });
     await controllerIngestProgress({ ...input, eventPath: progressPath });
+    await controllerRearmHeartbeat({ ...input, reason: 'reconcile' });
     const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     registry.controllerHeartbeats[0].pendingAction.expiresAt = '2000-01-01T00:00:00.000Z';
@@ -1501,10 +1616,8 @@ test('a timed-out pending heartbeat action returns bounded compensation', async 
     assert.equal(scan.heartbeatAction.type, 'compensate_timed_out_heartbeat_action');
     assert.equal(scan.pendingEvents.length, 0);
     assert.equal(scan.needsControllerAttention, false);
-    await assert.rejects(
-      controllerMarkBlocked({ ...input, reason: 'This mutation must wait for heartbeat compensation.', userSummary: 'No lifecycle mutation was applied.', blockerSource: 'external' }),
-      (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED',
-    );
+    const blocked = await controllerMarkBlocked({ ...input, reason: 'Business recovery must remain available despite heartbeat compensation.', userSummary: 'Lifecycle recovery continued while the host heartbeat was reconciled separately.', blockerSource: 'external' });
+    assert.equal(blocked.status, 'blocked');
     const finalization = await controllerFinalizeCycle(input);
     assert.equal(finalization.phase, 'compensate_timed_out_heartbeat');
     assert.equal(finalization.heartbeatAction.type, 'compensate_timed_out_heartbeat_action');
@@ -1525,7 +1638,8 @@ test('a pending automation can self-confirm, while repeated stale generations fu
 
     await delay();
     const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'checkpoint before generation switch' });
-    const prepared = await controllerIngestProgress({ ...input, eventPath: progressPath });
+    await controllerIngestProgress({ ...input, eventPath: progressPath });
+    const prepared = await controllerRearmHeartbeat({ ...input, reason: 'reconcile' });
     await controllerConfirmHeartbeatAction({ ...input, actionId: prepared.heartbeatAction.actionId, automationId: 'heartbeat-stale-auto-2' });
 
     let stale;
@@ -1572,7 +1686,8 @@ test('repeated retired-automation delete failures open a bounded fuse', async ()
     await controllerConfirmHeartbeatAction({ ...input, actionId: dispatched.heartbeatAction.actionId, automationId: 'heartbeat-delete-auto-1' });
     await delay();
     const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'checkpoint before replacing automation' });
-    const prepared = await controllerIngestProgress({ ...input, eventPath: progressPath });
+    await controllerIngestProgress({ ...input, eventPath: progressPath });
+    const prepared = await controllerRearmHeartbeat({ ...input, reason: 'reconcile' });
     const confirmed = await controllerConfirmHeartbeatAction({ ...input, actionId: prepared.heartbeatAction.actionId, automationId: 'heartbeat-delete-auto-2' });
     const cleanup = confirmed.cleanupHeartbeatAction;
     assert.equal(cleanup.automationId, 'heartbeat-delete-auto-1');
@@ -1589,7 +1704,7 @@ test('repeated retired-automation delete failures open a bounded fuse', async ()
   }
 });
 
-test('current heartbeat delete failures fuse but keep business blocked until real deletion', async () => {
+test('current heartbeat delete failures fuse while business recovery remains available', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-current-delete-'));
   const projectRoot = 'E:\\work\\project\\heartbeat-current-delete-fuse';
   try {
@@ -1617,7 +1732,7 @@ test('current heartbeat delete failures fuse but keep business blocked until rea
     assert.equal(failure.heartbeatState.automationId, 'heartbeat-current-auto-4');
     assert.equal(failure.heartbeatState.pendingAction.type, 'delete_controller_heartbeat');
     assert.equal(failure.heartbeatAction.type, 'delete_controller_heartbeat');
-    await assert.rejects(controllerAssertBusinessReady(input), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
+    assert.equal((await controllerAssertBusinessReady(input)).businessAllowed, true);
     const stale = await controllerScanPendingEvents({ ...input, heartbeatGeneration: deletePrepared.heartbeatAction.generation - 1, heartbeatAutomationId: 'heartbeat-current-auto-4', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=5;COUNT=1', heartbeatOccurrence: 4 });
     assert.equal(stale.heartbeatAction.type, 'delete_stale_automation');
     assert.equal(stale.pendingEvents.length, 0);
@@ -1626,7 +1741,7 @@ test('current heartbeat delete failures fuse but keep business blocked until rea
   }
 });
 
-test('terminal closeout supersedes an unconfirmed create and blocks business until both heartbeat copies are deleted', async () => {
+test('terminal closeout supersedes an unconfirmed create without blocking unrelated business recovery', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-terminal-finalize-'));
   const projectRoot = 'E:\\work\\project\\heartbeat-terminal-finalize';
   try {
@@ -1667,8 +1782,7 @@ test('terminal closeout supersedes an unconfirmed create and blocks business unt
     assert.equal(finalized.businessAllowed, false);
     assert.equal(finalized.phase, 'delete_heartbeat');
     assert.equal(finalized.heartbeatAction.actionId, archived.heartbeatAction.actionId);
-    await assert.rejects(controllerAssertBusinessReady(input), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
-    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'forbidden-before-heartbeat-delete', parentThreadId: input.controllerThreadId }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
+    assert.equal((await controllerAssertBusinessReady(input)).businessAllowed, true);
 
     const retryCleanup = await controllerRecordHeartbeatActionFailed({
       ...input,
@@ -1679,7 +1793,7 @@ test('terminal closeout supersedes an unconfirmed create and blocks business unt
     assert.equal(retryCleanup.heartbeatAction.type, 'finalize_controller_cycle');
     assert.notEqual(retryCleanup.heartbeatAction.actionId, archived.heartbeatAction.actionId);
     assert.deepEqual(retryCleanup.heartbeatAction.hostActions, archived.heartbeatAction.hostActions);
-    await assert.rejects(controllerAssertBusinessReady(input), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_CYCLE_RECONCILE_REQUIRED');
+    assert.equal((await controllerAssertBusinessReady(input)).businessAllowed, true);
 
     const confirmed = await controllerConfirmHeartbeatAction({
       ...input,

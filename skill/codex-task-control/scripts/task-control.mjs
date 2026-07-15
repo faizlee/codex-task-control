@@ -30,6 +30,7 @@ export const NEXT_OWNERS = Object.freeze(['worker', 'controller', 'undecided', '
 export const FAILURE_CLASSES = Object.freeze(['mechanical', 'comprehension', 'judgment', 'spec_missing', 'unclassified']);
 export const FAILURE_DOMAINS = Object.freeze(['tooling', 'environment', 'contract', 'test', 'implementation']);
 export const FAILURE_EVENT_TYPES = Object.freeze(['task_failed', 'task_blocked']);
+export const FAILURE_AUTHORITIES = Object.freeze(['contract_evidence', 'non_authoritative_diagnostic']);
 export const OBJECTIVE_FUSE_REPLACEMENT_LIMIT = 2;
 export const DEFAULT_OBJECTIVE_BUDGET_MINUTES = 120;
 export const OBJECTIVE_PROTOCOL_VERSION = 1;
@@ -75,7 +76,7 @@ export const RESULT_REVIEW_STATUSES = Object.freeze(['pending', 'accepted', 'rej
 export const DELIVERY_STATUSES = Object.freeze(['candidate', 'accepted_not_integrated', 'integrated', 'rejected']);
 export const OBSERVABILITY_PROTOCOL_VERSION = 1;
 export const OBSERVABILITY_MODES = Object.freeze(['lean', 'diagnostic']);
-export const OBSERVABILITY_PHASES = Object.freeze(['registered', 'dispatch_confirmed', 'progress_ingested', 'failure_ingested', 'completion_ingested', 'changes_requested', 'rework_prepared', 'reclaimed', 'blocked', 'review_accepted', 'integrated', 'archived']);
+export const OBSERVABILITY_PHASES = Object.freeze(['registered', 'dispatch_confirmed', 'progress_ingested', 'failure_ingested', 'failure_diagnostic_ingested', 'completion_ingested', 'changes_requested', 'rework_prepared', 'rework_dispatched', 'rework_cancelled', 'reclaimed', 'blocked', 'review_accepted', 'integrated', 'archived']);
 export const OBSERVABILITY_CONFIDENCE = Object.freeze(['direct', 'bounded', 'unavailable']);
 export const INTEGRATION_PROOF_PROTOCOL_VERSION = 1;
 const OBSERVABILITY_CLOCK_ID = `task-control-${process.pid}-${randomUUID().replaceAll('-', '')}`;
@@ -306,7 +307,7 @@ function validateParallelDegradation(value) {
   return { reason: value.reason, summary: value.summary.trim(), evidence };
 }
 
-export function validateParallelBatchManifest(value, projectRoot) {
+export function validateParallelBatchManifest(value, projectRoot, { allowLegacyMissingIncrementalValue = false } = {}) {
   const allowed = new Set(['schemaVersion', 'batchId', 'objective', 'dispatchAuthority', 'reviewCapacity', 'wipLimits', 'dirtyConflictDomains', 'degradationReceipt', 'candidates']);
   if (!isObject(value) || value.schemaVersion !== PARALLEL_BATCH_PROTOCOL_VERSION || Object.keys(value).some((key) => !allowed.has(key))) fail('PARALLEL_BATCH_INVALID', `parallel batch manifest 必须使用 schemaVersion=${PARALLEL_BATCH_PROTOCOL_VERSION} 且不得包含未知字段`);
   if (!isSafeThreadId(value.batchId) || !nonEmpty(value.objective) || !has(value.dispatchAuthority, PARALLEL_DISPATCH_AUTHORITIES)) fail('PARALLEL_BATCH_INVALID', 'batchId/objective/dispatchAuthority 无效');
@@ -319,9 +320,11 @@ export function validateParallelBatchManifest(value, projectRoot) {
   if (!Array.isArray(value.candidates) || value.candidates.length === 0) fail('PARALLEL_BATCH_INVALID', 'candidates 必须是非空数组');
   const candidateIds = new Set();
   const candidates = value.candidates.map((candidate) => {
-    const candidateAllowed = new Set(['candidateId', 'title', 'lane', 'workClass', 'taskMode', 'conflictDomains', 'dependencies', 'reviewCost', 'estimatedMinutes', 'blockingReasons', 'persistentLane', 'worktreeIdentity']);
+    const candidateAllowed = new Set(['candidateId', 'title', 'incrementalValue', 'lane', 'workClass', 'taskMode', 'conflictDomains', 'dependencies', 'reviewCost', 'estimatedMinutes', 'blockingReasons', 'persistentLane', 'worktreeIdentity']);
     if (!isObject(candidate) || Object.keys(candidate).some((key) => !candidateAllowed.has(key)) || !isSafeThreadId(candidate.candidateId) || candidateIds.has(candidate.candidateId) || !nonEmpty(candidate.title) || !has(candidate.lane, PARALLEL_LANES) || !has(candidate.workClass, WORK_CLASSES) || !REGISTER_TASK_MODES.includes(candidate.taskMode)) fail('PARALLEL_BATCH_INVALID', 'candidate identity/lane/workClass/taskMode 无效');
     candidateIds.add(candidate.candidateId);
+    if (!nonEmpty(candidate.incrementalValue) && !allowLegacyMissingIncrementalValue) fail('PARALLEL_CANDIDATE_VALUE_REQUIRED', `candidate ${candidate.candidateId} 必须说明独立增量价值，不能只为凑并发数量`);
+    const incrementalValue = nonEmpty(candidate.incrementalValue) ? candidate.incrementalValue.trim() : 'legacy_manifest_value_not_recorded';
     const conflictDomains = parallelStringArray(candidate.conflictDomains, `candidate ${candidate.candidateId}.conflictDomains`, { allowEmpty: candidate.lane !== 'implementation' });
     const blockingReasons = parallelStringArray(candidate.blockingReasons ?? [], `candidate ${candidate.candidateId}.blockingReasons`);
     if (!Array.isArray(candidate.dependencies)) fail('PARALLEL_BATCH_INVALID', `candidate ${candidate.candidateId}.dependencies 必须是数组`);
@@ -336,7 +339,7 @@ export function validateParallelBatchManifest(value, projectRoot) {
     if (candidate.lane === 'implementation' && !implementationMode) fail('PARALLEL_BATCH_INVALID', `implementation lane candidate ${candidate.candidateId} 必须使用 implementation 或 visual_implementation taskMode`);
     const worktreeIdentity = implementationMode ? validateParallelWorktreeIdentity(candidate.worktreeIdentity, projectRoot) : null;
     if (!implementationMode && candidate.worktreeIdentity !== null && candidate.worktreeIdentity !== undefined) fail('PARALLEL_BATCH_INVALID', `control_only candidate ${candidate.candidateId} 不得伪造 worktreeIdentity`);
-    return { candidateId: candidate.candidateId, title: candidate.title.trim(), lane: candidate.lane, workClass: candidate.workClass, taskMode: candidate.taskMode, conflictDomains, dependencies, reviewCost: candidate.reviewCost, estimatedMinutes: candidate.estimatedMinutes, blockingReasons, persistentLane: candidate.persistentLane, worktreeIdentity, threadId: null, registeredAt: null };
+    return { candidateId: candidate.candidateId, title: candidate.title.trim(), incrementalValue, lane: candidate.lane, workClass: candidate.workClass, taskMode: candidate.taskMode, conflictDomains, dependencies, reviewCost: candidate.reviewCost, estimatedMinutes: candidate.estimatedMinutes, blockingReasons, persistentLane: candidate.persistentLane, worktreeIdentity, threadId: null, registeredAt: null };
   });
   for (const candidate of candidates) for (const dependency of candidate.dependencies) if (!candidateIds.has(dependency.candidateId)) fail('PARALLEL_BATCH_INVALID', `candidate ${candidate.candidateId} 引用了未知 dependency ${dependency.candidateId}`);
   const visiting = new Set();
@@ -1083,6 +1086,10 @@ function ensureDispatchControl(tasks) {
   });
 }
 
+function ensureRecoveryControl(tasks) {
+  return tasks.map((task) => ({ ...task, pendingRework: task.pendingRework ?? null }));
+}
+
 function nextNumericSegment(used, width = 0) {
   let value = 1;
   while (used.has(String(value).padStart(width, '0'))) value += 1;
@@ -1145,7 +1152,7 @@ function ensureThreadControl(tasks, rootControllers) {
 }
 
 function ensureTaskControls(tasks, rootControllers) {
-  return ensureObservabilityControl(ensureParallelTaskControl(ensureDispatchControl(ensureExecutionControl(ensureObjectiveControl(ensureImplementationControl(ensureThreadControl(tasks, rootControllers)))))));
+  return ensureRecoveryControl(ensureObservabilityControl(ensureParallelTaskControl(ensureDispatchControl(ensureExecutionControl(ensureObjectiveControl(ensureImplementationControl(ensureThreadControl(tasks, rootControllers))))))));
 }
 
 function parallelTaskState(task) {
@@ -1162,7 +1169,7 @@ function activeParallelTask(task) {
 function validateParallelBatchRecord(value, tasks, knownControllers, projectRoot) {
   if (!isObject(value) || value.protocolVersion !== PARALLEL_BATCH_PROTOCOL_VERSION || !isSafeThreadId(value.controllerThreadId) || !knownControllers.has(value.controllerThreadId) || !has(value.status, PARALLEL_BATCH_STATUSES)) fail('REGISTRY_INVALID', 'parallel batch identity/status 无效');
   if (!Array.isArray(value.candidates)) fail('REGISTRY_INVALID', 'parallel batch candidates 无效');
-  const manifest = validateParallelBatchManifest({ schemaVersion: value.protocolVersion, batchId: value.batchId, objective: value.objective, dispatchAuthority: value.dispatchAuthority, reviewCapacity: value.reviewCapacity, wipLimits: value.wipLimits, dirtyConflictDomains: value.dirtyConflictDomains, degradationReceipt: value.degradationReceipt, candidates: value.candidates.map((candidate) => ({ candidateId: candidate.candidateId, title: candidate.title, lane: candidate.lane, workClass: candidate.workClass, taskMode: candidate.taskMode, conflictDomains: candidate.conflictDomains, dependencies: candidate.dependencies, reviewCost: candidate.reviewCost, estimatedMinutes: candidate.estimatedMinutes, blockingReasons: candidate.blockingReasons, persistentLane: candidate.persistentLane, worktreeIdentity: candidate.worktreeIdentity })) }, projectRoot);
+  const manifest = validateParallelBatchManifest({ schemaVersion: value.protocolVersion, batchId: value.batchId, objective: value.objective, dispatchAuthority: value.dispatchAuthority, reviewCapacity: value.reviewCapacity, wipLimits: value.wipLimits, dirtyConflictDomains: value.dirtyConflictDomains, degradationReceipt: value.degradationReceipt, candidates: value.candidates.map((candidate) => ({ candidateId: candidate.candidateId, title: candidate.title, incrementalValue: candidate.incrementalValue, lane: candidate.lane, workClass: candidate.workClass, taskMode: candidate.taskMode, conflictDomains: candidate.conflictDomains, dependencies: candidate.dependencies, reviewCost: candidate.reviewCost, estimatedMinutes: candidate.estimatedMinutes, blockingReasons: candidate.blockingReasons, persistentLane: candidate.persistentLane, worktreeIdentity: candidate.worktreeIdentity })) }, projectRoot, { allowLegacyMissingIncrementalValue: true });
   if (!nonEmpty(value.manifestPath) || !win32.isAbsolute(value.manifestPath) || !windowsPathInside(value.manifestPath, projectRoot) || !/^[0-9a-f]{64}$/.test(value.manifestDigest ?? '')) fail('REGISTRY_INVALID', 'parallel batch manifest path/digest 无效');
   if (!Array.isArray(value.pendingDispatchCandidateIds) || new Set(value.pendingDispatchCandidateIds).size !== value.pendingDispatchCandidateIds.length || value.pendingDispatchCandidateIds.some((id) => !manifest.candidates.some((candidate) => candidate.candidateId === id))) fail('REGISTRY_INVALID', 'parallel batch pendingDispatchCandidateIds 无效');
   if ((value.dispatchWaveId !== null && !isSafeThreadId(value.dispatchWaveId)) || !isTimestamp(value.createdAt) || !isTimestamp(value.updatedAt) || (value.closedAt !== null && !isTimestamp(value.closedAt))) fail('REGISTRY_INVALID', 'parallel batch wave/time 无效');
@@ -1229,7 +1236,11 @@ function parallelBatchRuntime(registry, batch) {
   const requiredFanoutCandidateIds = selected.length >= 2 ? selected.map((candidate) => candidate.candidateId) : [];
   const eligibleCandidates = [...stateByCandidate.values()].filter((entry) => ['eligible', 'registered'].includes(entry.state)).map((entry) => ({ candidateId: entry.candidate.candidateId, title: entry.candidate.title, lane: entry.candidate.lane, threadId: entry.candidate.threadId, state: entry.state, blockers: entry.blockers }));
   const candidateStates = [...stateByCandidate.values()].map((entry) => ({ candidateId: entry.candidate.candidateId, title: entry.candidate.title, lane: entry.candidate.lane, threadId: entry.candidate.threadId, state: entry.state, blockers: entry.blockers }));
-  const singleCandidateNeedsDegradation = selected.length === 1 && batch.degradationReceipt === null;
+  const waveAlreadyStarted = batch.candidates.some((candidate) => {
+    const task = candidate.threadId === null ? null : registry.tasks.find((entry) => entry.threadId === candidate.threadId);
+    return task !== null && ((task.lastDispatchedAttempt ?? 0) > 0 || isTerminalTask(task) || ['awaiting_review', 'accepted'].includes(task.status));
+  });
+  const singleCandidateNeedsDegradation = selected.length === 1 && batch.degradationReceipt === null && !waveAlreadyStarted;
   const fanoutBlockers = [];
   if (remainingTotal === 0 && selected.length === 0) fanoutBlockers.push('wip_capacity_exhausted');
   if (remainingReview === 0 && selected.length === 0) fanoutBlockers.push('review_capacity_exhausted');
@@ -1242,7 +1253,8 @@ function parallelBatchRuntime(registry, batch) {
     eligibleCandidates,
     requiredFanoutCandidateIds,
     fanoutRequired: requiredFanoutCandidateIds.length >= 2,
-    singleDispatchAllowed: selected.length === 1 && batch.degradationReceipt !== null,
+    singleDispatchAllowed: selected.length === 1 && (batch.degradationReceipt !== null || waveAlreadyStarted),
+    naturalBatchShrink: selected.length === 1 && batch.degradationReceipt === null && waveAlreadyStarted,
     selectedCandidateIds: selected.map((candidate) => candidate.candidateId),
     idleConcurrencySlots: Math.max(0, batch.wipLimits.total - activeTasks.length),
     usedReviewCapacity,
@@ -1267,12 +1279,10 @@ function controllerParallelRuntime(registry, controllerThreadId) {
 function controllerThreadDebt(registry, controllerThreadId) {
   const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
   const directMessages = (registry.controllerMessages ?? []).filter((message) => message.controllerThreadId === controllerThreadId);
-  const heartbeat = (registry.controllerHeartbeats ?? []).find((entry) => entry.controllerThreadId === controllerThreadId);
   const reasons = [];
   if (queues.queuedTasks.length > 0) reasons.push('review_routing_or_closeout_pending');
   if (queues.cleanupTasks.length > 0) reasons.push('actionable_thread_action_pending');
   if (directMessages.some((message) => message.status === 'prepared')) reasons.push('message_action_pending');
-  if (heartbeatEvidenceDefaults(heartbeat ?? { controllerThreadId, generation: 0, status: 'cancelled', dueAt: null, intervalMs: null, reason: 'reconcile', triggerTaskThreadId: null, updatedAt: new Date().toISOString() }).pendingAction !== null) reasons.push('heartbeat_action_pending');
   if (controllerHealthFor(registry, controllerThreadId)?.status === 'handoff_required') reasons.push('context_handoff_required');
   return { blocked: reasons.length > 0, reasons: [...new Set(reasons)] };
 }
@@ -1361,18 +1371,17 @@ function controllerCycleGate(registry, controllerThreadId, now = Date.now()) {
   const state = found === null ? null : heartbeatEvidenceDefaults(found);
   if (state !== null && state.pendingAction !== null) {
     const expired = now > Date.parse(state.pendingAction.expiresAt);
-    const pendingCreateCanOverlapActiveWork = state.pendingAction.type === 'create_controller_heartbeat' && (queues.shouldKeepHeartbeat || queues.routingTasks.length > 0) && !expired;
-    if (!pendingCreateCanOverlapActiveWork) {
-      return { businessAllowed: false, reason: expired ? 'pending_heartbeat_action_timed_out' : 'pending_heartbeat_action_unconfirmed', queues, heartbeatState: state, heartbeatAction: expired ? { type: 'compensate_timed_out_heartbeat_action', actionId: state.pendingAction.actionId, automationId: state.pendingAction.previousAutomationId, generation: state.pendingAction.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, command: 'controller-record-heartbeat-action-failed --reason host_timeout' } : heartbeatActionForPending(state, state.pendingAction) };
-    }
-    if (parallel.pendingDispatches.length > 0) return { businessAllowed: false, reason: 'parallel_dispatch_wave_incomplete', queues, heartbeatState: state, heartbeatAction: heartbeatActionForPending(state, state.pendingAction) };
-    return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: heartbeatActionForPending(state, state.pendingAction) };
+    const heartbeatAction = expired
+      ? { type: 'compensate_timed_out_heartbeat_action', actionId: state.pendingAction.actionId, automationId: state.pendingAction.previousAutomationId, generation: state.pendingAction.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, command: 'controller-record-heartbeat-action-failed --reason host_timeout' }
+      : heartbeatActionForPending(state, state.pendingAction);
+    if (parallel.pendingDispatches.length > 0) return { businessAllowed: false, reason: 'parallel_dispatch_wave_incomplete', queues, heartbeatState: state, heartbeatAction };
+    return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction, heartbeatWarning: expired ? 'pending_heartbeat_action_timed_out' : 'pending_heartbeat_action_unconfirmed' };
   }
   if (parallel.pendingDispatches.length > 0) return { businessAllowed: false, reason: 'parallel_dispatch_wave_incomplete', queues, heartbeatState: state, heartbeatAction: null };
   const undispatchedBootstrapOnly = state === null && queues.activeTasks.length === 0 && queues.cleanupTasks.length === 0 && queues.queuedTasks.length === 0 && queues.routingTasks.length > 0;
   if (undispatchedBootstrapOnly) return { businessAllowed: true, reason: null, queues, heartbeatState: null, heartbeatAction: null };
-  if (queues.shouldKeepHeartbeat && (state === null || state.status !== 'armed' || !isSafeThreadId(state.automationId))) return { businessAllowed: false, reason: 'confirmed_heartbeat_missing', queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', command: 'controller-finalize-cycle' } };
-  if (!queues.shouldKeepHeartbeat && state?.status === 'armed' && isSafeThreadId(state.automationId)) return { businessAllowed: false, reason: 'terminal_heartbeat_delete_required', queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', automationId: state.automationId, generation: state.generation, command: 'controller-finalize-cycle' } };
+  if (queues.shouldKeepHeartbeat && (state === null || state.status !== 'armed' || !isSafeThreadId(state.automationId))) return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', command: 'controller-finalize-cycle' }, heartbeatWarning: 'confirmed_heartbeat_missing' };
+  if (!queues.shouldKeepHeartbeat && state?.status === 'armed' && isSafeThreadId(state.automationId)) return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', automationId: state.automationId, generation: state.generation, command: 'controller-finalize-cycle' }, heartbeatWarning: 'terminal_heartbeat_delete_required' };
   return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: null };
 }
 
@@ -1386,13 +1395,15 @@ function assertControllerCycleBusinessReady(registry, controllerThreadId, option
 function assertNoExpiredPendingHeartbeat(registry, controllerThreadId, now = Date.now()) {
   const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId) ?? null;
   const pendingAction = found === null ? null : heartbeatEvidenceDefaults(found).pendingAction;
-  if (pendingAction !== null && now > Date.parse(pendingAction.expiresAt)) {
-    fail('CONTROLLER_CYCLE_RECONCILE_REQUIRED', 'pending_heartbeat_action_timed_out; 先执行 controller-finalize-cycle 并记录返回的 compensation，再继续任何生命周期变更');
-  }
+  return pendingAction !== null && now > Date.parse(pendingAction.expiresAt);
 }
 
 function heartbeatEvidenceDefaults(state) {
-  if (state.protocolVersion === HEARTBEAT_PROTOCOL_VERSION) return state;
+  const defaults = {
+    logicalLeaseDueAt: state.status === 'armed' ? state.dueAt : null,
+    logicalLeaseUpdatedAt: state.updatedAt,
+  };
+  if (state.protocolVersion === HEARTBEAT_PROTOCOL_VERSION) return { ...defaults, ...state };
   return {
     ...state,
     protocolVersion: HEARTBEAT_PROTOCOL_VERSION,
@@ -1414,6 +1425,7 @@ function heartbeatEvidenceDefaults(state) {
     notificationStatus: 'not_required',
     actionHistory: [],
     retiredAutomationIds: [],
+    ...defaults,
   };
 }
 
@@ -1496,6 +1508,11 @@ function rearmControllerHeartbeatInRegistry(registry, controllerThreadId, reason
   }
   if (base.pendingAction !== null) {
     return { registry, state: base, pendingState: { ...base.pendingAction }, heartbeatAction: heartbeatActionForPending(base, base.pendingAction), reusedPendingAction: true };
+  }
+  if (reason === 'progress' && base.status === 'armed' && desired.status === 'armed' && isSafeThreadId(base.automationId) && isTimestamp(base.dueAt) && now.getTime() < Date.parse(base.dueAt)) {
+    const state = { ...base, reason, triggerTaskThreadId, logicalLeaseDueAt: desired.dueAt, logicalLeaseUpdatedAt: now.toISOString(), updatedAt: now.toISOString() };
+    const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
+    return { registry: { ...registry, controllerHeartbeats, updatedAt: now.toISOString() }, state, pendingState: desired, heartbeatAction: null, reusedPendingAction: true, logicalLeaseRenewed: true };
   }
   const pendingAction = pendingHeartbeatAction(base, desired, now);
   const state = { ...base, pendingAction, updatedAt: now.toISOString() };
@@ -1616,7 +1633,11 @@ function validateControllerHeartbeat(value, knownControllers) {
   if (!has(value.notificationStatus, HEARTBEAT_NOTIFICATION_STATUSES)) fail('REGISTRY_INVALID', 'heartbeat notificationStatus 无效');
   if (!Array.isArray(value.actionHistory) || !Array.isArray(value.retiredAutomationIds) || !value.retiredAutomationIds.every(isSafeThreadId)) fail('REGISTRY_INVALID', 'heartbeat 历史或 retiredAutomationIds 无效');
   const pendingAction = value.pendingAction === null ? null : validatePendingHeartbeatAction(value.pendingAction, value);
-  return { ...value, pendingAction, actionHistory: value.actionHistory.map(validateHeartbeatHistoryEntry), retiredAutomationIds: [...new Set(value.retiredAutomationIds)] };
+  const logicalLeaseDueAt = value.logicalLeaseDueAt ?? (value.status === 'armed' ? value.dueAt : null);
+  const logicalLeaseUpdatedAt = value.logicalLeaseUpdatedAt ?? value.updatedAt;
+  if (logicalLeaseDueAt !== null && !isTimestamp(logicalLeaseDueAt)) fail('REGISTRY_INVALID', 'logicalLeaseDueAt 无效');
+  if (!isTimestamp(logicalLeaseUpdatedAt)) fail('REGISTRY_INVALID', 'logicalLeaseUpdatedAt 无效');
+  return { ...value, logicalLeaseDueAt, logicalLeaseUpdatedAt, pendingAction, actionHistory: value.actionHistory.map(validateHeartbeatHistoryEntry), retiredAutomationIds: [...new Set(value.retiredAutomationIds)] };
 }
 
 function validateDeliverablePackage(value, task, projectRoot) {
@@ -1755,6 +1776,10 @@ function validateTask(value, projectRoot) {
     if (value.status === 'changes_requested' && (value.failureClass === null || !nonEmpty(value.changesRequestedReason))) fail('REGISTRY_INVALID', 'changes_requested 必须记录失败分类和原因');
     if (value.status === 'reclaimed' && !nonEmpty(value.reclaimedReason)) fail('REGISTRY_INVALID', 'reclaimed 必须记录主控收回原因');
   }
+  if ('pendingRework' in value && value.pendingRework !== null) {
+    const pending = value.pendingRework;
+    if (!isObject(pending) || !isSafeThreadId(pending.actionId) || pending.nextAttempt !== value.attemptCount + 1 || pending.mode !== 'continue_same_attempt' || !isTimestamp(pending.preparedAt) || !isTimestamp(pending.expiresAt) || Date.parse(pending.expiresAt) <= Date.parse(pending.preparedAt) || value.status !== 'changes_requested') fail('REGISTRY_INVALID', 'pendingRework 结构或生命周期无效');
+  }
   const dispatchFields = ['lastDispatchedAttempt', 'lastDispatchedAt'];
   const presentDispatchFields = dispatchFields.filter((key) => key in value);
   if (presentDispatchFields.length !== 0 && presentDispatchFields.length !== dispatchFields.length) fail('REGISTRY_INVALID', '派发字段必须同时存在');
@@ -1800,7 +1825,7 @@ function validateTask(value, projectRoot) {
     } else {
       if (!isSafeThreadId(value.objectiveId) || (value.replacementOfThreadId !== null && !isSafeThreadId(value.replacementOfThreadId)) || !Number.isInteger(value.replacementOrdinal) || value.replacementOrdinal < 0 || !Number.isInteger(value.objectiveBudgetMinutes) || value.objectiveBudgetMinutes <= 0 || !isTimestamp(value.objectiveCreatedAt)) fail('REGISTRY_INVALID', 'objective identity/budget 无效');
       for (const failure of value.failureHistory) {
-        if (!isObject(failure) || !FAILURE_EVENT_TYPES.includes(failure.type) || !has(failure.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(failure.failureDomain, FAILURE_DOMAINS) || !nonEmpty(failure.attemptedStage) || !nonEmpty(failure.commandSummary) || typeof failure.mechanicalRetryEligible !== 'boolean' || !Number.isInteger(failure.attemptCount) || failure.attemptCount < 1 || !isTimestamp(failure.createdAt) || !Array.isArray(failure.evidence) || failure.evidence.length === 0 || !failure.evidence.every((entry) => isObject(entry) && nonEmpty(entry.id) && nonEmpty(entry.reference))) fail('REGISTRY_INVALID', 'failureHistory 记录无效');
+        if (!isObject(failure) || !FAILURE_EVENT_TYPES.includes(failure.type) || !has(failure.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(failure.failureDomain, FAILURE_DOMAINS) || !nonEmpty(failure.attemptedStage) || !nonEmpty(failure.commandSummary) || typeof failure.mechanicalRetryEligible !== 'boolean' || !Number.isInteger(failure.attemptCount) || failure.attemptCount < 1 || !isTimestamp(failure.createdAt) || !Array.isArray(failure.evidence) || failure.evidence.length === 0 || !failure.evidence.every((entry) => isObject(entry) && nonEmpty(entry.id) && nonEmpty(entry.reference)) || (failure.authority !== undefined && !has(failure.authority, FAILURE_AUTHORITIES)) || (failure.evidenceCommandId !== undefined && failure.evidenceCommandId !== null && !nonEmpty(failure.evidenceCommandId))) fail('REGISTRY_INVALID', 'failureHistory 记录无效');
       }
       for (const diagnostic of value.diagnostics) {
         if (!isObject(diagnostic) || !isSafeThreadId(diagnostic.diagnosticId) || !has(diagnostic.classification, DIAGNOSTIC_CLASSIFICATIONS) || !nonEmpty(diagnostic.summary) || !isTimestamp(diagnostic.recordedAt) || !Array.isArray(diagnostic.evidenceRefs)) fail('REGISTRY_INVALID', 'diagnostic 记录无效');
@@ -2096,7 +2121,7 @@ export async function controllerAssertBusinessReady(input) {
   if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
   const gate = controllerCycleGate(registry, input.controllerThreadId);
   if (!gate.businessAllowed) fail('CONTROLLER_CYCLE_RECONCILE_REQUIRED', `${gate.reason}; 先执行 controller-finalize-cycle 并真实完成返回的 host heartbeat action`);
-  return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, businessAllowed: true, heartbeatState: gate.heartbeatState };
+  return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, businessAllowed: true, heartbeatState: gate.heartbeatState, heartbeatWarning: gate.heartbeatWarning ?? null, heartbeatAction: gate.heartbeatAction ?? null };
 }
 
 function appendHeartbeatActionHistory(state, pending, outcome, detail, recordedAt = new Date().toISOString()) {
@@ -2168,6 +2193,8 @@ export async function controllerConfirmHeartbeatAction(input) {
       notificationStatus: 'not_required',
       actionHistory: appendHeartbeatActionHistory(state, pending, 'confirmed', pending.type === 'finalize_controller_cycle' ? `pending create cleanup=${input.pendingCreateCleanupOutcome}; confirmed automation deleted` : input.observed === true ? 'automation trigger proved create success' : 'host automation action confirmed'),
       retiredAutomationIds,
+      logicalLeaseDueAt: pending.desiredStatus === 'armed' ? pending.dueAt : null,
+      logicalLeaseUpdatedAt: now,
     };
     const cleanupHeartbeatAction = pending.type === 'create_controller_heartbeat' && pending.previousAutomationId !== null
       ? { type: 'delete_retired_automation', actionId: randomUUID().replaceAll('-', ''), automationId: pending.previousAutomationId, generation: pending.previousGeneration, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, onTimeout: 'controller-record-heartbeat-action-failed' }
@@ -2322,7 +2349,7 @@ export async function auditParallelRouting(input = {}) {
     }
     for (const batch of registry.parallelBatches.filter((entry) => !['closed', 'frozen'].includes(entry.status))) {
       const runtime = parallelBatchRuntime(registry, batch);
-      if (runtime.selectedCandidateIds.length === 1 && batch.degradationReceipt === null) violations.push({ projectKey: registry.projectKey, batchId: batch.batchId, directControllerThreadId: batch.controllerThreadId, reason: 'single_candidate_without_degradation_receipt' });
+      if (runtime.fanoutBlockers.includes('degradation_receipt_required')) violations.push({ projectKey: registry.projectKey, batchId: batch.batchId, directControllerThreadId: batch.controllerThreadId, reason: 'single_candidate_without_degradation_receipt' });
       if (runtime.pendingDispatchCandidateIds.length > 0) violations.push({ projectKey: registry.projectKey, batchId: batch.batchId, directControllerThreadId: batch.controllerThreadId, reason: 'incomplete_dispatch_wave' });
     }
   }
@@ -2659,7 +2686,11 @@ export async function controllerQueryDeliverables(input) {
     const objective = task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? objectiveRuntime(registry.tasks, task.objectiveId, Date.parse(registry.updatedAt)) : null;
     tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, model: task.model, thinking: task.thinking, workClass: task.workClass ?? null, parallelProtocolVersion: task.parallelProtocolVersion, parallelBatchId: task.parallelBatchId, parallelCandidateId: task.parallelCandidateId, parallelLane: task.parallelLane, attemptCount: task.attemptCount, lastDispatchedAt: task.lastDispatchedAt, progressEventCreatedAt: task.progressEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, failureEventCreatedAt: task.failureEventCreatedAt ?? null, executionEndedAt: task.executionEndedAt, archivedAt: task.archivedAt, stageProgress: task.stageProgress, observabilityProtocolVersion: task.observabilityProtocolVersion, observabilityReceipts: task.observabilityReceipts, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, integrationProof: task.integrationProof ?? null, objective, failureHistory: task.failureHistory, diagnostics: task.diagnostics, closeout: task.closeout, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
   }
-  return { reportSchemaVersion: 2, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount: tasks.reduce((total, task) => total + task.deliverables.length, 0), tasks };
+  const deliverableCount = tasks.reduce((total, task) => total + task.deliverables.length, 0);
+  const businessDeliverableCount = tasks.filter((task) => implementationTask(task) && task.integrationStatus === 'integrated' && task.integrationProof !== null && task.deliverables.some((entry) => entry.deliveryStatus === 'integrated')).length;
+  const candidateCommitCount = tasks.filter((task) => implementationTask(task) && nonEmpty(task.candidateCommit)).length;
+  const controlReviewPassedCount = tasks.filter((task) => task.taskMode === 'control_only' && task.status === 'integrated').length;
+  return { reportSchemaVersion: 3, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount, businessDeliverableCount, candidateCommitCount, controlReviewPassedCount, tasks };
 }
 
 function escapeHtml(value) {
@@ -2763,6 +2794,7 @@ function deliveryStatusLabel(deliverable, task) {
 
 function taskStatusLabel(task) {
   if (task.status === 'integrated' && implementationTask(task)) return task.integrationProof ? '已集成·Git 已验证' : '台账曾标记已集成·Git 未验证';
+  if (task.status === 'integrated' && task.taskMode === 'control_only') return '控制审查已通过';
   return reportStatusLabel(task.status);
 }
 
@@ -3083,15 +3115,18 @@ function renderDeliveryReport(data) {
   const integrated = data.tasks.filter((task) => task.status === 'integrated' && (!implementationTask(task) || task.integrationProof !== null)).length;
   const unverifiedIntegrated = data.tasks.filter((task) => task.status === 'integrated' && implementationTask(task) && task.integrationProof === null).length;
   const failed = data.tasks.filter((task) => ['blocked', 'reclaimed', 'changes_requested'].includes(task.status)).length;
+  const executiveSummary = data.businessDeliverableCount === 0
+    ? `<div class="warning"><strong>结论：本专题没有可验证的业务交付。</strong> 当前记录包含 ${data.candidateCommitCount} 个实现候选、${data.controlReviewPassedCount} 个控制/审查结果，但没有同时满足“成果包 + 主控接受 + Git 集成证明”的业务成果。控制任务通过不等于产品功能已经交付。</div>`
+    : `<div class="review"><strong>结论：已验证 ${data.businessDeliverableCount} 项业务交付。</strong> 另有 ${data.candidateCommitCount} 个实现候选、${data.controlReviewPassedCount} 个控制/审查结果；候选与控制结论不会冒充主线成果。</div>`;
   const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32;--blue:#315f86;--purple:#73509b}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.translation-note{display:block;margin-top:3px;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty,.diagnostic{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}.diagnostic{background:#edf4fa;border-color:var(--blue)}.gantt{display:grid;gap:8px;margin:12px 0 18px}.gantt-row{display:grid;grid-template-columns:70px minmax(220px,1fr) minmax(280px,auto);gap:10px;align-items:center}.gantt-track{height:16px;position:relative;background:#e5ddd2;border-radius:8px;overflow:hidden}.gantt-bar{position:absolute;top:0;height:100%;background:var(--amber)}.gantt-bar.ok{background:var(--green)}.gantt-bar.failed{background:var(--red)}.comparison-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0 20px}.comparison-card{padding:14px;background:var(--panel);border:1px solid var(--line)}.comparison-row{display:grid;grid-template-columns:72px minmax(120px,1fr) 92px;gap:10px;align-items:center;margin:9px 0}.comparison-row>strong{text-align:right}.comparison-track{display:block;height:12px;background:#e5ddd2;border-radius:8px;overflow:hidden}.comparison-bar{display:block;height:100%;border-radius:8px}.comparison-bar.input{background:var(--purple)}.comparison-bar.output{background:var(--green)}.comparison-bar.active{background:var(--blue)}.comparison-bar.tool{background:var(--amber)}.route-cell{min-width:210px}.route-cell>*{display:block;margin-bottom:3px}.token-cell{min-width:210px}.token-pair{display:grid;gap:9px;margin-bottom:8px}.token-pair span,.human-number{display:block}.token-pair b{display:block;color:var(--muted);font-size:12px}.compact-list{margin:0;padding-left:18px}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid,.comparison-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}.gantt-row{grid-template-columns:48px 1fr}.gantt-row small{grid-column:1/-1}.comparison-row{grid-template-columns:64px minmax(90px,1fr) 84px}th:nth-child(4),td:nth-child(4){min-width:260px}}';
-  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.deliverableCount}</strong><span>历史成果包</span></div><div class="metric"><strong>${integrated} / ${unverifiedIntegrated}</strong><span>已验证集成 / 历史未验证</span></div><div class="metric"><strong>${failed}</strong><span>阻塞 / 收回 / 未通过</span></div></div></header><main><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
+  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.businessDeliverableCount}</strong><span>已验证业务交付</span></div><div class="metric"><strong>${data.candidateCommitCount}</strong><span>实现候选提交</span></div><div class="metric"><strong>${data.controlReviewPassedCount}</strong><span>控制审查通过</span></div></div></header><main><section><h2>一眼结论</h2>${executiveSummary}</section><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
 }
 
 export async function controllerBuildDeliveryReport(input) {
   const data = await addObservability(await controllerQueryDeliverables(input), input);
   const html = renderDeliveryReport(data);
   await atomicWriteText(data.reportPath, html);
-  return { reportPath: data.reportPath, reportFileUri: pathToFileURL(data.reportPath).href, projectKey: data.projectKey, controllerThreadId: data.controllerThreadId, registryUpdatedAt: data.registryUpdatedAt, taskCount: data.taskCount, deliverableCount: data.deliverableCount, observability: data.observability };
+  return { reportPath: data.reportPath, reportFileUri: pathToFileURL(data.reportPath).href, projectKey: data.projectKey, controllerThreadId: data.controllerThreadId, registryUpdatedAt: data.registryUpdatedAt, taskCount: data.taskCount, deliverableCount: data.deliverableCount, businessDeliverableCount: data.businessDeliverableCount, candidateCommitCount: data.candidateCommitCount, controlReviewPassedCount: data.controlReviewPassedCount, observability: data.observability };
 }
 
 export async function controllerIngestContextHealth(input) {
@@ -3251,7 +3286,7 @@ async function readArtifact(filePath, expectedType) {
   if (expectedType === 'task_progress' && value.stageId !== undefined && !nonEmpty(value.stageId)) fail(code, 'progress event stageId 无效');
   if (expectedType === 'task_progress' && value.evidence !== undefined && !Array.isArray(value.evidence)) fail(code, 'progress event evidence 无效');
   if (FAILURE_EVENT_TYPES.includes(expectedType)) {
-    if (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !nonEmpty(value.attemptedStage) || !has(value.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(value.failureDomain, FAILURE_DOMAINS) || !nonEmpty(value.commandSummary) || !Array.isArray(value.evidence) || value.evidence.length === 0 || typeof value.mechanicalRetryEligible !== 'boolean') fail(code, 'failure event 字段无效');
+    if (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !nonEmpty(value.attemptedStage) || !has(value.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(value.failureDomain, FAILURE_DOMAINS) || !nonEmpty(value.commandSummary) || !Array.isArray(value.evidence) || value.evidence.length === 0 || typeof value.mechanicalRetryEligible !== 'boolean' || !has(value.authority ?? 'contract_evidence', FAILURE_AUTHORITIES)) fail(code, 'failure event 字段无效');
   }
   return value;
 }
@@ -3270,13 +3305,18 @@ export async function controllerIngestFailure(input) {
     if (Date.parse(event.createdAt) <= Date.parse(freshnessAnchor)) fail('EVENT_STALE', 'failure event 过期或重复');
     await assertImplementationContractCurrent(task, input.projectRoot);
     assertEventContractMatches(task, event);
-    if (implementationTask(task)) {
+    const authority = event.authority ?? 'contract_evidence';
+    let evidenceCommandId = nonEmpty(event.evidenceCommandId) ? event.evidenceCommandId.trim() : null;
+    if (implementationTask(task) && authority === 'contract_evidence') {
       if (!task.stageGates.some((gate) => gate.id === event.attemptedStage)) fail('STAGE_UNKNOWN', `未登记的 attemptedStage: ${event.attemptedStage}`);
       const knownEvidence = new Set(task.evidenceCommands.map((entry) => entry.id));
-      const unknown = event.evidence.filter((entry) => !knownEvidence.has(entry.id)).map((entry) => entry.id);
-      if (unknown.length > 0) fail('STAGE_EVIDENCE_UNKNOWN', `未登记的 evidence id: ${unknown.join(', ')}`);
+      if (evidenceCommandId === null && event.authority === undefined && event.evidence.length === 1 && knownEvidence.has(event.evidence[0].id)) evidenceCommandId = event.evidence[0].id;
+      if (evidenceCommandId === null || !knownEvidence.has(evidenceCommandId)) fail('FAILURE_COMMAND_NOT_CONTRACT_BOUND', '权威失败事件必须绑定合同 evidenceCommandId');
     }
-    const failureRecord = { type: expectedType, attemptedStage: event.attemptedStage, failureClass: event.failureClass, failureDomain: event.failureDomain, commandSummary: event.commandSummary.trim(), evidence: normalizeEvidenceReferences(event.evidence), mechanicalRetryEligible: event.mechanicalRetryEligible, attemptCount: task.attemptCount, createdAt: event.createdAt };
+    const failureRecord = { type: expectedType, authority, evidenceCommandId, attemptedStage: event.attemptedStage, failureClass: event.failureClass, failureDomain: event.failureDomain, commandSummary: event.commandSummary.trim(), evidence: normalizeEvidenceReferences(event.evidence), mechanicalRetryEligible: event.mechanicalRetryEligible, attemptCount: task.attemptCount, createdAt: event.createdAt };
+    if (authority === 'non_authoritative_diagnostic') {
+      return appendObservabilityReceipt({ ...task, failureHistory: [...task.failureHistory, failureRecord], updatedAt: new Date().toISOString() }, 'failure_diagnostic_ingested', event.createdAt);
+    }
     const reason = `${event.failureDomain}/${event.failureClass}: ${event.commandSummary.trim()}`;
     return appendObservabilityReceipt({ ...task, failureHistory: [...task.failureHistory, failureRecord], status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: event.failureClass, changesRequestedReason: reason, reviewVerdict: 'changes_requested', failureEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, updatedAt: new Date().toISOString() }, 'failure_ingested', event.createdAt);
   }});
@@ -3537,7 +3577,7 @@ export async function controllerScanPendingEvents(input) {
       if (type === 'task_progress' && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
       if (FAILURE_EVENT_TYPES.includes(type) && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
       if (type === 'notification_failed' && task.notificationStatus !== 'pending') continue;
-      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...contractSummary(task), ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : type === 'task_progress' ? { attemptCount: artifact.attemptCount, summary: artifact.summary, stageId: artifact.stageId ?? null, evidence: artifact.evidence ?? [] } : FAILURE_EVENT_TYPES.includes(type) ? { attemptCount: artifact.attemptCount, attemptedStage: artifact.attemptedStage, failureClass: artifact.failureClass, failureDomain: artifact.failureDomain, commandSummary: artifact.commandSummary, evidence: artifact.evidence, mechanicalRetryEligible: artifact.mechanicalRetryEligible } : { reason: artifact.reason }) });
+      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...contractSummary(task), ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : type === 'task_progress' ? { attemptCount: artifact.attemptCount, summary: artifact.summary, stageId: artifact.stageId ?? null, evidence: artifact.evidence ?? [] } : FAILURE_EVENT_TYPES.includes(type) ? { attemptCount: artifact.attemptCount, attemptedStage: artifact.attemptedStage, failureClass: artifact.failureClass, failureDomain: artifact.failureDomain, commandSummary: artifact.commandSummary, evidenceCommandId: artifact.evidenceCommandId ?? null, authority: artifact.authority ?? 'contract_evidence', evidence: artifact.evidence, mechanicalRetryEligible: artifact.mechanicalRetryEligible } : { reason: artifact.reason }) });
     }
   }
   pendingEvents.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.eventPath.localeCompare(right.eventPath));
@@ -3550,6 +3590,8 @@ export async function controllerScanPendingEvents(input) {
   });
   const overdueTasks = activeTasks.filter((task) => Date.parse(task.heartbeatDueAt) <= now);
   const stalledActiveTasks = activeTaskRecords.map((task) => stalledActiveTask(task, now)).filter(Boolean);
+  const zombieAttempts = directTasks.filter((task) => task.status === 'executing' && Number.isInteger(task.lastDispatchedAttempt) && task.attemptCount > task.lastDispatchedAttempt).map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, attemptCount: task.attemptCount, lastDispatchedAttempt: task.lastDispatchedAttempt, recoveryCommand: 'controller-recover-undispatched-attempt' }));
+  const preparedReworks = directTasks.filter((task) => task.pendingRework !== null).map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, ...task.pendingRework }));
   const reviewQueue = directTasks.filter((task) => task.status === 'awaiting_review' || task.status === 'accepted').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, candidateCommit: task.candidateCommit, notificationStatus: task.notificationStatus, ...contractSummary(task) }));
   const routingQueue = directTasks.filter((task) => task.status === 'changes_requested').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, executionStatus: task.executionStatus, nextOwner: task.nextOwner, failureClass: task.failureClass }));
   const objectiveIds = [...new Set(directTasks.filter((task) => task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION).map((task) => task.objectiveId))];
@@ -3582,6 +3624,8 @@ export async function controllerScanPendingEvents(input) {
     activeTasks,
     overdueTasks,
     stalledActiveTasks,
+    zombieAttempts,
+    preparedReworks,
     objectiveFuses,
     incidentQueue,
     contextHealth,
@@ -3600,7 +3644,7 @@ export async function controllerScanPendingEvents(input) {
     threadActions,
     reportNeedsRefresh,
     deliveryReportPath: deliveryReportPath(paths.home, paths.projectKey, input.controllerThreadId),
-    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0 || parallel.fanoutRequired || parallel.singleDispatchReady || parallel.pendingDispatches.length > 0,
+    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || zombieAttempts.length > 0 || preparedReworks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0 || parallel.fanoutRequired || parallel.singleDispatchReady || parallel.pendingDispatches.length > 0,
     shouldKeepHeartbeat: queues.shouldKeepHeartbeat,
   };
 }
@@ -3638,13 +3682,45 @@ export async function controllerMarkChangesRequested(input) {
 }
 
 export async function controllerDispatchRework(input) {
-  return mutateController({ ...input, mutate: (task, registry) => {
+  const result = await mutateController({ ...input, mutate: (task, registry) => {
     assertControllerCycleBusinessReady(registry, input.controllerThreadId);
     if (task.status !== 'changes_requested') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 重新派发`);
     if (task.failureClass !== 'mechanical') fail('REWORK_REQUIRES_CONTROLLER', `${task.failureClass} 失败不得继续交给原 worker；必须由主控收回并重新分类`);
     if ((task.attemptCount ?? 1) >= 2) fail('REWORK_LIMIT_REACHED', '同一可见任务只允许一次机械返工；必须由主控收回');
+    if (task.pendingRework !== null) fail('REWORK_ALREADY_PREPARED', '返工消息已准备；必须确认真实送达或取消，不能重复增加 attempt');
     const now = new Date().toISOString();
-    return appendObservabilityReceipt({ ...task, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: (task.attemptCount ?? 1) + 1, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'rework_prepared', now);
+    const pendingRework = { actionId: `rework_${randomUUID().replaceAll('-', '')}`, nextAttempt: task.attemptCount + 1, mode: 'continue_same_attempt', preparedAt: now, expiresAt: new Date(Date.parse(now) + CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS).toISOString() };
+    return appendObservabilityReceipt({ ...task, pendingRework, updatedAt: now }, 'rework_prepared', now);
+  }});
+  return { ...result, hostAction: { type: 'send_thread_message', actionId: result.pendingRework.actionId, targetThreadId: result.threadId, deliveryMode: 'start_next_turn_only', receiptRequired: true, messageText: `主控已批准一次机械返工。保持原合同与验收标准不变，只修复已记录的机械问题：${result.changesRequestedReason}`, onSuccess: 'controller-confirm-rework-dispatched --action-id <id> --host-receipt <receipt>', onFailure: 'controller-cancel-prepared-rework --reason <host-error>' } };
+}
+
+export async function controllerConfirmReworkDispatched(input) {
+  if (!isSafeThreadId(input.actionId) || !nonEmpty(input.hostReceipt)) fail('CLI_INVALID_ARGUMENTS', '确认返工必须提供 actionId 和真实宿主回执');
+  return mutateController({ ...input, heartbeatReason: 'dispatch', mutate: (task) => {
+    const pending = task.pendingRework;
+    if (pending === null || pending.actionId !== input.actionId) fail('REWORK_ACTION_STALE', '返工准备动作不存在或已被替换');
+    if (task.status !== 'changes_requested' || task.failureClass !== 'mechanical') fail('TASK_TRANSITION_INVALID', '返工确认时任务已不再处于可返工状态');
+    const now = new Date().toISOString();
+    return appendObservabilityReceipt({ ...task, pendingRework: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: pending.nextAttempt, lastDispatchedAttempt: pending.nextAttempt, lastDispatchedAt: now, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'rework_dispatched', now);
+  }});
+}
+
+export async function controllerCancelPreparedRework(input) {
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', '取消返工准备必须记录原因');
+  return mutateController({ ...input, mutate: (task) => {
+    if (task.pendingRework === null) fail('REWORK_NOT_PREPARED', '当前没有待确认的返工准备动作');
+    const now = new Date().toISOString();
+    return appendObservabilityReceipt({ ...task, pendingRework: null, updatedAt: now }, 'rework_cancelled', now);
+  }});
+}
+
+export async function controllerRecoverUndispatchedAttempt(input) {
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', '恢复未派发轮次必须记录原因');
+  return mutateController({ ...input, mutate: (task) => {
+    if (task.status !== 'executing' || !Number.isInteger(task.lastDispatchedAttempt) || task.attemptCount <= task.lastDispatchedAttempt) fail('ZOMBIE_ATTEMPT_NOT_FOUND', '当前任务不存在 attemptCount 超前于真实派发回执的 zombie 轮次');
+    const now = new Date().toISOString();
+    return appendObservabilityReceipt({ ...task, pendingRework: null, status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', attemptCount: task.lastDispatchedAttempt, failureClass: task.failureClass ?? 'mechanical', changesRequestedReason: task.changesRequestedReason ?? input.reason.trim(), reviewVerdict: 'changes_requested', executionEndedAt: now, updatedAt: now }, 'rework_cancelled', now);
   }});
 }
 
@@ -3866,14 +3942,14 @@ export async function createFailureEvent(input) {
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
   const evidence = normalizeEvidenceReferences(input.evidence ?? []);
   if (evidence.length === 0) fail('FAILURE_EVIDENCE_REQUIRED', 'failure event 必须提供至少一条证据引用');
+  let authority = 'contract_evidence';
   if (implementationTask(result.task)) {
     if (!result.task.stageGates.some((gate) => gate.id === input.attemptedStage.trim())) fail('STAGE_UNKNOWN', `未登记的 attemptedStage: ${input.attemptedStage}`);
     const knownEvidence = new Set(result.task.evidenceCommands.map((entry) => entry.id));
-    const unknown = evidence.filter((entry) => !knownEvidence.has(entry.id)).map((entry) => entry.id);
-    if (unknown.length > 0) fail('STAGE_EVIDENCE_UNKNOWN', `未登记的 evidence id: ${unknown.join(', ')}`);
+    authority = nonEmpty(input.evidenceCommandId) && knownEvidence.has(input.evidenceCommandId.trim()) ? 'contract_evidence' : 'non_authoritative_diagnostic';
   }
   const prefix = input.eventType === 'task_failed' ? 'task-failed' : 'task-blocked';
-  return writeChildArtifact(result.paths, result.task.threadId, prefix, { schemaVersion: 1, type: input.eventType, projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, attemptedStage: input.attemptedStage.trim(), failureClass: input.failureClass, failureDomain: input.failureDomain, commandSummary: input.commandSummary.trim(), evidence, mechanicalRetryEligible: input.mechanicalRetryEligible, ...contractSummary(result.task), createdAt: new Date().toISOString() });
+  return writeChildArtifact(result.paths, result.task.threadId, prefix, { schemaVersion: 1, type: input.eventType, projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, attemptedStage: input.attemptedStage.trim(), failureClass: input.failureClass, failureDomain: input.failureDomain, commandSummary: input.commandSummary.trim(), evidenceCommandId: nonEmpty(input.evidenceCommandId) ? input.evidenceCommandId.trim() : null, authority, evidence, mechanicalRetryEligible: input.mechanicalRetryEligible, ...contractSummary(result.task), createdAt: new Date().toISOString() });
 }
 
 export async function createProgressEvent(input) {
@@ -3958,7 +4034,7 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.13.2',
+    'codex-task-control v0.14.0',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
@@ -3968,7 +4044,7 @@ function helpText() {
     '  controller-close-parallel-batch --project-root <root> --controller <id> --batch-id <id>',
     '  audit-parallel-routing [--codex-home <CODEX_HOME>]',
     '  progress --self <thread> --summary <text> [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
-    '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--evidence-ref <id=reference> ...]',
+    '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--evidence-command-id <contract-id>] [--evidence-ref <id=reference> ...]',
     '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json>',
     '  controller-query-deliverables --project-root <root> --controller <id>',
     '  controller-build-delivery-report --project-root <root> --controller <id> [--observability lean|diagnostic] [--otel-jsonl <file-or-dir>] [--desktop-log <file>]',
@@ -3982,6 +4058,10 @@ function helpText() {
     '  controller-prepare-message --project-root <root> --controller <id> --thread <id> --kind follow_up|clarification|evidence_request|notification|stop|cancel --delivery-mode queue|interrupt --target-turn-state running|idle|unknown --message <text> [--message-id <id>] [--interrupt-authority user_explicit|controller_safety]',
     '  controller-release-message --project-root <root> --controller <id> --message-id <id> --target-turn-state running|idle|unknown',
     '  controller-record-message-delivery --project-root <root> --controller <id> --message-id <id> --action-id <id> --outcome delivered|failed [--receipt <host-receipt>] [--reason <host-error>]',
+    '  controller-dispatch-rework ...  # 只准备返工消息，不增加 attempt',
+    '  controller-confirm-rework-dispatched ... --action-id <id> --host-receipt <receipt>',
+    '  controller-cancel-prepared-rework ... --reason <text>',
+    '  controller-recover-undispatched-attempt ... --reason <text>',
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
     'implementation 成果包按 attempt 追加保存；lean HTML 只读现有台账，diagnostic 才按需读取 rollout 与显式提供的 OTel/Desktop 日志；两者都不维持 heartbeat。',
@@ -4040,7 +4120,7 @@ export async function runCli(args = process.argv.slice(2)) {
     const selfThreadId = required(args, '--self');
     const eventType = required(args, '--event-type');
     const attemptedStage = required(args, '--attempted-stage');
-    const eventPath = await createFailureEvent({ ...storage, selfThreadId, eventType, attemptedStage, failureClass: required(args, '--failure-class'), failureDomain: required(args, '--failure-domain'), commandSummary: required(args, '--command-summary'), mechanicalRetryEligible: requiredBoolean(args, '--mechanical-retry-eligible'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')) });
+    const eventPath = await createFailureEvent({ ...storage, selfThreadId, eventType, attemptedStage, failureClass: required(args, '--failure-class'), failureDomain: required(args, '--failure-domain'), commandSummary: required(args, '--command-summary'), evidenceCommandId: option(args, '--evidence-command-id'), mechanicalRetryEligible: requiredBoolean(args, '--mechanical-retry-eligible'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')) });
     const task = (await querySelf({ ...storage, selfThreadId })).task;
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildFailureNotification(task, eventType, attemptedStage), notificationRequired: true, ...contractSummary(task) };
   }
@@ -4071,6 +4151,9 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-mark-notification-sent') result = await controllerMarkNotificationSent({ ...controllerInput(args) });
   else if (command === 'mark-changes-requested') result = await controllerMarkChangesRequested({ ...controllerInput(args), failureClass: required(args, '--failure-class'), reason: required(args, '--reason') });
   else if (command === 'controller-dispatch-rework') result = await controllerDispatchRework({ ...controllerInput(args) });
+  else if (command === 'controller-confirm-rework-dispatched') result = await controllerConfirmReworkDispatched({ ...controllerInput(args), actionId: required(args, '--action-id'), hostReceipt: required(args, '--host-receipt') });
+  else if (command === 'controller-cancel-prepared-rework') result = await controllerCancelPreparedRework({ ...controllerInput(args), reason: required(args, '--reason') });
+  else if (command === 'controller-recover-undispatched-attempt') result = await controllerRecoverUndispatchedAttempt({ ...controllerInput(args), reason: required(args, '--reason') });
   else if (command === 'controller-reclaim') result = await controllerReclaimTask({ ...controllerInput(args), reason: required(args, '--reason'), userSummary: required(args, '--user-summary') });
   else if (command === 'mark-blocked') result = await controllerMarkBlocked({ ...controllerInput(args), reason: required(args, '--reason'), userSummary: required(args, '--user-summary'), blockerSource: required(args, '--blocker-source'), diagnosticId: option(args, '--diagnostic-id') });
   else if (command === 'controller-record-diagnostic') result = await controllerRecordDiagnostic({ ...controllerInput(args), diagnosticId: required(args, '--diagnostic-id'), classification: required(args, '--classification'), summary: required(args, '--summary'), playerImpact: option(args, '--player-impact'), normalLifecycleReproduction: option(args, '--normal-lifecycle-reproduction'), growthTrend: option(args, '--growth-trend'), whyBlocking: option(args, '--why-blocking'), evidenceRefs: parseEvidenceReferences(options(args, '--evidence-ref')) });
