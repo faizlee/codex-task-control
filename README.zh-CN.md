@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.14.0 是一次减法重构：业务生命周期、宿主动作和 heartbeat 不再互相冒充。返工只有收到真实发送回执才进入下一轮；合同外失败只做诊断；进度只续逻辑租约；HTML 先给出可验证业务交付结论。全部状态仍保存在本地，不调用模型 provider。
+> v0.15.0 改为稳定优先 watchdog：连续两轮没有业务变化就停止自动续期；heartbeat 删除只自动补偿一次，再失败便要求人工清理和显式恢复。任何 heartbeat 故障都不阻塞业务生命周期，且全程不调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,12 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.14.0 已经解决什么
+## v0.15.0 已经解决什么
+
+- 每次有效 watchdog 扫描都会计算业务状态指纹。连续两轮没有任务、事件、审查、消息或并发批次变化时，自动续期熔断并只通知一次。
+- 已触发的 `COUNT=1` automation 会被视为已经消费。真实 progress 会清零无进展计数并准备新的 one-shot，不会误把已经触发的物理 watchdog 当成仍可续租。
+- heartbeat 删除只允许一次自动补偿。第二次失败返回 `manual_heartbeat_cleanup_required`，不再生成自动重试，同时业务命令仍保持可用。
+- 新增 `controller-resume-watchdog --reason ...`。只有旧 automation 已确认清理后才能显式恢复，并持久记录人工恢复原因。
 
 - `controller-dispatch-rework` 现在只准备宿主消息，不增加 attempt、不把任务标成运行中。只有 `controller-confirm-rework-dispatched` 收到真实宿主回执后才原子进入下一轮；发送失败可以取消准备动作。
 - 扫描会直接列出 `zombieAttempts` 与 `preparedReworks`。历史上 attempt 已增加但没有真实派发回执的任务，可以用 `controller-recover-undispatched-attempt` 恢复，不受 heartbeat 故障阻塞。
@@ -73,8 +78,8 @@
 - heartbeat 改为两阶段提交：本地 prepare、App 创建新 automation、确认并切换台账、最后删除旧 automation；App 失败时不会提前推进 confirmed generation。
 - 每轮主控收口统一走一个入口。终态且已无业务队列时，如果仍有未确认的新 heartbeat create，会返回有界的 `finalize_controller_cycle`：按 action ID/generation 比较删除未确认 create，并删除最后一个 confirmed automation。
 - 已超时的 pending heartbeat action 会返回有界补偿动作，但不再阻塞失败入账、收回、恢复或无关登记；宿主清理债务与业务生命周期分开审计。
-- automation 强制 `COUNT=1`；stale、错误 ID、过期、重复触发或 RRULE 错配只返回空队列的 `delete_stale_automation`，不再静默空转。
-- 持久记录最后成功 generation、automation ID、pending action、触发/stale/删除失败次数、熔断证据与一次性通知状态。
+- automation 强制 `COUNT=1`；第一次 stale、错误 ID、过期、重复触发或 RRULE 错配返回空队列的 `delete_stale_automation`，第二次异常转为人工清理，不再自动循环。
+- 持久记录最后成功 generation、automation ID、pending action、触发/stale/删除失败/无进展次数、业务指纹、熔断证据、人工恢复原因与一次性通知状态。
 - 新登记的 implementation 必须提交带 schema 版本的成果包，记录 candidate commit、用户可见摘要、实际改变、未完成项、测试/前后数值和带类型的 artifact 引用。
 - 视觉任务完成前校验 presentation stage、必需 artifact 类型/里程碑、任务归属、合同允许根目录、文件存在、非零尺寸、SHA-256 去重以及 PNG/JPEG/GIF 可解码尺寸。
 - 每个 attempt 的成果历史只追加不覆盖；reclaimed、blocked、changes_requested 证据明确显示为失败，并严格区分候选、已接受未集成、已集成。
@@ -90,14 +95,14 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.14.0 不做什么
+## v0.15.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.14.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.15.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。Skill 会返回有界清理选择器并保持业务恢复路径开放；彻底消除旧 automation 唤醒仍需要宿主级 compare-and-delete/defer hook。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.15.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
 - 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
 - 当前只对 Windows 项目路径做了完整验证。
 

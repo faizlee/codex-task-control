@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.14.0 preview. This subtraction refactor separates business lifecycle truth from host actions and heartbeat automation: rework waits for a real host receipt, contract-external failures stay diagnostic, progress renews a logical lease, and HTML starts with verified-delivery truth. It makes zero model-provider calls.
+> Windows-first v0.15.0 preview. Stability-first watchdogs now stop automatic rearm after two unchanged cycles, retry heartbeat deletion only once, and require explicit manual cleanup/resume after a fuse. Business lifecycle recovery remains available throughout, and the tool makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,12 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.14.0 does
+## What v0.15.0 does
+
+- Fingerprints business lifecycle state on each valid watchdog cycle. Two consecutive cycles without a task, event, review, message, or parallel-batch change fuse automatic rearm and notify once.
+- Treats a fired `COUNT=1` automation as consumed. Real progress resets the no-progress counter and prepares a fresh one-shot instead of incorrectly extending an already-fired physical watchdog.
+- Allows one automatic heartbeat-delete compensation. A second failure becomes `manual_heartbeat_cleanup_required`; it never creates another automatic retry, and business commands remain available.
+- Adds `controller-resume-watchdog --reason ...`. Resume requires the old automation to be confirmed cleaned and records the manual recovery reason before a new one-shot can be created.
 
 - Prepares rework without incrementing the attempt. `controller-confirm-rework-dispatched` advances lifecycle only after a real host delivery receipt; cancellation and zombie-attempt recovery remain available independently of heartbeat health.
 - Requires implementation failures to bind a controller-fixed evidence command before they become lifecycle-authoritative. Ad-hoc command failures remain non-authoritative diagnostics.
@@ -82,8 +87,8 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Finalizes each controller cycle through one entry point. A terminal/quiescent controller with an unconfirmed replacement create receives a bounded `finalize_controller_cycle` action that compare-deletes that pending create and deletes the last confirmed automation.
 - Returns bounded compensation for expired heartbeat actions without letting host cleanup block failure ingestion, reclaim, recovery, or unrelated registration. Partial parallel send waves remain fail-closed.
 - Uses adaptive `COUNT=1` cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval.
-- Turns stale, wrong-ID, expired, repeated, or misconfigured heartbeat invocations into an empty-queue `delete_stale_automation` path instead of a silent infinite loop.
-- Persists last successful generation, automation ID, pending action, trigger/stale/delete-failure counts, fuse evidence, and one-time notification state.
+- Turns the first stale, wrong-ID, expired, repeated, or misconfigured heartbeat invocation into an empty-queue `delete_stale_automation` path; a repeated failure becomes manual-only instead of another automatic loop.
+- Persists last successful generation, automation ID, pending action, trigger/stale/delete-failure/no-progress counts, business fingerprint, fuse evidence, manual-resume reason, and one-time notification state.
 - Requires schema-versioned result manifests for newly registered implementation tasks. They capture the candidate commit, user-visible outcome, actual changes, incomplete items, readable tests/metrics, and typed artifact references.
 - Validates visual presentation artifacts before completion: required stage/type/milestone, ownership, allowlisted roots, file existence, non-zero size, SHA-256 uniqueness, and decodable PNG/JPEG/GIF dimensions.
 - Appends every attempt to immutable deliverable history, keeps rejected/reclaimed/blocked evidence visibly failed, and distinguishes candidate, accepted-not-integrated, and integrated outcomes.
@@ -98,14 +103,14 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.14.0 does not do
+## What v0.15.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.14.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.15.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
-- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. The skill now blocks later controlled business actions and returns bounded cleanup selectors, but a host-native compare-and-delete/defer hook remains the complete fix.
+- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.15.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
@@ -127,7 +132,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.14.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.15.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh

@@ -41,9 +41,11 @@ export const HEARTBEAT_STATUSES = Object.freeze(['armed', 'cancelled']);
 export const HEARTBEAT_REASONS = Object.freeze(['dispatch', 'progress', 'completion', 'reconcile']);
 export const HEARTBEAT_ACTION_TYPES = Object.freeze(['create_controller_heartbeat', 'delete_controller_heartbeat', 'finalize_controller_cycle']);
 export const HEARTBEAT_NOTIFICATION_STATUSES = Object.freeze(['not_required', 'pending', 'sent', 'failed']);
-export const HEARTBEAT_PROTOCOL_VERSION = 2;
+export const HEARTBEAT_PROTOCOL_VERSION = 3;
 export const HEARTBEAT_ACTION_TIMEOUT_MS = 30 * 1000;
-export const HEARTBEAT_STALE_LIMIT = 3;
+export const HEARTBEAT_STALE_LIMIT = 2;
+export const HEARTBEAT_DELETE_FAILURE_LIMIT = 2;
+export const HEARTBEAT_NO_PROGRESS_LIMIT = 2;
 export const HEARTBEAT_MAX_OCCURRENCES = 1;
 export const CONTROLLER_MESSAGE_PROTOCOL_VERSION = 1;
 export const CONTROLLER_MESSAGE_KINDS = Object.freeze(['follow_up', 'clarification', 'evidence_request', 'notification', 'stop', 'cancel']);
@@ -1366,20 +1368,23 @@ function controllerWorkQueues(tasks, controllerThreadId) {
 function controllerCycleGate(registry, controllerThreadId, now = Date.now()) {
   const taskQueues = controllerWorkQueues(registry.tasks, controllerThreadId);
   const parallel = controllerParallelRuntime(registry, controllerThreadId);
-  const queues = { ...taskQueues, parallel, shouldKeepHeartbeat: taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat };
   const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId) ?? null;
   const state = found === null ? null : heartbeatEvidenceDefaults(found);
+  const watchdogDisabled = state?.disabledAt !== null && state?.disabledAt !== undefined;
+  const desiredHeartbeat = taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat;
+  const queues = { ...taskQueues, parallel, desiredHeartbeat, shouldKeepHeartbeat: desiredHeartbeat && !watchdogDisabled };
   if (state !== null && state.pendingAction !== null) {
     const expired = now > Date.parse(state.pendingAction.expiresAt);
     const heartbeatAction = expired
       ? { type: 'compensate_timed_out_heartbeat_action', actionId: state.pendingAction.actionId, automationId: state.pendingAction.previousAutomationId, generation: state.pendingAction.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, command: 'controller-record-heartbeat-action-failed --reason host_timeout' }
       : heartbeatActionForPending(state, state.pendingAction);
     if (parallel.pendingDispatches.length > 0) return { businessAllowed: false, reason: 'parallel_dispatch_wave_incomplete', queues, heartbeatState: state, heartbeatAction };
-    return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction, heartbeatWarning: expired ? 'pending_heartbeat_action_timed_out' : 'pending_heartbeat_action_unconfirmed' };
+    return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction, heartbeatWarning: state.pendingAction.manualOnly === true ? 'watchdog_manual_cleanup_required' : expired ? 'pending_heartbeat_action_timed_out' : 'pending_heartbeat_action_unconfirmed' };
   }
   if (parallel.pendingDispatches.length > 0) return { businessAllowed: false, reason: 'parallel_dispatch_wave_incomplete', queues, heartbeatState: state, heartbeatAction: null };
   const undispatchedBootstrapOnly = state === null && queues.activeTasks.length === 0 && queues.cleanupTasks.length === 0 && queues.queuedTasks.length === 0 && queues.routingTasks.length > 0;
   if (undispatchedBootstrapOnly) return { businessAllowed: true, reason: null, queues, heartbeatState: null, heartbeatAction: null };
+  if (watchdogDisabled) return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: state.status === 'armed' && isSafeThreadId(state.automationId) ? { type: 'controller_finalize_cycle', automationId: state.automationId, generation: state.generation, command: 'controller-finalize-cycle' } : null, heartbeatWarning: 'watchdog_fused' };
   if (queues.shouldKeepHeartbeat && (state === null || state.status !== 'armed' || !isSafeThreadId(state.automationId))) return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', command: 'controller-finalize-cycle' }, heartbeatWarning: 'confirmed_heartbeat_missing' };
   if (!queues.shouldKeepHeartbeat && state?.status === 'armed' && isSafeThreadId(state.automationId)) return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: { type: 'controller_finalize_cycle', automationId: state.automationId, generation: state.generation, command: 'controller-finalize-cycle' }, heartbeatWarning: 'terminal_heartbeat_delete_required' };
   return { businessAllowed: true, reason: null, queues, heartbeatState: state, heartbeatAction: null };
@@ -1402,8 +1407,17 @@ function heartbeatEvidenceDefaults(state) {
   const defaults = {
     logicalLeaseDueAt: state.status === 'armed' ? state.dueAt : null,
     logicalLeaseUpdatedAt: state.updatedAt,
+    consecutiveNoProgressCycles: 0,
+    lastCycleFingerprint: null,
+    lastCycleReceiptKey: null,
+    lastMeaningfulProgressAt: null,
+    noProgressFuseCount: 0,
+    manualResumeCount: 0,
+    lastManualResumeAt: null,
+    lastManualResumeReason: null,
   };
   if (state.protocolVersion === HEARTBEAT_PROTOCOL_VERSION) return { ...defaults, ...state };
+  if (state.protocolVersion === 2) return { ...defaults, ...state, protocolVersion: HEARTBEAT_PROTOCOL_VERSION };
   return {
     ...state,
     protocolVersion: HEARTBEAT_PROTOCOL_VERSION,
@@ -1440,6 +1454,9 @@ function heartbeatDesiredState(controllerThreadId, generation, queues, reason, t
 }
 
 function heartbeatActionForPending(state, pendingAction) {
+  if (pendingAction.manualOnly === true) {
+    return { type: 'manual_heartbeat_cleanup_required', controllerThreadId: state.controllerThreadId, actionId: pendingAction.actionId, automationId: pendingAction.previousAutomationId, generation: pendingAction.generation, automaticRetry: false, reason: state.disableReason ?? 'automatic heartbeat cleanup fused', onSuccess: pendingAction.type === 'finalize_controller_cycle' ? 'controller-confirm-heartbeat-action --pending-create-cleanup-outcome deleted|not_found' : 'controller-confirm-heartbeat-action' };
+  }
   if (pendingAction.type === 'finalize_controller_cycle') {
     const hostActions = [
       { type: 'compare_and_delete_pending_create', actionId: pendingAction.supersededCreateActionId, generation: pendingAction.supersededCreateGeneration, requiresActionIdMatch: true },
@@ -1498,7 +1515,20 @@ function rearmControllerHeartbeatInRegistry(registry, controllerThreadId, reason
   const parallel = controllerParallelRuntime(registry, controllerThreadId);
   const queues = { ...taskQueues, parallel, shouldKeepHeartbeat: taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat };
   const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === controllerThreadId);
-  const base = found ? heartbeatEvidenceDefaults(found) : heartbeatEvidenceDefaults({ controllerThreadId, generation: 0, status: 'cancelled', dueAt: null, intervalMs: null, reason, triggerTaskThreadId: null, updatedAt: now.toISOString() });
+  let base = found ? heartbeatEvidenceDefaults(found) : heartbeatEvidenceDefaults({ controllerThreadId, generation: 0, status: 'cancelled', dueAt: null, intervalMs: null, reason, triggerTaskThreadId: null, updatedAt: now.toISOString() });
+  const meaningfulLifecycleChange = ['dispatch', 'progress', 'completion'].includes(reason);
+  if (meaningfulLifecycleChange) {
+    base = {
+      ...base,
+      consecutiveNoProgressCycles: 0,
+      lastCycleFingerprint: null,
+      lastCycleReceiptKey: null,
+      lastMeaningfulProgressAt: now.toISOString(),
+    };
+  }
+  if (base.disabledAt !== null) {
+    queues.shouldKeepHeartbeat = false;
+  }
   const desired = heartbeatDesiredState(controllerThreadId, base.generation + 1, queues, reason, triggerTaskThreadId, now);
   if (base.pendingAction?.type === 'create_controller_heartbeat' && desired.status === 'cancelled') {
     const pendingAction = pendingCycleFinalizationAction(base, base.pendingAction, desired, now);
@@ -1509,7 +1539,12 @@ function rearmControllerHeartbeatInRegistry(registry, controllerThreadId, reason
   if (base.pendingAction !== null) {
     return { registry, state: base, pendingState: { ...base.pendingAction }, heartbeatAction: heartbeatActionForPending(base, base.pendingAction), reusedPendingAction: true };
   }
-  if (reason === 'progress' && base.status === 'armed' && desired.status === 'armed' && isSafeThreadId(base.automationId) && isTimestamp(base.dueAt) && now.getTime() < Date.parse(base.dueAt)) {
+  if (desired.status === 'cancelled' && base.status === 'cancelled' && base.automationId === null) {
+    const state = { ...base, reason, triggerTaskThreadId, logicalLeaseDueAt: null, logicalLeaseUpdatedAt: now.toISOString(), updatedAt: now.toISOString() };
+    const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
+    return { registry: { ...registry, controllerHeartbeats, updatedAt: now.toISOString() }, state, pendingState: desired, heartbeatAction: null, reusedPendingAction: false };
+  }
+  if (reason === 'progress' && base.status === 'armed' && desired.status === 'armed' && base.observedTriggerCount === 0 && isSafeThreadId(base.automationId) && isTimestamp(base.dueAt) && now.getTime() < Date.parse(base.dueAt)) {
     const state = { ...base, reason, triggerTaskThreadId, logicalLeaseDueAt: desired.dueAt, logicalLeaseUpdatedAt: now.toISOString(), updatedAt: now.toISOString() };
     const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
     return { registry: { ...registry, controllerHeartbeats, updatedAt: now.toISOString() }, state, pendingState: desired, heartbeatAction: null, reusedPendingAction: true, logicalLeaseRenewed: true };
@@ -1585,7 +1620,7 @@ function validateControllerMessage(value, tasks, knownControllers) {
 function validatePendingHeartbeatAction(value, state) {
   if (!isObject(value)) fail('REGISTRY_INVALID', 'pending heartbeat action 必须是对象');
   const required = ['actionId', 'type', 'generation', 'previousGeneration', 'previousAutomationId', 'dueAt', 'intervalMs', 'desiredStatus', 'reason', 'triggerTaskThreadId', 'preparedAt', 'expiresAt', 'maxOccurrences'];
-  if (!required.every((key) => key in value) || !isSafeThreadId(value.actionId) || !has(value.type, HEARTBEAT_ACTION_TYPES) || !Number.isInteger(value.generation) || value.generation !== state.generation + 1 || value.previousGeneration !== state.generation || (value.previousAutomationId !== null && !isSafeThreadId(value.previousAutomationId)) || !has(value.desiredStatus, HEARTBEAT_STATUSES) || !has(value.reason, HEARTBEAT_REASONS) || !isTimestamp(value.preparedAt) || !isTimestamp(value.expiresAt) || value.maxOccurrences !== HEARTBEAT_MAX_OCCURRENCES) fail('REGISTRY_INVALID', 'pending heartbeat action 字段无效');
+  if (!required.every((key) => key in value) || !isSafeThreadId(value.actionId) || !has(value.type, HEARTBEAT_ACTION_TYPES) || !Number.isInteger(value.generation) || value.generation !== state.generation + 1 || value.previousGeneration !== state.generation || (value.previousAutomationId !== null && !isSafeThreadId(value.previousAutomationId)) || !has(value.desiredStatus, HEARTBEAT_STATUSES) || !has(value.reason, HEARTBEAT_REASONS) || !isTimestamp(value.preparedAt) || !isTimestamp(value.expiresAt) || value.maxOccurrences !== HEARTBEAT_MAX_OCCURRENCES || (value.manualOnly !== undefined && typeof value.manualOnly !== 'boolean')) fail('REGISTRY_INVALID', 'pending heartbeat action 字段无效');
   if (value.triggerTaskThreadId !== null) assertSafeThreadId(value.triggerTaskThreadId, 'pendingHeartbeat.triggerTaskThreadId');
   if (value.type === 'finalize_controller_cycle') {
     if (value.desiredStatus !== 'cancelled' || value.dueAt !== null || value.intervalMs !== null || !isSafeThreadId(value.supersededCreateActionId) || !Number.isInteger(value.supersededCreateGeneration) || value.supersededCreateGeneration !== value.generation) fail('REGISTRY_INVALID', 'controller cycle finalization action 无效');
@@ -1610,8 +1645,8 @@ function validateControllerHeartbeat(value, knownControllers) {
   if (!required.every((key) => key in value)) fail('REGISTRY_INVALID', 'controller heartbeat 缺少字段');
   assertSafeThreadId(value.controllerThreadId, 'heartbeat.controllerThreadId');
   if (!knownControllers.has(value.controllerThreadId)) fail('REGISTRY_INVALID', `heartbeat controller 未登记: ${value.controllerThreadId}`);
-  const isProtocolV2 = value.protocolVersion === HEARTBEAT_PROTOCOL_VERSION;
-  if (!Number.isInteger(value.generation) || value.generation < (isProtocolV2 ? 0 : 1)) fail('REGISTRY_INVALID', 'heartbeat generation 无效');
+  const isCurrentProtocol = value.protocolVersion === HEARTBEAT_PROTOCOL_VERSION;
+  if (!Number.isInteger(value.generation) || value.generation < (isCurrentProtocol ? 0 : 1)) fail('REGISTRY_INVALID', 'heartbeat generation 无效');
   if (!has(value.status, HEARTBEAT_STATUSES)) fail('REGISTRY_INVALID', `heartbeat status 无效: ${value.status}`);
   if (!has(value.reason, HEARTBEAT_REASONS)) fail('REGISTRY_INVALID', `heartbeat reason 无效: ${value.reason}`);
   if (value.triggerTaskThreadId !== null) assertSafeThreadId(value.triggerTaskThreadId, 'heartbeat.triggerTaskThreadId');
@@ -1621,15 +1656,16 @@ function validateControllerHeartbeat(value, knownControllers) {
   } else if (value.dueAt !== null || value.intervalMs !== null) {
     fail('REGISTRY_INVALID', 'cancelled heartbeat 不能保留 dueAt 或 intervalMs');
   }
-  if (!isProtocolV2) return { ...value };
-  const evidenceFields = ['automationId', 'lastSuccessfulGeneration', 'lastSuccessfulAt', 'pendingAction', 'consecutiveStaleCount', 'lastStaleGeneration', 'lastStaleAt', 'observedAutomationId', 'observedGeneration', 'observedTriggerCount', 'lastTriggeredAt', 'actionFailureCount', 'deleteFailureCount', 'disabledAt', 'disableReason', 'notificationStatus', 'actionHistory', 'retiredAutomationIds'];
-  if (!evidenceFields.every((key) => key in value)) fail('REGISTRY_INVALID', 'heartbeat v2 证据字段不完整');
+  if (!isCurrentProtocol) return { ...value };
+  const evidenceFields = ['automationId', 'lastSuccessfulGeneration', 'lastSuccessfulAt', 'pendingAction', 'consecutiveStaleCount', 'lastStaleGeneration', 'lastStaleAt', 'observedAutomationId', 'observedGeneration', 'observedTriggerCount', 'lastTriggeredAt', 'actionFailureCount', 'deleteFailureCount', 'disabledAt', 'disableReason', 'notificationStatus', 'actionHistory', 'retiredAutomationIds', 'consecutiveNoProgressCycles', 'lastCycleFingerprint', 'lastCycleReceiptKey', 'lastMeaningfulProgressAt', 'noProgressFuseCount', 'manualResumeCount', 'lastManualResumeAt', 'lastManualResumeReason'];
+  if (!evidenceFields.every((key) => key in value)) fail('REGISTRY_INVALID', 'heartbeat v3 证据字段不完整');
   for (const field of ['automationId', 'observedAutomationId']) if (value[field] !== null) assertSafeThreadId(value[field], `heartbeat.${field}`);
   if (!Number.isInteger(value.lastSuccessfulGeneration) || value.lastSuccessfulGeneration < 0 || value.lastSuccessfulGeneration > value.generation) fail('REGISTRY_INVALID', 'lastSuccessfulGeneration 无效');
-  for (const field of ['lastSuccessfulAt', 'lastStaleAt', 'lastTriggeredAt', 'disabledAt']) if (value[field] !== null && !isTimestamp(value[field])) fail('REGISTRY_INVALID', `${field} 无效`);
-  for (const field of ['consecutiveStaleCount', 'observedTriggerCount', 'actionFailureCount', 'deleteFailureCount']) if (!Number.isInteger(value[field]) || value[field] < 0) fail('REGISTRY_INVALID', `${field} 无效`);
+  for (const field of ['lastSuccessfulAt', 'lastStaleAt', 'lastTriggeredAt', 'disabledAt', 'lastMeaningfulProgressAt', 'lastManualResumeAt']) if (value[field] !== null && !isTimestamp(value[field])) fail('REGISTRY_INVALID', `${field} 无效`);
+  for (const field of ['consecutiveStaleCount', 'observedTriggerCount', 'actionFailureCount', 'deleteFailureCount', 'consecutiveNoProgressCycles', 'noProgressFuseCount', 'manualResumeCount']) if (!Number.isInteger(value[field]) || value[field] < 0) fail('REGISTRY_INVALID', `${field} 无效`);
   for (const field of ['lastStaleGeneration', 'observedGeneration']) if (value[field] !== null && (!Number.isInteger(value[field]) || value[field] < 1)) fail('REGISTRY_INVALID', `${field} 无效`);
   if (value.disableReason !== null && !nonEmpty(value.disableReason)) fail('REGISTRY_INVALID', 'disableReason 无效');
+  for (const field of ['lastCycleFingerprint', 'lastCycleReceiptKey', 'lastManualResumeReason']) if (value[field] !== null && !nonEmpty(value[field])) fail('REGISTRY_INVALID', `${field} 无效`);
   if (!has(value.notificationStatus, HEARTBEAT_NOTIFICATION_STATUSES)) fail('REGISTRY_INVALID', 'heartbeat notificationStatus 无效');
   if (!Array.isArray(value.actionHistory) || !Array.isArray(value.retiredAutomationIds) || !value.retiredAutomationIds.every(isSafeThreadId)) fail('REGISTRY_INVALID', 'heartbeat 历史或 retiredAutomationIds 无效');
   const pendingAction = value.pendingAction === null ? null : validatePendingHeartbeatAction(value.pendingAction, value);
@@ -2078,6 +2114,45 @@ export async function controllerRearmHeartbeat(input) {
   });
 }
 
+export async function controllerResumeWatchdog(input) {
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', '恢复 watchdog 必须提供具体 reason');
+  const resolvedHome = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(resolvedHome, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const rawRegistry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const registry = { ...rawRegistry, tasks: ensureTaskControls(rawRegistry.tasks, rawRegistry.rootControllerThreadIds) };
+    const found = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === input.controllerThreadId);
+    if (!found) fail('HEARTBEAT_NOT_REGISTERED', 'controller heartbeat 尚未登记');
+    const state = heartbeatEvidenceDefaults(found);
+    if (state.disabledAt === null) fail('WATCHDOG_NOT_FUSED', 'watchdog 当前未熔断，无需恢复');
+    if (state.pendingAction !== null || state.status !== 'cancelled' || state.automationId !== null) fail('WATCHDOG_CLEANUP_REQUIRED', '必须先完成或人工确认 heartbeat automation 清理，再恢复 watchdog');
+    const now = new Date();
+    const resumedState = {
+      ...state,
+      disabledAt: null,
+      disableReason: null,
+      notificationStatus: 'not_required',
+      consecutiveStaleCount: 0,
+      consecutiveNoProgressCycles: 0,
+      lastCycleFingerprint: null,
+      lastCycleReceiptKey: null,
+      lastMeaningfulProgressAt: now.toISOString(),
+      actionFailureCount: 0,
+      deleteFailureCount: 0,
+      manualResumeCount: state.manualResumeCount + 1,
+      lastManualResumeAt: now.toISOString(),
+      lastManualResumeReason: input.reason.trim(),
+      updatedAt: now.toISOString(),
+    };
+    const resumedRegistry = { ...registry, controllerHeartbeats: [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== input.controllerThreadId), resumedState], updatedAt: now.toISOString() };
+    const heartbeat = rearmControllerHeartbeatInRegistry(resumedRegistry, input.controllerThreadId, 'reconcile', null, now);
+    const next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { projectKey: next.projectKey, controllerThreadId: input.controllerThreadId, resumed: true, heartbeatState: heartbeat.state, pendingHeartbeatState: heartbeat.pendingState, heartbeatAction: heartbeat.heartbeatAction };
+  });
+}
+
 export async function controllerFinalizeCycle(input) {
   const resolvedHome = resolveTaskControlHome(input);
   const { paths } = await ensureProject(resolvedHome, input.projectRoot);
@@ -2090,6 +2165,7 @@ export async function controllerFinalizeCycle(input) {
     const before = controllerCycleGate(registry, input.controllerThreadId);
     const unresolvedCloseouts = before.queues.directTasks.filter((task) => task.closeout !== null && !closeoutComplete(task)).map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, notificationStatus: task.closeout.notificationStatus, reportStatus: task.closeout.reportStatus }));
     const requiredThreadActions = before.queues.directTasks.flatMap((task) => threadActionsForTask(task, registry.tasks));
+    if (before.heartbeatState?.pendingAction?.manualOnly === true) return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, finalized: false, businessAllowed: true, phase: 'watchdog_manual_cleanup_required', heartbeatState: before.heartbeatState, heartbeatAction: before.heartbeatAction, unresolvedCloseouts, requiredThreadActions };
     const routingOnly = before.queues.routingTasks.length > 0 && unresolvedCloseouts.length === 0 && requiredThreadActions.length === 0 && !before.queues.shouldKeepHeartbeat;
     if (routingOnly) {
       if (before.heartbeatState !== null && before.heartbeatState.pendingAction !== null) return { projectKey: registry.projectKey, controllerThreadId: input.controllerThreadId, finalized: false, businessAllowed: before.businessAllowed, phase: Date.now() > Date.parse(before.heartbeatState.pendingAction.expiresAt) ? 'compensate_timed_out_heartbeat' : 'resolve_heartbeat_action', heartbeatState: before.heartbeatState, heartbeatAction: before.heartbeatAction, unresolvedCloseouts: [], requiredThreadActions: [] };
@@ -2166,6 +2242,7 @@ export async function controllerConfirmHeartbeatAction(input) {
       fail('HEARTBEAT_AUTOMATION_MISMATCH', '删除确认的 automationId 与待删除对象不一致');
     }
     const retiredAutomationIds = pending.previousAutomationId === null ? state.retiredAutomationIds : [...new Set([...state.retiredAutomationIds, pending.previousAutomationId])];
+    const preserveFuse = pending.desiredStatus === 'cancelled' && state.disabledAt !== null;
     const nextState = {
       ...state,
       generation: pending.generation,
@@ -2188,9 +2265,9 @@ export async function controllerConfirmHeartbeatAction(input) {
       lastTriggeredAt: null,
       actionFailureCount: 0,
       deleteFailureCount: 0,
-      disabledAt: null,
-      disableReason: null,
-      notificationStatus: 'not_required',
+      disabledAt: preserveFuse ? state.disabledAt : null,
+      disableReason: preserveFuse ? state.disableReason : null,
+      notificationStatus: preserveFuse ? state.notificationStatus : 'not_required',
       actionHistory: appendHeartbeatActionHistory(state, pending, 'confirmed', pending.type === 'finalize_controller_cycle' ? `pending create cleanup=${input.pendingCreateCleanupOutcome}; confirmed automation deleted` : input.observed === true ? 'automation trigger proved create success' : 'host automation action confirmed'),
       retiredAutomationIds,
       logicalLeaseDueAt: pending.desiredStatus === 'armed' ? pending.dueAt : null,
@@ -2207,15 +2284,16 @@ export async function controllerRecordHeartbeatActionFailed(input) {
   if (!isSafeThreadId(input.actionId) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'heartbeat action failure 必须提供 actionId 和 reason');
   return mutateControllerHeartbeat(input, async (state) => {
     const pending = state.pendingAction?.actionId === input.actionId ? state.pendingAction : null;
+    if (pending?.manualOnly === true) fail('WATCHDOG_MANUAL_CLEANUP_REQUIRED', '自动清理已经熔断；请在宿主中手动删除对应 automation，再确认该 action');
     const retiredFailure = pending === null && state.pendingAction === null && isSafeThreadId(input.automationId) && (state.retiredAutomationIds.includes(input.automationId) || input.automationId !== state.automationId || state.actionHistory.some((entry) => entry.actionId === input.actionId && entry.type === 'delete_controller_heartbeat'));
     if (pending === null && !retiredFailure) fail('HEARTBEAT_ACTION_STALE', '失败 action 既不是当前 pending，也不是已登记 retired automation');
     const failed = pending ?? { actionId: input.actionId, type: 'delete_controller_heartbeat', generation: state.generation, previousGeneration: state.generation, previousAutomationId: input.automationId };
     const now = new Date().toISOString();
     const actionFailureCount = state.actionFailureCount + 1;
     const deleteFailureCount = state.deleteFailureCount + (['delete_controller_heartbeat', 'finalize_controller_cycle'].includes(failed.type) ? 1 : 0);
-    const fuseOpen = deleteFailureCount >= HEARTBEAT_STALE_LIMIT;
+    const fuseOpen = deleteFailureCount >= HEARTBEAT_DELETE_FAILURE_LIMIT;
     const retryCurrentCleanup = pending !== null && ['delete_controller_heartbeat', 'finalize_controller_cycle'].includes(failed.type)
-      ? { ...failed, actionId: randomUUID().replaceAll('-', ''), preparedAt: now, expiresAt: new Date(Date.parse(now) + HEARTBEAT_ACTION_TIMEOUT_MS).toISOString() }
+      ? { ...failed, actionId: randomUUID().replaceAll('-', ''), preparedAt: now, expiresAt: new Date(Date.parse(now) + HEARTBEAT_ACTION_TIMEOUT_MS).toISOString(), manualOnly: fuseOpen }
       : null;
     const nextState = {
       ...state,
@@ -2233,7 +2311,9 @@ export async function controllerRecordHeartbeatActionFailed(input) {
       : (isSafeThreadId(input.automationId) && input.automationId !== state.automationId ? input.automationId : null);
     const heartbeatAction = retryCurrentCleanup !== null
       ? heartbeatActionForPending(nextState, retryCurrentCleanup)
-      : targetAutomationId === null ? null : { type: 'delete_stale_automation', actionId: input.actionId, automationId: targetAutomationId, generation: failed.previousGeneration, currentGeneration: nextState.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, reason: fuseOpen ? 'delete_failure_limit' : 'host_action_failed', onTimeout: 'controller-record-heartbeat-action-failed' };
+      : targetAutomationId === null ? null : fuseOpen
+        ? { type: 'manual_heartbeat_cleanup_required', actionId: input.actionId, automationId: targetAutomationId, generation: failed.previousGeneration, currentGeneration: nextState.generation, automaticRetry: false, reason: 'delete_failure_limit' }
+        : { type: 'delete_stale_automation', actionId: input.actionId, automationId: targetAutomationId, generation: failed.previousGeneration, currentGeneration: nextState.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, reason: 'host_action_failed', onTimeout: 'controller-record-heartbeat-action-failed' };
     return { state: nextState, output: { fuseOpen, notificationRequired: nextState.notificationStatus === 'pending', heartbeatAction } };
   });
 }
@@ -3434,6 +3514,51 @@ function heartbeatRruleCount(value) {
   return match ? Number(match[1]) : null;
 }
 
+function controllerBusinessFingerprint(registry, controllerThreadId, pendingEvents, parallel) {
+  const tasks = registry.tasks
+    .filter((task) => task.directControllerThreadId === controllerThreadId)
+    .map((task) => ({ threadId: task.threadId, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, updatedAt: task.updatedAt, lastDispatchedAt: task.lastDispatchedAt ?? null, progressEventCreatedAt: task.progressEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, candidateCommit: task.candidateCommit ?? null, notificationStatus: task.notificationStatus }))
+    .sort((left, right) => left.threadId.localeCompare(right.threadId));
+  const events = pendingEvents.map((event) => ({ type: event.type, threadId: event.threadId, createdAt: event.createdAt, eventPath: event.eventPath })).sort((left, right) => left.eventPath.localeCompare(right.eventPath));
+  const messages = registry.controllerMessages
+    .filter((message) => message.controllerThreadId === controllerThreadId)
+    .map((message) => ({ messageId: message.messageId, status: message.status, updatedAt: message.updatedAt }))
+    .sort((left, right) => left.messageId.localeCompare(right.messageId));
+  const batches = parallel.batches.map((batch) => ({ batchId: batch.batchId, status: batch.status, dispatchWaveId: batch.dispatchWaveId, pendingDispatchCandidateIds: batch.pendingDispatchCandidateIds, candidateStates: batch.candidateStates.map((candidate) => ({ candidateId: candidate.candidateId, state: candidate.state, threadId: candidate.threadId })) })).sort((left, right) => left.batchId.localeCompare(right.batchId));
+  return createHash('sha256').update(JSON.stringify({ tasks, events, messages, batches })).digest('hex');
+}
+
+function heartbeatCycleReceiptKey(input) {
+  return [input.heartbeatGeneration, input.heartbeatAutomationId, input.heartbeatOccurrence ?? 'unknown', input.heartbeatFiredAt ?? 'unknown'].join(':');
+}
+
+async function recordHeartbeatCycleEvidence(input, fingerprint) {
+  return mutateControllerHeartbeat(input, async (state) => {
+    const requestedGeneration = Number(input.heartbeatGeneration);
+    if (state.status !== 'armed' || state.generation !== requestedGeneration || state.automationId !== input.heartbeatAutomationId) fail('HEARTBEAT_ACTION_STALE', 'watchdog cycle 身份已变化');
+    const receiptKey = heartbeatCycleReceiptKey(input);
+    if (state.lastCycleReceiptKey === receiptKey) return { state, output: { recorded: false, duplicate: true, fuseOpened: false } };
+    const now = isTimestamp(input.heartbeatFiredAt) ? input.heartbeatFiredAt : new Date().toISOString();
+    const baseline = state.lastCycleFingerprint === null;
+    const businessChanged = !baseline && state.lastCycleFingerprint !== fingerprint;
+    const consecutiveNoProgressCycles = baseline || businessChanged ? 0 : state.consecutiveNoProgressCycles + 1;
+    const fuseOpened = state.disabledAt === null && consecutiveNoProgressCycles >= HEARTBEAT_NO_PROGRESS_LIMIT;
+    const nextState = {
+      ...state,
+      lastCycleFingerprint: fingerprint,
+      lastCycleReceiptKey: receiptKey,
+      lastMeaningfulProgressAt: baseline || businessChanged ? now : state.lastMeaningfulProgressAt,
+      consecutiveNoProgressCycles,
+      noProgressFuseCount: state.noProgressFuseCount + (fuseOpened ? 1 : 0),
+      disabledAt: fuseOpened ? now : state.disabledAt,
+      disableReason: fuseOpened ? `watchdog observed ${consecutiveNoProgressCycles} consecutive cycles without business progress` : state.disableReason,
+      notificationStatus: fuseOpened && state.notificationStatus === 'not_required' ? 'pending' : state.notificationStatus,
+      updatedAt: now,
+    };
+    return { state: nextState, output: { recorded: true, duplicate: false, baseline, businessChanged, consecutiveNoProgressCycles, fuseOpened } };
+  });
+}
+
 async function recordHeartbeatObservation(input) {
   if (!isSafeThreadId(input.heartbeatAutomationId)) fail('CLI_INVALID_ARGUMENTS', 'heartbeat automation id 无效');
   const requestedGeneration = Number(input.heartbeatGeneration);
@@ -3529,15 +3654,21 @@ export async function controllerScanPendingEvents(input) {
   if (!controllerKnown) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 未登记为项目主控或父任务');
 
   const heartbeatValue = registry.controllerHeartbeats.find((heartbeat) => heartbeat.controllerThreadId === input.controllerThreadId) ?? null;
-  const heartbeatState = heartbeatValue === null ? null : heartbeatEvidenceDefaults(heartbeatValue);
+  let heartbeatState = heartbeatValue === null ? null : heartbeatEvidenceDefaults(heartbeatValue);
   if (input.heartbeatGeneration !== undefined) {
     const requestedGeneration = Number(input.heartbeatGeneration);
     if (!Number.isInteger(requestedGeneration) || requestedGeneration < 1) fail('CLI_INVALID_ARGUMENTS', 'heartbeat generation 必须是正整数');
     if (heartbeatState?.pendingAction?.type === 'create_controller_heartbeat' && heartbeatState.pendingAction.generation === requestedGeneration && (input.heartbeatActionId === undefined || input.heartbeatActionId === heartbeatState.pendingAction.actionId)) {
       return staleHeartbeatResult(registry, heartbeatState, input, 'pending_create_observed', { staleHeartbeat: false, pendingHeartbeat: true, heartbeatAction: { type: 'confirm_observed_heartbeat', actionId: heartbeatState.pendingAction.actionId, automationId: input.heartbeatAutomationId ?? null, generation: requestedGeneration, command: 'controller-confirm-heartbeat-action --observed true' } });
     }
+    if (heartbeatState?.pendingAction?.manualOnly === true) {
+      return staleHeartbeatResult(registry, heartbeatState, input, 'watchdog_manual_cleanup_required', { staleHeartbeat: false, pendingHeartbeat: true, heartbeatAction: heartbeatActionForPending(heartbeatState, heartbeatState.pendingAction), notificationRequired: heartbeatState.notificationStatus === 'pending' });
+    }
     if (heartbeatState !== null && heartbeatState.pendingAction !== null && Date.now() > Date.parse(heartbeatState.pendingAction.expiresAt)) {
       return staleHeartbeatResult(registry, heartbeatState, input, 'pending_action_timeout', { staleHeartbeat: false, pendingHeartbeat: true, heartbeatAction: { type: 'compensate_timed_out_heartbeat_action', actionId: heartbeatState.pendingAction.actionId, automationId: heartbeatState.pendingAction.previousAutomationId, generation: heartbeatState.pendingAction.generation, timeoutMs: HEARTBEAT_ACTION_TIMEOUT_MS, command: 'controller-record-heartbeat-action-failed --reason host_timeout' } });
+    }
+    if (heartbeatState?.disabledAt !== null && heartbeatState?.disabledAt !== undefined) {
+      return staleHeartbeatResult(registry, heartbeatState, input, 'watchdog_disabled', { heartbeatAction: { type: 'manual_heartbeat_cleanup_required', automationId: input.heartbeatAutomationId ?? heartbeatState.automationId, generation: requestedGeneration, automaticRetry: false, reason: heartbeatState.disableReason }, notificationRequired: heartbeatState.notificationStatus === 'pending' });
     }
     if (heartbeatState === null || heartbeatState.status !== 'armed' || heartbeatState.generation !== requestedGeneration) {
       return staleHeartbeatResult(registry, heartbeatState, input, 'generation_mismatch');
@@ -3611,8 +3742,16 @@ export async function controllerScanPendingEvents(input) {
   });
   const taskQueues = controllerWorkQueues(registry.tasks, input.controllerThreadId);
   const parallel = controllerParallelRuntime(registry, input.controllerThreadId);
-  const queues = { ...taskQueues, shouldKeepHeartbeat: taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat };
+  let cycleEvidence = null;
+  if (input.heartbeatGeneration !== undefined && isSafeThreadId(input.heartbeatAutomationId)) {
+    const fingerprint = controllerBusinessFingerprint(registry, input.controllerThreadId, pendingEvents, parallel);
+    cycleEvidence = await recordHeartbeatCycleEvidence(input, fingerprint);
+    heartbeatState = cycleEvidence.heartbeatState;
+  }
+  const watchdogFused = heartbeatState?.disabledAt !== null && heartbeatState?.disabledAt !== undefined;
+  const queues = { ...taskQueues, shouldKeepHeartbeat: (taskQueues.shouldKeepHeartbeat || parallel.shouldKeepHeartbeat) && !watchdogFused };
   const reportNeedsRefresh = await deliveryReportNeedsRefresh(paths, input.controllerThreadId, registry.updatedAt);
+  const heartbeatAction = cycleEvidence?.fuseOpened === true ? { type: 'controller_finalize_cycle', automationId: heartbeatState.automationId, generation: heartbeatState.generation, command: 'controller-finalize-cycle', reason: 'watchdog_no_progress_fuse' } : null;
   return {
     projectKey: registry.projectKey,
     controllerThreadId: input.controllerThreadId,
@@ -3644,7 +3783,12 @@ export async function controllerScanPendingEvents(input) {
     threadActions,
     reportNeedsRefresh,
     deliveryReportPath: deliveryReportPath(paths.home, paths.projectKey, input.controllerThreadId),
-    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || zombieAttempts.length > 0 || preparedReworks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0 || parallel.fanoutRequired || parallel.singleDispatchReady || parallel.pendingDispatches.length > 0,
+    cycleEvidence: cycleEvidence === null ? null : { recorded: cycleEvidence.recorded, duplicate: cycleEvidence.duplicate, baseline: cycleEvidence.baseline ?? false, businessChanged: cycleEvidence.businessChanged ?? false, consecutiveNoProgressCycles: cycleEvidence.consecutiveNoProgressCycles ?? heartbeatState.consecutiveNoProgressCycles, fuseOpened: cycleEvidence.fuseOpened },
+    watchdogFused,
+    heartbeatAction,
+    notificationRequired: heartbeatState?.notificationStatus === 'pending',
+    notificationText: heartbeatState?.notificationStatus === 'pending' ? `主控 watchdog 已停止自动续期：${heartbeatState.disableReason}。业务台账仍可继续；完成清理后使用 controller-resume-watchdog 显式恢复。` : null,
+    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || zombieAttempts.length > 0 || preparedReworks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0 || parallel.fanoutRequired || parallel.singleDispatchReady || parallel.pendingDispatches.length > 0 || heartbeatState?.notificationStatus === 'pending',
     shouldKeepHeartbeat: queues.shouldKeepHeartbeat,
   };
 }
@@ -4034,7 +4178,7 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.14.0',
+    'codex-task-control v0.15.0',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
@@ -4054,6 +4198,7 @@ function helpText() {
     '  mark-integrated ... [--integration-target-ref <git-ref>]  # implementation 默认验证 candidate 是 HEAD 的祖先',
     '  controller-confirm-heartbeat-action --project-root <root> --controller <id> --action-id <id> [--automation-id <new-or-deleted-id>] [--pending-create-cleanup-outcome deleted|not_found]',
     '  controller-finalize-cycle --project-root <root> --controller <id>',
+    '  controller-resume-watchdog --project-root <root> --controller <id> --reason <manual-review-reason>',
     '  controller-assert-business-ready --project-root <root> --controller <id>',
     '  controller-prepare-message --project-root <root> --controller <id> --thread <id> --kind follow_up|clarification|evidence_request|notification|stop|cancel --delivery-mode queue|interrupt --target-turn-state running|idle|unknown --message <text> [--message-id <id>] [--interrupt-authority user_explicit|controller_safety]',
     '  controller-release-message --project-root <root> --controller <id> --message-id <id> --target-turn-state running|idle|unknown',
@@ -4066,7 +4211,7 @@ function helpText() {
     '',
     'implementation 成果包按 attempt 追加保存；lean HTML 只读现有台账，diagnostic 才按需读取 rollout 与显式提供的 OTel/Desktop 日志；两者都不维持 heartbeat。',
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
-    'heartbeat 使用 prepare/create-new/confirm/switch/delete-old 两阶段协议；终态必须 finalize 并确认删除，stale invocation 只返回受限自删除动作。',
+    'heartbeat 使用单次 watchdog；连续两轮无业务变化自动熔断，删除只自动补偿一次，清理失败后必须人工确认并显式 resume。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
   ].join('\n');
 }
@@ -4141,6 +4286,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-rearm-heartbeat') result = await controllerRearmHeartbeat({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: option(args, '--reason') ?? 'reconcile' });
   else if (command === 'controller-confirm-heartbeat-action') result = await controllerConfirmHeartbeatAction({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), observed: option(args, '--observed') === 'true', pendingCreateCleanupOutcome: option(args, '--pending-create-cleanup-outcome') });
   else if (command === 'controller-finalize-cycle') result = await controllerFinalizeCycle({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
+  else if (command === 'controller-resume-watchdog') result = await controllerResumeWatchdog({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: required(args, '--reason') });
   else if (command === 'controller-assert-business-ready') result = await controllerAssertBusinessReady({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-prepare-message') result = await controllerPrepareMessage({ ...controllerInput(args), messageId: option(args, '--message-id'), kind: required(args, '--kind'), deliveryMode: required(args, '--delivery-mode'), targetTurnState: required(args, '--target-turn-state'), messageText: required(args, '--message'), interruptAuthority: option(args, '--interrupt-authority') });
   else if (command === 'controller-release-message') result = await controllerReleaseMessage({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), messageId: required(args, '--message-id'), targetTurnState: required(args, '--target-turn-state') });

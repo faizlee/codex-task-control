@@ -45,6 +45,7 @@ import {
   controllerRecordTitleSynced,
   controllerRegisterTask,
   controllerRearmHeartbeat,
+  controllerResumeWatchdog,
   controllerFinalizeCycle,
   controllerRetryThreadAction,
   controllerScanPendingEvents,
@@ -1564,7 +1565,7 @@ test('heartbeat replacement failure does not advance the confirmed generation', 
   }
 });
 
-test('legacy confirmed heartbeat migrates to protocol v2 without losing generation', async () => {
+test('legacy confirmed heartbeat migrates to protocol v3 without losing generation', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-migration-'));
   const projectRoot = 'E:\\work\\project\\heartbeat-v2-migration';
   try {
@@ -1573,7 +1574,7 @@ test('legacy confirmed heartbeat migrates to protocol v2 without losing generati
     const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const heartbeat = registry.controllerHeartbeats[0];
-    for (const key of ['protocolVersion', 'automationId', 'lastSuccessfulGeneration', 'lastSuccessfulAt', 'pendingAction', 'consecutiveStaleCount', 'lastStaleGeneration', 'lastStaleAt', 'observedAutomationId', 'observedGeneration', 'observedTriggerCount', 'lastTriggeredAt', 'actionFailureCount', 'deleteFailureCount', 'disabledAt', 'disableReason', 'notificationStatus', 'actionHistory', 'retiredAutomationIds']) delete heartbeat[key];
+    for (const key of ['protocolVersion', 'automationId', 'lastSuccessfulGeneration', 'lastSuccessfulAt', 'pendingAction', 'consecutiveStaleCount', 'lastStaleGeneration', 'lastStaleAt', 'observedAutomationId', 'observedGeneration', 'observedTriggerCount', 'lastTriggeredAt', 'actionFailureCount', 'deleteFailureCount', 'disabledAt', 'disableReason', 'notificationStatus', 'actionHistory', 'retiredAutomationIds', 'consecutiveNoProgressCycles', 'lastCycleFingerprint', 'lastCycleReceiptKey', 'lastMeaningfulProgressAt', 'noProgressFuseCount', 'manualResumeCount', 'lastManualResumeAt', 'lastManualResumeReason']) delete heartbeat[key];
     heartbeat.generation = 121;
     heartbeat.updatedAt = new Date().toISOString();
     registry.updatedAt = heartbeat.updatedAt;
@@ -1581,7 +1582,8 @@ test('legacy confirmed heartbeat migrates to protocol v2 without losing generati
 
     const scan = await controllerScanPendingEvents(input);
     assert.equal(scan.heartbeatState.generation, 121);
-    assert.equal(scan.heartbeatState.protocolVersion, 2);
+    assert.equal(scan.heartbeatState.protocolVersion, 3);
+    assert.equal(scan.heartbeatState.consecutiveNoProgressCycles, 0);
     const unchanged = JSON.parse(await readFile(registryPath, 'utf8'));
     assert.equal('protocolVersion' in unchanged.controllerHeartbeats[0], false, 'read-only scan without automation identity must not rewrite legacy heartbeat');
 
@@ -1589,7 +1591,7 @@ test('legacy confirmed heartbeat migrates to protocol v2 without losing generati
     assert.equal(prepared.heartbeatState.generation, 121);
     assert.equal(prepared.heartbeatAction.generation, 122);
     const migrated = JSON.parse(await readFile(registryPath, 'utf8'));
-    assert.equal(migrated.controllerHeartbeats[0].protocolVersion, 2);
+    assert.equal(migrated.controllerHeartbeats[0].protocolVersion, 3);
     assert.equal(migrated.controllerHeartbeats[0].lastSuccessfulGeneration, 121);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
@@ -1643,18 +1645,19 @@ test('a pending automation can self-confirm, while repeated stale generations fu
     await controllerConfirmHeartbeatAction({ ...input, actionId: prepared.heartbeatAction.actionId, automationId: 'heartbeat-stale-auto-2' });
 
     let stale;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
       stale = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 1, heartbeatAutomationId: 'heartbeat-stale-auto-1', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: attempt });
       assert.equal(stale.staleHeartbeat, true);
-      assert.equal(stale.heartbeatAction.type, 'delete_stale_automation');
+      assert.equal(stale.heartbeatAction.type, attempt === 1 ? 'delete_stale_automation' : 'manual_heartbeat_cleanup_required');
       assert.equal(stale.pendingEvents.length, 0);
       assert.equal(stale.needsControllerAttention, false);
     }
-    assert.equal(stale.heartbeatState.consecutiveStaleCount, 3);
+    assert.equal(stale.heartbeatState.consecutiveStaleCount, 2);
     assert.equal(stale.notificationRequired, true);
     await controllerMarkHeartbeatNotificationSent(input);
-    const afterNotification = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 1, heartbeatAutomationId: 'heartbeat-stale-auto-1', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 4 });
+    const afterNotification = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 1, heartbeatAutomationId: 'heartbeat-stale-auto-1', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 3 });
     assert.equal(afterNotification.notificationRequired, false);
+    assert.equal(afterNotification.heartbeatAction.type, 'manual_heartbeat_cleanup_required');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
@@ -1692,13 +1695,13 @@ test('repeated retired-automation delete failures open a bounded fuse', async ()
     const cleanup = confirmed.cleanupHeartbeatAction;
     assert.equal(cleanup.automationId, 'heartbeat-delete-auto-1');
     let failure;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
       failure = await controllerRecordHeartbeatActionFailed({ ...input, actionId: cleanup.actionId, automationId: cleanup.automationId, reason: `delete attempt ${attempt} timed out` });
     }
     assert.equal(failure.fuseOpen, true);
     assert.equal(failure.notificationRequired, true);
-    assert.equal(failure.heartbeatState.deleteFailureCount, 3);
-    assert.equal(failure.heartbeatAction.type, 'delete_stale_automation');
+    assert.equal(failure.heartbeatState.deleteFailureCount, 2);
+    assert.equal(failure.heartbeatAction.type, 'manual_heartbeat_cleanup_required');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
@@ -1722,7 +1725,7 @@ test('current heartbeat delete failures fuse while business recovery remains ava
     assert.equal(deletePrepared.heartbeatAction.automationId, 'heartbeat-current-auto-4');
     let failure;
     let deleteAction = deletePrepared.heartbeatAction;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
       failure = await controllerRecordHeartbeatActionFailed({ ...input, actionId: deleteAction.actionId, automationId: 'heartbeat-current-auto-4', reason: `current delete attempt ${attempt} timed out` });
       deleteAction = failure.heartbeatAction;
     }
@@ -1731,11 +1734,87 @@ test('current heartbeat delete failures fuse while business recovery remains ava
     assert.equal(failure.heartbeatState.generation, deletePrepared.heartbeatAction.generation - 1);
     assert.equal(failure.heartbeatState.automationId, 'heartbeat-current-auto-4');
     assert.equal(failure.heartbeatState.pendingAction.type, 'delete_controller_heartbeat');
-    assert.equal(failure.heartbeatAction.type, 'delete_controller_heartbeat');
+    assert.equal(failure.heartbeatState.pendingAction.manualOnly, true);
+    assert.equal(failure.heartbeatAction.type, 'manual_heartbeat_cleanup_required');
     assert.equal((await controllerAssertBusinessReady(input)).businessAllowed, true);
     const stale = await controllerScanPendingEvents({ ...input, heartbeatGeneration: deletePrepared.heartbeatAction.generation - 1, heartbeatAutomationId: 'heartbeat-current-auto-4', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=5;COUNT=1', heartbeatOccurrence: 4 });
-    assert.equal(stale.heartbeatAction.type, 'delete_stale_automation');
+    assert.equal(stale.heartbeatAction.type, 'manual_heartbeat_cleanup_required');
     assert.equal(stale.pendingEvents.length, 0);
+    const manuallyCleaned = await controllerConfirmHeartbeatAction({ ...input, actionId: failure.heartbeatState.pendingAction.actionId, automationId: 'heartbeat-current-auto-4' });
+    assert.equal(manuallyCleaned.heartbeatState.status, 'cancelled');
+    assert.notEqual(manuallyCleaned.heartbeatState.disabledAt, null);
+    const resumed = await controllerResumeWatchdog({ ...input, reason: 'User verified the host automation was removed.' });
+    assert.equal(resumed.resumed, true);
+    assert.equal(resumed.heartbeatState.disabledAt, null);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
+test('two consecutive no-progress watchdog cycles stop automatic rearm without blocking business recovery', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-watchdog-no-progress-'));
+  const projectRoot = 'E:\\work\\project\\watchdog-no-progress';
+  try {
+    const { input, dispatched } = await createHeartbeatFixture(taskControlHome, projectRoot);
+    await controllerConfirmHeartbeatAction({ ...input, actionId: dispatched.heartbeatAction.actionId, automationId: 'watchdog-no-progress-auto-1' });
+
+    const first = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 1, heartbeatAutomationId: 'watchdog-no-progress-auto-1', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 1 });
+    assert.equal(first.cycleEvidence.baseline, true);
+    assert.equal(first.cycleEvidence.consecutiveNoProgressCycles, 0);
+    let finalized = await controllerFinalizeCycle(input);
+    await controllerConfirmHeartbeatAction({ ...input, actionId: finalized.heartbeatAction.actionId, automationId: 'watchdog-no-progress-auto-2' });
+
+    const second = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 2, heartbeatAutomationId: 'watchdog-no-progress-auto-2', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 1 });
+    assert.equal(second.cycleEvidence.consecutiveNoProgressCycles, 1);
+    assert.equal(second.watchdogFused, false);
+    finalized = await controllerFinalizeCycle(input);
+    await controllerConfirmHeartbeatAction({ ...input, actionId: finalized.heartbeatAction.actionId, automationId: 'watchdog-no-progress-auto-3' });
+
+    const third = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 3, heartbeatAutomationId: 'watchdog-no-progress-auto-3', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 1 });
+    assert.equal(third.cycleEvidence.consecutiveNoProgressCycles, 2);
+    assert.equal(third.cycleEvidence.fuseOpened, true);
+    assert.equal(third.watchdogFused, true);
+    assert.equal(third.shouldKeepHeartbeat, false);
+    assert.equal(third.heartbeatAction.type, 'controller_finalize_cycle');
+    assert.equal((await controllerAssertBusinessReady(input)).businessAllowed, true);
+
+    await delay();
+    const lateProgressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Late progress arrived after the watchdog fuse opened.' });
+    const lateProgress = await controllerIngestProgress({ ...input, eventPath: lateProgressPath });
+    assert.notEqual(lateProgress.heartbeatState.disabledAt, null, 'business progress must not silently reopen a fused watchdog');
+    assert.equal(lateProgress.heartbeatAction.type, 'delete_controller_heartbeat');
+    await controllerConfirmHeartbeatAction({ ...input, actionId: lateProgress.heartbeatAction.actionId, automationId: 'watchdog-no-progress-auto-3' });
+    const resumed = await controllerResumeWatchdog({ ...input, reason: 'User reviewed the stalled worker and chose to continue monitoring.' });
+    assert.equal(resumed.heartbeatAction.type, 'create_controller_heartbeat');
+    assert.equal(resumed.heartbeatState.consecutiveNoProgressCycles, 0);
+    assert.equal(resumed.heartbeatState.manualResumeCount, 1);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
+test('real progress resets the no-progress watchdog counter and schedules a consumed one-shot again', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-watchdog-progress-reset-'));
+  const projectRoot = 'E:\\work\\project\\watchdog-progress-reset';
+  try {
+    const { input, dispatched } = await createHeartbeatFixture(taskControlHome, projectRoot);
+    await controllerConfirmHeartbeatAction({ ...input, actionId: dispatched.heartbeatAction.actionId, automationId: 'watchdog-progress-auto-1' });
+    await controllerScanPendingEvents({ ...input, heartbeatGeneration: 1, heartbeatAutomationId: 'watchdog-progress-auto-1', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 1 });
+    let finalized = await controllerFinalizeCycle(input);
+    await controllerConfirmHeartbeatAction({ ...input, actionId: finalized.heartbeatAction.actionId, automationId: 'watchdog-progress-auto-2' });
+    const unchanged = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 2, heartbeatAutomationId: 'watchdog-progress-auto-2', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 1 });
+    assert.equal(unchanged.cycleEvidence.consecutiveNoProgressCycles, 1);
+
+    await delay();
+    const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'A real worker checkpoint arrived.' });
+    const progressed = await controllerIngestProgress({ ...input, eventPath: progressPath });
+    assert.equal(progressed.heartbeatState.consecutiveNoProgressCycles, 0);
+    assert.equal(progressed.heartbeatAction.type, 'create_controller_heartbeat', 'a one-shot that already fired must be replaced after real progress');
+    await controllerConfirmHeartbeatAction({ ...input, actionId: progressed.heartbeatAction.actionId, automationId: 'watchdog-progress-auto-3' });
+    const afterProgress = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 3, heartbeatAutomationId: 'watchdog-progress-auto-3', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=3;COUNT=1', heartbeatOccurrence: 1 });
+    assert.equal(afterProgress.cycleEvidence.baseline, true);
+    assert.equal(afterProgress.cycleEvidence.consecutiveNoProgressCycles, 0);
+    assert.equal(afterProgress.watchdogFused, false);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
