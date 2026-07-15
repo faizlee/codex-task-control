@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.13.0 preview. Parallel batches, lightweight lifecycle receipts, on-demand local timing diagnostics, contract/result checks, controller message queue, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights make zero model-provider calls.
+> Windows-first v0.13.1 preview. Parallel batches, lightweight lifecycle receipts, Chinese-first on-demand local timing diagnostics, contract/result checks, controller message queue, stall/fuse audits, delivery reports, heartbeat protocol, and routing preflights make zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,7 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.13.0 does
+## What v0.13.1 does
 
 - Piggybacks schema-v1 observability receipts on registration, dispatch, real progress ingestion, failure/completion, review, integration, and archive. It creates no extra worker command or progress event.
 - Keeps `lean` reporting as the default: it reads only the existing ledger and never loads rollout, Desktop, or OTel data.
@@ -31,6 +31,8 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Separates ledger dispatch-window overlap from paired completed-turn overlap, so planned or merely dispatched concurrency is never mislabeled as actual simultaneous active turns.
 - Shows per-task model/thinking, attempts, lifecycle timing, completed-turn active union, tool/TTFT/context/compaction/retry evidence, directly observed completed-response tokens, and account-level quota snapshots with explicit attribution limits.
 - Writes on-demand diagnostics to `diagnostic.html`; the normal deterministic `index.html` remains available for closeout refreshes and never keeps a heartbeat alive.
+- Renders fixed report terminology in Chinese, keeps necessary model/protocol identifiers beside a Chinese explanation, marks untranslated free-form English records, formats large values as `万`/`亿` with exact counts, and adds task-relative consumption bars without calling a model.
+- Describes completed-response tokens as already-observed cumulative processing, never as OTel overhead or an exact Codex quota bill.
 
 - Plans schema-v1 `parallel_batch` objects before task creation, with candidate lanes, dependencies, conflict domains, WIP limits, review capacity, and implementation worktree identity.
 - Requires at least two independent candidates when capacity allows. A single-task fallback needs a typed degradation receipt with evidence; an implementation plus independent QA/no-code/readonly candidate cannot silently collapse to one code task.
@@ -85,12 +87,12 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.13.0 does not do
+## What v0.13.1 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.13.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.13.1 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
 - It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. The skill now blocks later controlled business actions and returns bounded cleanup selectors, but a host-native compare-and-delete/defer hook remains the complete fix.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
@@ -114,7 +116,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.13.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.13.1 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -250,7 +252,7 @@ node $TaskControl controller-build-delivery-report --project-root "C:\work\examp
 node $TaskControl controller-build-delivery-report --project-root "C:\work\example" --controller "controller-1" --observability diagnostic --otel-jsonl "$HOME\.codex\otel-local\data"
 ```
 
-The default `lean` report writes `index.html` and performs no rollout/OTel scan. `diagnostic` writes `diagnostic.html` beside it and runs only on explicit request. Completed-response tokens are task-correlated only when same-conversation OTel receipts exist; rate-limit snapshots remain an account envelope and are never presented as a per-task bill. Unknown intervals remain unassigned.
+The default `lean` report writes `index.html` and performs no rollout/OTel scan. `diagnostic` writes `diagnostic.html` beside it and runs only on explicit request. Reports use Chinese explanations, `万`/`亿` compact values with exact counts, and task-relative comparison bars. Completed-response tokens are task-correlated only when same-conversation OTel receipts exist and describe already-observed cumulative processing, not OTel overhead or a quota bill. Rate-limit snapshots remain an account envelope. Unknown intervals remain unassigned.
 
 Use [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json) for non-visual work, [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json) for visual work, and [`assets/observability-receipt.example.json`](skill/codex-task-control/assets/observability-receipt.example.json) for the receipt shape. Old tasks remain readable and show “historical evidence unavailable” when no trustworthy artifacts exist.
 

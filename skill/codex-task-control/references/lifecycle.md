@@ -185,6 +185,8 @@ The report keeps evidence classes separate:
 
 Report generation never mutates the registry, creates a second ledger, changes `reportNeedsRefresh`, or creates/retains heartbeat work. Detailed diagnostics may be slower because they parse local history, but that cost occurs only on explicit report generation.
 
+The HTML presentation is Chinese-first. Fixed statuses, task modes, work classes, reasoning levels, anomaly codes, timing labels, and evidence categories render as Chinese labels; model names and protocol/event identifiers remain visible only as technical identifiers with adjacent Chinese explanations. Values at or above 10,000 use `万`, values at or above 100,000,000 use `亿`, and the exact integer remains beneath the compact value. Diagnostic reports add task-relative bars for cumulative input/output tokens, completed-turn active time, and tool time. Free-form ledger text that contains no Chinese is marked as an untranslated original record; report generation never calls a model to translate it. Completed-response tokens are described as already-observed cumulative model input/output, not OTel overhead and not a Codex quota bill.
+
 ## Controller-to-worker message contract
 
 The App's user-facing composer supports follow-up queue behavior, but the current programmatic message tool does not expose a queue/steer parameter or a queue acknowledgement. The ledger must therefore never infer native queue delivery from a generic successful send call.

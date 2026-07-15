@@ -2595,6 +2595,87 @@ function reportStatusClass(status) {
   return 'failed';
 }
 
+const REPORT_STATUS_LABELS = Object.freeze({ registered: '已登记', executing: '执行中', awaiting_review: '等待主控审查', changes_requested: '已停止，等待主控决定', accepted: '已接受，等待集成', integrated: '已集成', reclaimed: '已收回', blocked: '已阻塞' });
+const REPORT_THINKING_LABELS = Object.freeze({ medium: '中等推理', high: '高强度推理', xhigh: '极高强度推理', max: '最高强度推理' });
+const REPORT_WORK_CLASS_LABELS = Object.freeze({ repeatable: '规则明确的可重复任务', bounded_reasoning: '边界明确的代码理解任务', bounded_control: '边界明确的主控任务', frontier_control: '前沿主控任务', hard_arbitration: '高难度裁决', final_arbitration: '最终裁决', legacy: '旧版任务，分类不可用' });
+const REPORT_TASK_MODE_LABELS = Object.freeze({ control_only: '控制、审计或只读任务', implementation: '代码或资源实现任务', visual_implementation: '视觉实现任务', legacy_unclassified: '旧版任务，类型未分类' });
+const REPORT_MODEL_LABELS = Object.freeze({ 'gpt-5.6-luna': 'Luna（经济型机械执行模型）', 'gpt-5.6-terra': 'Terra（经济型代码理解模型）', 'gpt-5.6-sol': 'Sol（前沿主控模型）' });
+const REPORT_FAILURE_CLASS_LABELS = Object.freeze({ mechanical: '机械执行问题', comprehension: '理解偏差', judgment: '判断问题', spec_missing: '规格缺失', unclassified: '未分类' });
+const REPORT_FAILURE_DOMAIN_LABELS = Object.freeze({ tooling: '工具链', environment: '运行环境', contract: '实施合同', test: '测试验证', implementation: '代码实现' });
+const REPORT_DIAGNOSTIC_LABELS = Object.freeze({ technical_debt: '非阻塞技术债', milestone_blocker: '里程碑阻塞项' });
+const REPORT_ARTIFACT_TYPE_LABELS = Object.freeze({ screenshot: '截图', reference: '参考资料', contact_sheet: '对照图集', log: '日志', test_summary: '测试摘要', report: '报告' });
+const REPORT_MILESTONE_LABELS = Object.freeze({ reference: '参考', before: '修改前', intermediate: '关键中间状态', after: '修改后', current: '当前状态', failure: '失败证据' });
+const REPORT_WORKSPACE_ROLE_LABELS = Object.freeze({ candidate_worktree: '候选工作树', project_main: '项目主分支', external_reference: '外部参考', task_control: '任务控制目录' });
+
+function reportEnumLabel(labels, value, fallback = '未识别的技术值') {
+  return labels[value] ?? `${fallback}（${value ?? '空'}）`;
+}
+
+function reportStatusLabel(status) { return reportEnumLabel(REPORT_STATUS_LABELS, status, '未识别状态'); }
+
+function renderRecordedText(value) {
+  const text = String(value ?? '');
+  const escaped = escapeHtml(text);
+  if (!text || /[\u3400-\u9fff]/u.test(text)) return escaped;
+  return `${escaped}<small class="translation-note">原始英文或技术记录；为避免额外模型消耗，报告未自动翻译。</small>`;
+}
+
+function compactChineseNumber(value) {
+  if (!Number.isFinite(value)) return '不可用';
+  const absolute = Math.abs(value);
+  const format = (number) => number.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (absolute >= 100000000) return `${format(value / 100000000)} 亿`;
+  if (absolute >= 10000) return `${format(value / 10000)} 万`;
+  return value.toLocaleString('zh-CN');
+}
+
+function renderHumanCount(value, unit = '') {
+  if (!Number.isFinite(value)) return '不可用';
+  const compact = compactChineseNumber(value);
+  const exact = value.toLocaleString('zh-CN');
+  const suffix = unit ? ` ${escapeHtml(unit)}` : '';
+  return Math.abs(value) >= 10000
+    ? `<strong class="human-number">${escapeHtml(compact)}${suffix}</strong><small>精确值：${escapeHtml(exact)}${suffix}</small>`
+    : `<strong class="human-number">${escapeHtml(compact)}${suffix}</strong>`;
+}
+
+function compactChineseDuration(value) {
+  if (!Number.isFinite(value)) return '不可用';
+  if (value < 60) return `${value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })} 秒`;
+  const totalSeconds = Math.round(value);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours} 小时 ${minutes} 分${seconds ? ` ${seconds} 秒` : ''}`;
+  return `${minutes} 分${seconds ? ` ${seconds} 秒` : ''}`;
+}
+
+function renderHumanDuration(value) {
+  if (!Number.isFinite(value)) return '不可用';
+  const compact = compactChineseDuration(value);
+  const exact = `${value.toLocaleString('zh-CN')} 秒`;
+  return value >= 60 ? `${escapeHtml(compact)}<small>精确值：${escapeHtml(exact)}</small>` : escapeHtml(compact);
+}
+
+function anomalyChineseText(item) {
+  const number = Number(item.evidence?.match(/\d+(?:\.\d+)?/)?.[0]);
+  if (item.code === 'multiple_attempts') return `多次尝试（共 ${Number.isFinite(number) ? number : '若干'} 次）`;
+  if (item.code === 'recorded_failure') return `已记录失败（${Number.isFinite(number) ? number : '若干'} 条失败事件）`;
+  if (item.code === 'routing_mismatch') return `模型、推理强度与任务类型不匹配（技术证据：${item.evidence}）`;
+  if (item.code === 'repeated_commands') return `发现重复命令（${Number.isFinite(number) ? number : '若干'} 类重复指纹）`;
+  if (item.code === 'failed_rework') return `存在失败或返工链（${Number.isFinite(number) ? number : '若干'} 条）`;
+  if (item.code === 'context_pressure') return `上下文压力偏高（峰值比例 ${Number.isFinite(number) ? Math.round(number * 100) : '?'}%）`;
+  if (item.code === 'compaction') return `发生上下文压缩（${Number.isFinite(number) ? number : '若干'} 次）`;
+  if (item.code === 'large_unassigned_interval') return `大段时间无法准确归因（${Number.isFinite(number) ? number : '?'}%，原因未知）`;
+  return `未识别的异常规则（技术标识：${item.code}；证据：${item.evidence}）`;
+}
+
+function batchAnomalyChineseText(item) {
+  if (item.code === 'parallel_batch_without_overlapping_dispatch_windows') return `登记为并发批次，但派发窗口没有重叠（技术证据：${item.evidence}）`;
+  if (item.code === 'dispatched_parallel_but_completed_turns_serial') return `派发窗口有重叠，但已完成的模型交互轮次仍然串行（技术证据：${item.evidence}）`;
+  return `未识别的并发异常（技术标识：${item.code}；证据：${item.evidence}）`;
+}
+
 function deliveryStatusLabel(deliverable, task) {
   if (deliverable.attempt === task.attemptCount && task.status === 'reclaimed') return '已收回';
   if (deliverable.attempt === task.attemptCount && task.status === 'blocked') return '已阻塞';
@@ -2790,20 +2871,12 @@ async function addObservability(data, input) {
 }
 
 function renderArtifactHtml(artifact) {
-  const meta = `${artifact.milestone} · ${artifact.workspaceRole} · ${artifact.createdAt}`;
+  const meta = `${reportEnumLabel(REPORT_MILESTONE_LABELS, artifact.milestone, '未识别里程碑')} · ${reportEnumLabel(REPORT_WORKSPACE_ROLE_LABELS, artifact.workspaceRole, '未识别来源位置')} · ${artifact.createdAt}`;
   const missing = artifact.availability === 'missing' ? '<div class="missing">文件当前不可用；历史引用仍保留。</div>' : '';
   const visual = ['screenshot', 'contact_sheet'].includes(artifact.type) && artifact.availability !== 'missing'
     ? `<a href="${escapeHtml(artifact.href)}"><img loading="lazy" src="${escapeHtml(artifact.href)}" alt="${escapeHtml(artifact.label)}"></a>`
-    : `<a class="artifact-link" href="${escapeHtml(artifact.href)}">打开 ${escapeHtml(artifact.type)}</a>`;
-  return `<figure class="artifact ${artifact.selected ? 'selected' : ''}">${visual}${missing}<figcaption><strong>${escapeHtml(artifact.label)}</strong><span>${escapeHtml(artifact.description)}</span><small>${escapeHtml(meta)}</small></figcaption></figure>`;
-}
-
-function secondsLabel(value) {
-  return Number.isFinite(value) ? `${value.toLocaleString('zh-CN')} 秒` : '不可用';
-}
-
-function numberLabel(value) {
-  return Number.isFinite(value) ? value.toLocaleString('en-US') : '?';
+    : `<a class="artifact-link" href="${escapeHtml(artifact.href)}">打开${escapeHtml(reportEnumLabel(REPORT_ARTIFACT_TYPE_LABELS, artifact.type, '未识别资料'))}</a>`;
+  return `<figure class="artifact ${artifact.selected ? 'selected' : ''}">${visual}${missing}<figcaption><strong>${renderRecordedText(artifact.label)}</strong><span>${renderRecordedText(artifact.description)}</span><small>${escapeHtml(meta)}</small></figcaption></figure>`;
 }
 
 function renderLifecycleGantt(data) {
@@ -2813,42 +2886,85 @@ function renderLifecycleGantt(data) {
   return `<div class="gantt">${rows.map(({ task, start, end }) => { const left = ((start - min) / span) * 100; const width = Math.max(0.8, ((Math.max(start, end) - start) / span) * 100); return `<div class="gantt-row"><strong>${escapeHtml(task.displayKey)}</strong><div class="gantt-track"><span class="gantt-bar ${reportStatusClass(task.status)}" style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%"></span></div><small>${escapeHtml(task.lifecycle.dispatchedAt)} → ${escapeHtml(task.lifecycle.executionEndAt ?? `观测上界 ${data.registryUpdatedAt}`)}</small></div>`; }).join('')}</div>`;
 }
 
+function renderTaskRoute(task) {
+  const model = reportEnumLabel(REPORT_MODEL_LABELS, task.model, '未识别模型');
+  const thinking = reportEnumLabel(REPORT_THINKING_LABELS, task.thinking, '未识别推理强度');
+  const workClass = reportEnumLabel(REPORT_WORK_CLASS_LABELS, task.workClass ?? 'legacy', '未识别任务类型');
+  return `<strong>${escapeHtml(model)}</strong><span>${escapeHtml(thinking)}</span><span>${escapeHtml(workClass)}</span><small>模型技术标识：${escapeHtml(task.model)}</small>`;
+}
+
+function unavailableDiagnosticLabel(diagnostic) {
+  const reason = diagnostic.reason ?? diagnostic.status;
+  if (reason === 'rollout_not_found') return '未找到该任务的过程日志（rollout）';
+  if (reason === 'not_requested') return '本次未请求深度诊断';
+  if (reason === 'TIME_DIAGNOSTICS_UNAVAILABLE') return '本地耗时分析器不可用';
+  return `诊断证据不可用（技术原因：${reason}）`;
+}
+
+function relativeBar(value, maximum, className) {
+  const width = Number.isFinite(value) && maximum > 0 ? Math.max(1, (value / maximum) * 100) : 0;
+  return `<span class="comparison-track"><span class="comparison-bar ${className}" style="width:${width.toFixed(2)}%"></span></span>`;
+}
+
+function renderConsumptionComparison(data) {
+  const tasks = data.tasks.filter((task) => task.timeDiagnostic.status === 'observed');
+  if (tasks.length === 0) return '<div class="legacy">没有可以比较的本地耗时与上下文处理数据。</div>';
+  const maximum = (selector) => Math.max(0, ...tasks.map(selector).filter(Number.isFinite));
+  const maxInput = maximum((task) => task.timeDiagnostic.tokens.inputTokens);
+  const maxOutput = maximum((task) => task.timeDiagnostic.tokens.outputTokens);
+  const maxActive = maximum((task) => task.timeDiagnostic.activeTurnUnionSeconds);
+  const maxTool = maximum((task) => task.timeDiagnostic.toolUnionSeconds);
+  const cards = tasks.map((task) => {
+    const diagnostic = task.timeDiagnostic;
+    const tokenObserved = diagnostic.tokens.status === 'direct_completed_responses';
+    return `<article class="comparison-card"><h4>${escapeHtml(task.displayKey)} · ${renderRecordedText(task.title)}</h4><div class="comparison-row"><span>累计输入</span>${relativeBar(tokenObserved ? diagnostic.tokens.inputTokens : null, maxInput, 'input')}<strong>${escapeHtml(tokenObserved ? compactChineseNumber(diagnostic.tokens.inputTokens) : '不可用')}</strong></div><div class="comparison-row"><span>累计输出</span>${relativeBar(tokenObserved ? diagnostic.tokens.outputTokens : null, maxOutput, 'output')}<strong>${escapeHtml(tokenObserved ? compactChineseNumber(diagnostic.tokens.outputTokens) : '不可用')}</strong></div><div class="comparison-row"><span>活跃执行</span>${relativeBar(diagnostic.activeTurnUnionSeconds, maxActive, 'active')}<strong>${escapeHtml(compactChineseDuration(diagnostic.activeTurnUnionSeconds))}</strong></div><div class="comparison-row"><span>工具调用</span>${relativeBar(diagnostic.toolUnionSeconds, maxTool, 'tool')}<strong>${escapeHtml(compactChineseDuration(diagnostic.toolUnionSeconds))}</strong></div></article>`;
+  }).join('');
+  return `<h3>任务消耗直观对比</h3><p class="subtitle">条形长度只比较本报告内的任务。累计输入/输出是已经发生的模型响应所报告的 Token（模型处理文本单位）之和，不是 OTel（本地遥测日志）产生的额外消耗，也不是 Codex 额度账单。</p><div class="comparison-grid">${cards}</div>`;
+}
+
 function renderObservabilitySection(data) {
   const observed = data.tasks.filter((task) => task.timeDiagnostic.status === 'observed').length;
   const anomalyCount = data.tasks.reduce((total, task) => total + task.anomalies.length, 0) + data.observability.batchAnomalies.length;
   const rows = data.tasks.map((task) => {
     const diagnostic = task.timeDiagnostic;
-    const tokens = diagnostic.status === 'observed' && diagnostic.tokens.status === 'direct_completed_responses' ? `${numberLabel(diagnostic.tokens.inputTokens)} in / ${numberLabel(diagnostic.tokens.outputTokens)} out` : '不可用';
-    const timing = diagnostic.status === 'observed' ? `dispatch→first turn ${secondsLabel(task.lifecycle.dispatchToFirstTurnSeconds)}（上界）；active ${secondsLabel(diagnostic.activeTurnUnionSeconds)}；tool ${secondsLabel(diagnostic.toolUnionSeconds)}；TTFT median ${secondsLabel(diagnostic.clientObservedTtftSeconds?.median)}` : `未观测：${diagnostic.reason ?? diagnostic.status}`;
-    const anomalies = task.anomalies.length > 0 ? task.anomalies.map((item) => `${item.code}（${item.evidence}）`).join('；') : '未命中确定性异常规则';
-    return `<tr><td>${escapeHtml(task.displayKey)}</td><td>${escapeHtml(task.model)} / ${escapeHtml(task.thinking)}<br><small>${escapeHtml(task.workClass ?? 'legacy')}</small></td><td>${escapeHtml(task.lifecycle.dispatchedAt ?? '未派发')}<br><small>窗口 ${escapeHtml(secondsLabel(task.lifecycle.dispatchToEndSeconds))}</small></td><td>${escapeHtml(timing)}</td><td>${escapeHtml(tokens)}<br><small>额度代理，不是账单</small></td><td>${escapeHtml(anomalies)}</td></tr>`;
+    const tokens = diagnostic.status === 'observed' && diagnostic.tokens.status === 'direct_completed_responses'
+      ? `<div class="token-pair"><span><b>累计输入</b>${renderHumanCount(diagnostic.tokens.inputTokens, 'Token')}</span><span><b>累计输出</b>${renderHumanCount(diagnostic.tokens.outputTokens, 'Token')}</span></div><small>这是已发生请求的累计上下文处理量；不是 OTel 额外消耗，也不是额度账单。</small>`
+      : '不可用';
+    const timing = diagnostic.status === 'observed'
+      ? `<ul class="compact-list"><li>派发到首次模型交互：${renderHumanDuration(task.lifecycle.dispatchToFirstTurnSeconds)}（观测上界）</li><li>活跃执行：${renderHumanDuration(diagnostic.activeTurnUnionSeconds)}</li><li>工具调用：${renderHumanDuration(diagnostic.toolUnionSeconds)}</li><li>首字返回中位数：${renderHumanDuration(diagnostic.clientObservedTtftSeconds?.median)}</li></ul>`
+      : escapeHtml(unavailableDiagnosticLabel(diagnostic));
+    const anomalies = task.anomalies.length > 0 ? `<ul class="compact-list">${task.anomalies.map((item) => `<li>${escapeHtml(anomalyChineseText(item))}</li>`).join('')}</ul>` : '未命中确定性异常规则';
+    return `<tr><td>${escapeHtml(task.displayKey)}</td><td class="route-cell">${renderTaskRoute(task)}</td><td>${escapeHtml(task.lifecycle.dispatchedAt ?? '未派发')}<br><small>派发窗口：${escapeHtml(compactChineseDuration(task.lifecycle.dispatchToEndSeconds))}</small></td><td>${timing}</td><td class="token-cell">${tokens}</td><td>${anomalies}</td></tr>`;
   }).join('');
   const actual = data.observability.activeTurnConcurrency;
-  const batchAnomalies = data.observability.batchAnomalies.length > 0 ? `<div class="warning"><strong>并发异常：</strong>${escapeHtml(data.observability.batchAnomalies.map((item) => `${item.code}（${item.evidence}）`).join('；'))}</div>` : '';
-  return `<section><h2>按需观测与消耗诊断</h2><p class="subtitle">模式：${escapeHtml(data.observability.mode)}。默认 lean 只读台账；diagnostic 才读取 rollout 和用户显式提供的 OTel/Desktop 日志。</p><div class="metrics"><div class="metric"><strong>${data.observability.lifecycleConcurrency.maxConcurrent}</strong><span>派发窗口最大重叠</span></div><div class="metric"><strong>${actual.maxConcurrent ?? '—'}</strong><span>完成 turn 最大并发</span></div><div class="metric"><strong>${observed}/${data.taskCount}</strong><span>有时间诊断的任务</span></div><div class="metric"><strong>${anomalyCount}</strong><span>异常证据项</span></div></div>${batchAnomalies}<div class="legacy"><strong>解释边界：</strong>${escapeHtml(data.observability.lifecycleConcurrency.interpretation)} ${escapeHtml(data.observability.activeTurnConcurrency.interpretation)} ${escapeHtml(data.observability.quotaInterpretation)}</div><h3>派发窗口时间线</h3>${renderLifecycleGantt(data)}<div class="table-wrap"><table><thead><tr><th>任务</th><th>路由</th><th>台账时间</th><th>本地耗时证据</th><th>Token / 额度代理</th><th>异常</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+  const batchAnomalies = data.observability.batchAnomalies.length > 0 ? `<div class="warning"><strong>并发异常：</strong><ul>${data.observability.batchAnomalies.map((item) => `<li>${escapeHtml(batchAnomalyChineseText(item))}</li>`).join('')}</ul></div>` : '';
+  const mode = data.observability.mode === 'diagnostic' ? '深度诊断模式（diagnostic）' : '轻量报告模式（lean）';
+  return `<section><h2>按需观测与消耗诊断</h2><p class="subtitle">当前模式：${escapeHtml(mode)}。轻量模式只读取任务台账；只有深度诊断模式才读取任务过程日志（rollout）、OTel（本地遥测日志）以及用户明确提供的桌面客户端日志。</p><div class="metrics"><div class="metric"><strong>${data.observability.lifecycleConcurrency.maxConcurrent}</strong><span>派发窗口最大重叠数</span></div><div class="metric"><strong>${actual.maxConcurrent ?? '—'}</strong><span>完成的模型交互轮次最大并发数</span></div><div class="metric"><strong>${observed}/${data.taskCount}</strong><span>具有本地时间诊断的任务</span></div><div class="metric"><strong>${anomalyCount}</strong><span>异常证据项</span></div></div>${batchAnomalies}<div class="legacy"><strong>解释边界：</strong>派发到执行结束的台账窗口重叠，只能证明任务生命周期有重叠，不等于模型内部同时计算。已配对的任务开始/任务完成事件（task_started/task_complete）可以证明模型交互轮次同时活跃，但仍不等于处理器（CPU）或模型内部计算时间。Token 是模型处理文本的计量单位；这里只有同一对话的模型响应完成事件（response.completed）累计值。额度快照属于整个账户，并发时不能归因给单个任务。</div>${renderConsumptionComparison(data)}<h3>派发窗口时间线</h3>${renderLifecycleGantt(data)}<div class="table-wrap"><table><thead><tr><th>任务</th><th>模型与任务类型</th><th>台账时间</th><th>本地耗时证据</th><th>累计上下文处理量（非账单）</th><th>异常</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 
 function renderDeliveryReport(data) {
-  const statusRows = data.tasks.map((task) => `<tr><td>${escapeHtml(task.displayKey)}</td><td>${escapeHtml(task.title)}</td><td><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(task.status)}</span></td><td>${escapeHtml(task.deliverables.at(-1)?.userVisibleSummary ?? '历史证据不可用')}</td><td>${escapeHtml(task.nextGate)}</td></tr>`).join('');
+  const statusRows = data.tasks.map((task) => `<tr><td>${escapeHtml(task.displayKey)}</td><td>${renderRecordedText(task.title)}</td><td><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(reportStatusLabel(task.status))}</span></td><td>${renderRecordedText(task.deliverables.at(-1)?.userVisibleSummary ?? '历史证据不可用')}</td><td>${renderRecordedText(task.nextGate)}</td></tr>`).join('');
   const timelines = data.tasks.map((task) => {
     const packages = task.deliverables.map((deliverable) => {
       const packageClass = ['reclaimed', 'blocked', 'changes_requested'].includes(task.status) || deliverable.deliveryStatus === 'rejected' ? 'failed' : reportStatusClass(task.status);
-      const artifacts = deliverable.artifacts.length > 0 ? `<div class="artifact-grid">${deliverable.artifacts.map(renderArtifactHtml).join('')}</div>` : `<p class="empty">无截图：${escapeHtml(deliverable.noScreenshotReason ?? '未说明')}</p>`;
-      const metrics = deliverable.testSummary.metrics.map((metric) => `<li>${escapeHtml(metric.label)}：${escapeHtml(metric.before)} → ${escapeHtml(metric.after)}${metric.unit ? ` ${escapeHtml(metric.unit)}` : ''}</li>`).join('');
-      return `<article class="package ${packageClass}"><div class="package-head"><div><h3>Attempt ${deliverable.attempt} · ${escapeHtml(deliverable.userVisibleSummary)}</h3><p>${escapeHtml(deliverable.recordedAt)} · candidate ${escapeHtml(deliverable.candidateCommit)}</p></div><span class="badge ${packageClass}">${escapeHtml(deliveryStatusLabel(deliverable, task))}</span></div><div class="columns"><div><h4>实际改变</h4><ul>${deliverable.actualChanges.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></div><div><h4>测试 / 数值</h4><p>${escapeHtml(deliverable.testSummary.status)}：${escapeHtml(deliverable.testSummary.summary)}</p><ul>${metrics}</ul></div></div>${deliverable.incompleteItems.length > 0 ? `<div class="warning"><strong>未完成：</strong>${escapeHtml(deliverable.incompleteItems.join('；'))}</div>` : ''}${deliverable.reviewReason ? `<div class="review"><strong>主控审查：</strong>${escapeHtml(deliverable.reviewReason)}</div>` : ''}${artifacts}</article>`;
+      const artifacts = deliverable.artifacts.length > 0 ? `<div class="artifact-grid">${deliverable.artifacts.map(renderArtifactHtml).join('')}</div>` : `<p class="empty">无截图：${renderRecordedText(deliverable.noScreenshotReason ?? '未说明')}</p>`;
+      const metrics = deliverable.testSummary.metrics.map((metric) => `<li>${renderRecordedText(metric.label)}：${renderRecordedText(metric.before)} → ${renderRecordedText(metric.after)}${metric.unit ? ` ${renderRecordedText(metric.unit)}` : ''}</li>`).join('');
+      const testStatus = ({ passed: '通过', failed: '失败', partial: '部分通过', blocked: '受阻' })[deliverable.testSummary.status] ?? `未识别状态（${deliverable.testSummary.status}）`;
+      return `<article class="package ${packageClass}"><div class="package-head"><div><h3>第 ${deliverable.attempt} 次尝试 · ${renderRecordedText(deliverable.userVisibleSummary)}</h3><p>${escapeHtml(deliverable.recordedAt)} · 候选提交：${escapeHtml(deliverable.candidateCommit)}</p></div><span class="badge ${packageClass}">${escapeHtml(deliveryStatusLabel(deliverable, task))}</span></div><div class="columns"><div><h4>实际改变</h4><ul>${deliverable.actualChanges.map((item) => `<li>${renderRecordedText(item)}</li>`).join('')}</ul></div><div><h4>测试 / 数值</h4><p>${escapeHtml(testStatus)}：${renderRecordedText(deliverable.testSummary.summary)}</p><ul>${metrics}</ul></div></div>${deliverable.incompleteItems.length > 0 ? `<div class="warning"><strong>未完成：</strong>${deliverable.incompleteItems.map(renderRecordedText).join('；')}</div>` : ''}${deliverable.reviewReason ? `<div class="review"><strong>主控审查：</strong>${renderRecordedText(deliverable.reviewReason)}</div>` : ''}${artifacts}</article>`;
     }).join('');
     const legacy = task.deliverables.length === 0 && task.legacyArtifacts.length === 0 ? '<div class="legacy">历史证据不可用；不据此伪造完成状态。</div>' : '';
-    const stageRefs = task.legacyArtifacts.length > 0 ? `<details class="legacy"><summary>阶段证据参考（未验证）</summary><ul>${task.legacyArtifacts.map((artifact) => `<li>${escapeHtml(artifact.createdAt)} · ${escapeHtml(artifact.label)} · ${escapeHtml(artifact.reference)}</li>`).join('')}</ul></details>` : '';
-    const failures = task.failureHistory.length > 0 ? `<details class="warning"><summary>失败 / 阻塞事件（${task.failureHistory.length}）</summary><ul>${task.failureHistory.map((failure) => `<li>${escapeHtml(failure.createdAt)} · ${escapeHtml(failure.attemptedStage)} · ${escapeHtml(failure.failureDomain)}/${escapeHtml(failure.failureClass)} · ${escapeHtml(failure.commandSummary)}</li>`).join('')}</ul></details>` : '';
-    const diagnostics = task.diagnostics.length > 0 ? `<details class="legacy"><summary>诊断价值裁决（${task.diagnostics.length}）</summary><ul>${task.diagnostics.map((diagnostic) => `<li>${escapeHtml(diagnostic.classification)} · ${escapeHtml(diagnostic.summary)}</li>`).join('')}</ul></details>` : '';
-    const objective = task.objective ? `<div class="legacy"><strong>Objective：</strong>${escapeHtml(task.objective.objectiveId)} · replacement ${task.objective.replacementCount}/${OBJECTIVE_FUSE_REPLACEMENT_LIMIT} · ${Math.round(task.objective.cumulativeExecutionMs / 60000)} min${task.objective.fuseOpen ? ` · 已熔断：${escapeHtml(task.objective.reasons.join(', '))}` : ''}</div>` : '';
-    const closeout = task.closeout ? `<div class="review"><strong>事故收口：</strong>${escapeHtml(task.closeout.userVisibleSummary)} · notification=${escapeHtml(task.closeout.notificationStatus)} · report=${escapeHtml(task.closeout.reportStatus)}</div>` : '';
-    const timeDiagnostic = task.timeDiagnostic.status === 'observed' ? `<div class="diagnostic"><strong>时间证据：</strong>active ${escapeHtml(secondsLabel(task.timeDiagnostic.activeTurnUnionSeconds))} · tool ${escapeHtml(secondsLabel(task.timeDiagnostic.toolUnionSeconds))} · unknown ${escapeHtml(secondsLabel(task.timeDiagnostic.unknownSeconds))}（不归因）· context ${escapeHtml(task.timeDiagnostic.contextPeakRatio ?? '不可用')} · compaction ${task.timeDiagnostic.compactions}</div>` : '';
-    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${escapeHtml(task.title)}</h2><p>${escapeHtml(task.taskMode)} · ${escapeHtml(task.model)}/${escapeHtml(task.thinking)} · attempt ${task.attemptCount}</p></div><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(task.status)}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${escapeHtml(task.blocker)}</div>` : ''}${closeout}${timeDiagnostic}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${escapeHtml(task.nextGate)}</div></section>`;
+    const stageRefs = task.legacyArtifacts.length > 0 ? `<details class="legacy"><summary>阶段证据参考（未验证）</summary><ul>${task.legacyArtifacts.map((artifact) => `<li>${escapeHtml(artifact.createdAt)} · ${renderRecordedText(artifact.label)} · 证据路径：${escapeHtml(artifact.reference)}</li>`).join('')}</ul></details>` : '';
+    const failures = task.failureHistory.length > 0 ? `<details class="warning"><summary>失败 / 阻塞事件（${task.failureHistory.length}）</summary><ul>${task.failureHistory.map((failure) => `<li>${escapeHtml(failure.createdAt)} · 阶段：${renderRecordedText(failure.attemptedStage)} · 领域：${escapeHtml(reportEnumLabel(REPORT_FAILURE_DOMAIN_LABELS, failure.failureDomain, '未识别领域'))} · 分类：${escapeHtml(reportEnumLabel(REPORT_FAILURE_CLASS_LABELS, failure.failureClass, '未识别分类'))} · ${renderRecordedText(failure.commandSummary)}</li>`).join('')}</ul></details>` : '';
+    const diagnostics = task.diagnostics.length > 0 ? `<details class="legacy"><summary>诊断价值裁决（${task.diagnostics.length}）</summary><ul>${task.diagnostics.map((diagnostic) => `<li>${escapeHtml(reportEnumLabel(REPORT_DIAGNOSTIC_LABELS, diagnostic.classification, '未识别诊断分类'))} · ${renderRecordedText(diagnostic.summary)}</li>`).join('')}</ul></details>` : '';
+    const objective = task.objective ? `<div class="legacy"><strong>任务目标：</strong>技术标识 ${escapeHtml(task.objective.objectiveId)} · 已替换 ${task.objective.replacementCount}/${OBJECTIVE_FUSE_REPLACEMENT_LIMIT} 次 · 累计执行 ${escapeHtml(compactChineseDuration(task.objective.cumulativeExecutionMs / 1000))}${task.objective.fuseOpen ? ` · 已熔断：${task.objective.reasons.map(renderRecordedText).join('；')}` : ''}</div>` : '';
+    const closeout = task.closeout ? `<div class="review"><strong>事故收口：</strong>${renderRecordedText(task.closeout.userVisibleSummary)} · 通知状态：${escapeHtml(({ sent: '已发送', pending: '待发送', failed: '发送失败' })[task.closeout.notificationStatus] ?? `未识别（${task.closeout.notificationStatus}）`)} · 报告状态：${escapeHtml(({ synced: '已同步', pending: '待同步', failed: '同步失败' })[task.closeout.reportStatus] ?? `未识别（${task.closeout.reportStatus}）`)}</div>` : '';
+    const timeDiagnostic = task.timeDiagnostic.status === 'observed' ? `<div class="diagnostic"><strong>时间证据：</strong>活跃执行 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.activeTurnUnionSeconds))} · 工具调用 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.toolUnionSeconds))} · 无法归因 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.unknownSeconds))} · 上下文峰值占比 ${task.timeDiagnostic.contextPeakRatio === null ? '不可用' : `${Math.round(task.timeDiagnostic.contextPeakRatio * 100)}%`} · 上下文压缩 ${task.timeDiagnostic.compactions} 次</div>` : '';
+    const routeSummary = `${reportEnumLabel(REPORT_TASK_MODE_LABELS, task.taskMode, '未识别任务模式')} · ${reportEnumLabel(REPORT_MODEL_LABELS, task.model, '未识别模型')} · ${reportEnumLabel(REPORT_THINKING_LABELS, task.thinking, '未识别推理强度')} · 第 ${task.attemptCount} 次尝试`;
+    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${renderRecordedText(task.title)}</h2><p>${escapeHtml(routeSummary)}</p><small>模型技术标识：${escapeHtml(task.model)}</small></div><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(reportStatusLabel(task.status))}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${renderRecordedText(task.blocker)}</div>` : ''}${closeout}${timeDiagnostic}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${renderRecordedText(task.nextGate)}</div></section>`;
   }).join('');
   const integrated = data.tasks.filter((task) => task.status === 'integrated').length;
   const failed = data.tasks.filter((task) => ['blocked', 'reclaimed', 'changes_requested'].includes(task.status)).length;
-  const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32;--blue:#315f86}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty,.diagnostic{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}.diagnostic{background:#edf4fa;border-color:var(--blue)}.gantt{display:grid;gap:8px;margin:12px 0 18px}.gantt-row{display:grid;grid-template-columns:70px minmax(220px,1fr) minmax(280px,auto);gap:10px;align-items:center}.gantt-track{height:16px;position:relative;background:#e5ddd2;border-radius:8px;overflow:hidden}.gantt-bar{position:absolute;top:0;height:100%;background:var(--amber)}.gantt-bar.ok{background:var(--green)}.gantt-bar.failed{background:var(--red)}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}.gantt-row{grid-template-columns:48px 1fr}.gantt-row small{grid-column:1/-1}th:nth-child(4),td:nth-child(4){min-width:260px}}';
+  const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32;--blue:#315f86;--purple:#73509b}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.translation-note{display:block;margin-top:3px;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty,.diagnostic{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}.diagnostic{background:#edf4fa;border-color:var(--blue)}.gantt{display:grid;gap:8px;margin:12px 0 18px}.gantt-row{display:grid;grid-template-columns:70px minmax(220px,1fr) minmax(280px,auto);gap:10px;align-items:center}.gantt-track{height:16px;position:relative;background:#e5ddd2;border-radius:8px;overflow:hidden}.gantt-bar{position:absolute;top:0;height:100%;background:var(--amber)}.gantt-bar.ok{background:var(--green)}.gantt-bar.failed{background:var(--red)}.comparison-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0 20px}.comparison-card{padding:14px;background:var(--panel);border:1px solid var(--line)}.comparison-row{display:grid;grid-template-columns:72px minmax(120px,1fr) 92px;gap:10px;align-items:center;margin:9px 0}.comparison-row>strong{text-align:right}.comparison-track{display:block;height:12px;background:#e5ddd2;border-radius:8px;overflow:hidden}.comparison-bar{display:block;height:100%;border-radius:8px}.comparison-bar.input{background:var(--purple)}.comparison-bar.output{background:var(--green)}.comparison-bar.active{background:var(--blue)}.comparison-bar.tool{background:var(--amber)}.route-cell{min-width:210px}.route-cell>*{display:block;margin-bottom:3px}.token-cell{min-width:210px}.token-pair{display:grid;gap:9px;margin-bottom:8px}.token-pair span,.human-number{display:block}.token-pair b{display:block;color:var(--muted);font-size:12px}.compact-list{margin:0;padding-left:18px}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid,.comparison-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}.gantt-row{grid-template-columns:48px 1fr}.gantt-row small{grid-column:1/-1}.comparison-row{grid-template-columns:64px minmax(90px,1fr) 84px}th:nth-child(4),td:nth-child(4){min-width:260px}}';
   return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.deliverableCount}</strong><span>历史成果包</span></div><div class="metric"><strong>${integrated}</strong><span>已集成</span></div><div class="metric"><strong>${failed}</strong><span>阻塞 / 收回 / 未通过</span></div></div></header><main><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
 }
 
@@ -3694,7 +3810,7 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.13.0',
+    'codex-task-control v0.13.1',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',

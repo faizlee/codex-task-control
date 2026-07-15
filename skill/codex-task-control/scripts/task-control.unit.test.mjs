@@ -842,14 +842,17 @@ test('lean observability piggybacks existing lifecycle events and never invokes 
     assert.equal(await readFile(registryPath, 'utf8'), before, 'lean reporting must not mutate the task ledger');
     const html = await readFile(report.reportPath, 'utf8');
     assert.match(html, /按需观测与消耗诊断/);
-    assert.match(html, /默认 lean 只读台账/);
+    assert.match(html, /轻量报告模式（lean）/);
+    assert.match(html, /轻量模式只读取任务台账/);
+    assert.match(html, />执行中</);
+    assert.doesNotMatch(html, />executing</);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test('diagnostic observability reads local evidence only on demand and labels tokens as a quota proxy', async () => {
+test('diagnostic observability renders Chinese explanations and human-readable consumption only on demand', async () => {
   const fixture = await createResultProtocolFixture();
   const { taskControlHome, projectRoot, input } = fixture;
   try {
@@ -877,7 +880,7 @@ test('diagnostic observability reads local evidence only on demand and labels to
           repeatedCommandCount: 2,
           retryChainCount: 1,
           threadHealth: { status: 'warning', reasons: [] },
-          otel: { status: 'observed', completedResponseTokens: { sampleCount: 2, inputTokens: 12000, outputTokens: 900 }, modelNames: ['gpt-5.6-terra'], reasoningEfforts: ['medium'], inferenceTimingAvailable: false },
+          otel: { status: 'observed', completedResponseTokens: { sampleCount: 2, inputTokens: 2824623, outputTokens: 120000000 }, modelNames: ['gpt-5.6-terra'], reasoningEfforts: ['medium'], inferenceTimingAvailable: false },
           rateLimits: { sampleCount: 2, primary: { usedPercent: { first: 10, last: 11 } }, secondary: null },
         },
         turnEnvelopes: [
@@ -894,10 +897,18 @@ test('diagnostic observability reads local evidence only on demand and labels to
     assert.equal(report.observability.activeTurnConcurrency.maxConcurrent, 1);
     assert.equal(await readFile(registryPath, 'utf8'), before, 'diagnostic reporting must not mutate the task ledger or heartbeat');
     const html = await readFile(report.reportPath, 'utf8');
-    assert.match(html, /12,000 in \/ 900 out/);
-    assert.match(html, /额度代理，不是账单/);
-    assert.match(html, /repeated_commands/);
-    assert.match(html, /unknown 45 秒（不归因）/);
+    assert.match(html, /282\.46 万 Token/);
+    assert.match(html, /精确值：2,824,623 Token/);
+    assert.match(html, /累计输出<\/b><strong class="human-number">1\.20 亿 Token/);
+    assert.match(html, /精确值：120,000,000 Token/);
+    assert.match(html, /不是 OTel 额外消耗，也不是额度账单/);
+    assert.match(html, /任务消耗直观对比/);
+    assert.match(html, /发现重复命令（2 类重复指纹）/);
+    assert.match(html, /无法归因 45 秒/);
+    assert.match(html, /活跃执行：1 分 40 秒/);
+    assert.match(html, /Terra（经济型代码理解模型）/);
+    assert.match(html, /原始英文或技术记录/);
+    assert.doesNotMatch(html, /2,824,623 in \/ 120,000,000 out|TTFT median|repeated_commands|unknown 45 秒|>executing</);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
