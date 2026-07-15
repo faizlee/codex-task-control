@@ -1646,7 +1646,8 @@ function validateControllerHeartbeat(value, knownControllers) {
   assertSafeThreadId(value.controllerThreadId, 'heartbeat.controllerThreadId');
   if (!knownControllers.has(value.controllerThreadId)) fail('REGISTRY_INVALID', `heartbeat controller 未登记: ${value.controllerThreadId}`);
   const isCurrentProtocol = value.protocolVersion === HEARTBEAT_PROTOCOL_VERSION;
-  if (!Number.isInteger(value.generation) || value.generation < (isCurrentProtocol ? 0 : 1)) fail('REGISTRY_INVALID', 'heartbeat generation 无效');
+  const supportsPreparedGenerationZero = value.protocolVersion === 2 || isCurrentProtocol;
+  if (!Number.isInteger(value.generation) || value.generation < (supportsPreparedGenerationZero ? 0 : 1)) fail('REGISTRY_INVALID', 'heartbeat generation 无效');
   if (!has(value.status, HEARTBEAT_STATUSES)) fail('REGISTRY_INVALID', `heartbeat status 无效: ${value.status}`);
   if (!has(value.reason, HEARTBEAT_REASONS)) fail('REGISTRY_INVALID', `heartbeat reason 无效: ${value.reason}`);
   if (value.triggerTaskThreadId !== null) assertSafeThreadId(value.triggerTaskThreadId, 'heartbeat.triggerTaskThreadId');

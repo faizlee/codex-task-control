@@ -1598,6 +1598,29 @@ test('legacy confirmed heartbeat migrates to protocol v3 without losing generati
   }
 });
 
+test('protocol v2 prepared generation zero remains readable and migrates in memory', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-v2-zero-'));
+  const projectRoot = 'E:\\work\\project\\heartbeat-v2-zero';
+  try {
+    const { input } = await createHeartbeatFixture(taskControlHome, projectRoot);
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const heartbeat = registry.controllerHeartbeats[0];
+    heartbeat.protocolVersion = 2;
+    for (const key of ['consecutiveNoProgressCycles', 'lastCycleFingerprint', 'lastCycleReceiptKey', 'lastMeaningfulProgressAt', 'noProgressFuseCount', 'manualResumeCount', 'lastManualResumeAt', 'lastManualResumeReason']) delete heartbeat[key];
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+
+    const scan = await controllerScanPendingEvents(input);
+    assert.equal(scan.heartbeatState.protocolVersion, 3);
+    assert.equal(scan.heartbeatState.generation, 0);
+    assert.equal(scan.heartbeatState.consecutiveNoProgressCycles, 0);
+    const unchanged = JSON.parse(await readFile(registryPath, 'utf8'));
+    assert.equal(unchanged.controllerHeartbeats[0].protocolVersion, 2, 'read-only scan must not rewrite the v2 ledger');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
 test('a timed-out pending heartbeat action returns bounded compensation', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-timeout-'));
   const projectRoot = 'E:\\work\\project\\heartbeat-pending-timeout';
