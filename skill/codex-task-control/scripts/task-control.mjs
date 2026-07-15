@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { execFile as execFileCallback } from 'node:child_process';
 import { homedir } from 'node:os';
 import { basename, dirname, join, win32 } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { access, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
+import { promisify } from 'node:util';
 
 export const TASK_STATUSES = Object.freeze(['executing', 'awaiting_review', 'changes_requested', 'accepted', 'integrated', 'blocked', 'reclaimed']);
 export const REVIEW_VERDICTS = Object.freeze(['pending', 'changes_requested', 'accepted']);
@@ -75,7 +77,9 @@ export const OBSERVABILITY_PROTOCOL_VERSION = 1;
 export const OBSERVABILITY_MODES = Object.freeze(['lean', 'diagnostic']);
 export const OBSERVABILITY_PHASES = Object.freeze(['registered', 'dispatch_confirmed', 'progress_ingested', 'failure_ingested', 'completion_ingested', 'changes_requested', 'rework_prepared', 'reclaimed', 'blocked', 'review_accepted', 'integrated', 'archived']);
 export const OBSERVABILITY_CONFIDENCE = Object.freeze(['direct', 'bounded', 'unavailable']);
+export const INTEGRATION_PROOF_PROTOCOL_VERSION = 1;
 const OBSERVABILITY_CLOCK_ID = `task-control-${process.pid}-${randomUUID().replaceAll('-', '')}`;
+const execFile = promisify(execFileCallback);
 export const HEARTBEAT_INTERVALS_MS = Object.freeze({
   repeatable: 3 * 60 * 1000,
   bounded_reasoning_medium: 5 * 60 * 1000,
@@ -977,7 +981,7 @@ function normalizeEvidenceReferences(value = []) {
   });
 }
 
-function validateStageCheckpoint(task, stageId, evidence) {
+function validateStageCheckpoint(task, stageId, evidence, { pendingStages = new Map() } = {}) {
   if (!implementationTask(task)) {
     if (stageId !== undefined || (Array.isArray(evidence) && evidence.length > 0)) fail('STAGE_NOT_APPLICABLE', 'control_only/legacy 任务不得提交实施阶段证据');
     return { stageId: null, evidence: [] };
@@ -986,9 +990,22 @@ function validateStageCheckpoint(task, stageId, evidence) {
   const normalizedStageId = stageId.trim();
   const gateIndex = task.stageGates.findIndex((gate) => gate.id === normalizedStageId);
   if (gateIndex < 0) fail('STAGE_UNKNOWN', `未登记的 stage: ${normalizedStageId}`);
-  if (completedStageIds(task).includes(normalizedStageId)) fail('STAGE_ALREADY_COMPLETED', `当前轮次 stage 已完成: ${normalizedStageId}`);
+  if (completedStageIds(task).includes(normalizedStageId) || pendingStages.has(normalizedStageId)) fail('STAGE_ALREADY_COMPLETED', `当前轮次 stage 已完成或已提交待入账: ${normalizedStageId}`);
   const completed = new Set(completedStageIds(task));
-  const missingPredecessors = task.stageGates.slice(0, gateIndex).filter((gate) => gate.required && !completed.has(gate.id)).map((gate) => gate.id);
+  let newestPendingPredecessorAt = null;
+  const missingPredecessors = [];
+  for (const gate of task.stageGates.slice(0, gateIndex)) {
+    if (!gate.required || completed.has(gate.id)) continue;
+    const pending = pendingStages.get(gate.id) ?? [];
+    if (pending.length === 0) {
+      missingPredecessors.push(gate.id);
+      continue;
+    }
+    if (pending.length !== 1) fail('STAGE_PREDECESSOR_DUPLICATE', `待入账前置阶段存在重复事件: ${gate.id}`);
+    const createdAt = pending[0].createdAt;
+    if (newestPendingPredecessorAt !== null && Date.parse(createdAt) <= Date.parse(newestPendingPredecessorAt)) fail('STAGE_PREDECESSOR_ORDER_INVALID', `待入账前置阶段时间顺序无效: ${gate.id}`);
+    newestPendingPredecessorAt = createdAt;
+  }
   if (missingPredecessors.length > 0) fail('STAGE_ORDER_INVALID', `必须先完成阶段: ${missingPredecessors.join(', ')}`);
   const normalizedEvidence = normalizeEvidenceReferences(evidence);
   const knownEvidence = new Set(task.evidenceCommands.map((entry) => entry.id));
@@ -999,6 +1016,53 @@ function validateStageCheckpoint(task, stageId, evidence) {
   const missingEvidence = gate.requiredEvidence.filter((id) => !supplied.has(id));
   if (missingEvidence.length > 0) fail('STAGE_EVIDENCE_MISSING', `stage ${normalizedStageId} 缺少证据: ${missingEvidence.join(', ')}`);
   return { stageId: normalizedStageId, evidence: normalizedEvidence };
+}
+
+function pendingStageFromEvent(paths, task, event) {
+  if (!implementationTask(task)
+    || event.projectKey !== paths.projectKey
+    || event.threadId !== task.threadId
+    || event.parentThreadId !== task.parentThreadId
+    || event.controllerThreadId !== task.directControllerThreadId
+    || event.attemptCount !== task.attemptCount
+    || event.taskMode !== task.taskMode
+    || event.contractDigest !== task.contractDigest
+    || event.contractVersion !== contractVersion(task)
+    || !isTimestamp(event.createdAt)
+    || Date.parse(event.createdAt) > Date.now() + 60_000) return null;
+  const freshnessAnchor = latestTimestamp(task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
+  if (Date.parse(event.createdAt) <= Date.parse(freshnessAnchor) || !nonEmpty(event.stageId)) return null;
+  const gate = task.stageGates.find((candidate) => candidate.id === event.stageId.trim());
+  if (!gate) return null;
+  try {
+    const evidence = normalizeEvidenceReferences(event.evidence ?? []);
+    const knownEvidence = new Set(task.evidenceCommands.map((entry) => entry.id));
+    if (evidence.some((entry) => !knownEvidence.has(entry.id))) return null;
+    const supplied = new Set(evidence.map((entry) => entry.id));
+    if (gate.requiredEvidence.some((id) => !supplied.has(id))) return null;
+  } catch {
+    return null;
+  }
+  return { stageId: gate.id, createdAt: event.createdAt };
+}
+
+async function pendingStagesForCreation(paths, task) {
+  const pendingStages = new Map();
+  for (const eventPath of await listTaskEventFiles(paths, task)) {
+    if (artifactTypeForPath(eventPath) !== 'task_progress') continue;
+    let event;
+    try {
+      event = await readArtifact(eventPath, 'task_progress');
+    } catch {
+      continue;
+    }
+    const stage = pendingStageFromEvent(paths, task, event);
+    if (stage === null) continue;
+    const existing = pendingStages.get(stage.stageId) ?? [];
+    existing.push(stage);
+    pendingStages.set(stage.stageId, existing);
+  }
+  return pendingStages;
 }
 
 function assertEventContractMatches(task, event) {
@@ -1605,6 +1669,18 @@ function validateTask(value, projectRoot) {
   if (!has(value.status, TASK_STATUSES)) fail('REGISTRY_INVALID', `status 无效: ${value.status}`);
   if (!has(value.reviewVerdict, REVIEW_VERDICTS)) fail('REGISTRY_INVALID', `reviewVerdict 无效: ${value.reviewVerdict}`);
   if (!has(value.integrationStatus, INTEGRATION_STATUSES)) fail('REGISTRY_INVALID', `integrationStatus 无效: ${value.integrationStatus}`);
+  if ('integrationProof' in value && value.integrationProof !== null) {
+    const proof = value.integrationProof;
+    if (!isObject(proof)
+      || proof.schemaVersion !== INTEGRATION_PROOF_PROTOCOL_VERSION
+      || proof.method !== 'git_ancestor'
+      || !nonEmpty(proof.recordedCandidateCommit)
+      || !/^[0-9a-f]{40,64}$/.test(proof.candidateCommit ?? '')
+      || !nonEmpty(proof.targetRef)
+      || !/^[0-9a-f]{40,64}$/.test(proof.targetCommit ?? '')
+      || !isTimestamp(proof.verifiedAt)) fail('REGISTRY_INVALID', 'integrationProof 结构无效');
+    if (proof.recordedCandidateCommit !== value.candidateCommit || value.status !== 'integrated' || value.integrationStatus !== 'integrated') fail('REGISTRY_INVALID', 'integrationProof 与候选提交或生命周期不一致');
+  }
   if (!has(value.notificationStatus, NOTIFICATION_STATUSES)) fail('REGISTRY_INVALID', `notificationStatus 无效: ${value.notificationStatus}`);
   if (value.candidateCommit !== null && !nonEmpty(value.candidateCommit)) fail('REGISTRY_INVALID', 'candidateCommit 无效');
   if (value.completionEventCreatedAt !== undefined && !isTimestamp(value.completionEventCreatedAt)) fail('REGISTRY_INVALID', 'completionEventCreatedAt 无效');
@@ -1661,6 +1737,7 @@ function validateTask(value, projectRoot) {
         }
       }
       value.deliverableHistory = value.deliverableHistory.map((entry) => validateDeliverablePackage(entry, value, projectRoot));
+      if (value.status === 'integrated' && 'integrationProof' in value && value.integrationProof === null) fail('REGISTRY_INVALID', '新协议实施任务标记 integrated 前必须记录 Git 祖先证明');
     }
   }
   const executionFields = ['executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason'];
@@ -2412,7 +2489,7 @@ export async function controllerRegisterTask(input) {
     const objectiveCreatedAt = replaced?.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? replaced.objectiveCreatedAt : now;
     const runtime = objectiveRuntime(controlledTasks, objectiveId);
     if (runtime.fuseOpen) fail('OBJECTIVE_RETRY_FUSE_OPEN', `objective ${objectiveId} 已熔断: ${runtime.reasons.join(', ')}`);
-    const draftBase = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, ...parallelControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', observabilityProtocolVersion: OBSERVABILITY_PROTOCOL_VERSION, observabilityReceipts: [], updatedAt: now };
+    const draftBase = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, ...parallelControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', integrationProof: null, notificationStatus: 'pending', observabilityProtocolVersion: OBSERVABILITY_PROTOCOL_VERSION, observabilityReceipts: [], updatedAt: now };
     const draft = appendObservabilityReceipt(draftBase, 'registered', now);
     const tasks = ensureTaskControls([...controlledTasks, draft], rootControllers);
     const task = tasks.find((candidate) => candidate.threadId === input.threadId);
@@ -2580,7 +2657,7 @@ export async function controllerQueryDeliverables(input) {
     const manifestReferences = new Set(deliverables.flatMap((deliverable) => deliverable.artifacts.flatMap((artifact) => [artifact.path, artifact.uri].filter(nonEmpty))));
     const legacyArtifacts = legacyEvidenceForTask(task).filter((artifact) => !manifestReferences.has(artifact.reference));
     const objective = task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? objectiveRuntime(registry.tasks, task.objectiveId, Date.parse(registry.updatedAt)) : null;
-    tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, model: task.model, thinking: task.thinking, workClass: task.workClass ?? null, parallelProtocolVersion: task.parallelProtocolVersion, parallelBatchId: task.parallelBatchId, parallelCandidateId: task.parallelCandidateId, parallelLane: task.parallelLane, attemptCount: task.attemptCount, lastDispatchedAt: task.lastDispatchedAt, progressEventCreatedAt: task.progressEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, failureEventCreatedAt: task.failureEventCreatedAt ?? null, executionEndedAt: task.executionEndedAt, archivedAt: task.archivedAt, stageProgress: task.stageProgress, observabilityProtocolVersion: task.observabilityProtocolVersion, observabilityReceipts: task.observabilityReceipts, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, objective, failureHistory: task.failureHistory, diagnostics: task.diagnostics, closeout: task.closeout, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
+    tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, model: task.model, thinking: task.thinking, workClass: task.workClass ?? null, parallelProtocolVersion: task.parallelProtocolVersion, parallelBatchId: task.parallelBatchId, parallelCandidateId: task.parallelCandidateId, parallelLane: task.parallelLane, attemptCount: task.attemptCount, lastDispatchedAt: task.lastDispatchedAt, progressEventCreatedAt: task.progressEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, failureEventCreatedAt: task.failureEventCreatedAt ?? null, executionEndedAt: task.executionEndedAt, archivedAt: task.archivedAt, stageProgress: task.stageProgress, observabilityProtocolVersion: task.observabilityProtocolVersion, observabilityReceipts: task.observabilityReceipts, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, integrationProof: task.integrationProof ?? null, objective, failureHistory: task.failureHistory, diagnostics: task.diagnostics, closeout: task.closeout, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
   }
   return { reportSchemaVersion: 2, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount: tasks.reduce((total, task) => total + task.deliverables.length, 0), tasks };
 }
@@ -2666,7 +2743,7 @@ function anomalyChineseText(item) {
   if (item.code === 'failed_rework') return `存在失败或返工链（${Number.isFinite(number) ? number : '若干'} 条）`;
   if (item.code === 'context_pressure') return `上下文压力偏高（峰值比例 ${Number.isFinite(number) ? Math.round(number * 100) : '?'}%）`;
   if (item.code === 'compaction') return `发生上下文压缩（${Number.isFinite(number) ? number : '若干'} 次）`;
-  if (item.code === 'large_unassigned_interval') return `大段时间无法准确归因（${Number.isFinite(number) ? number : '?'}%，原因未知）`;
+  if (item.code === 'large_unassigned_interval') return `活跃模型交互内有较多时间无法准确归因（${Number.isFinite(number) ? number : '?'}%，原因未知）`;
   return `未识别的异常规则（技术标识：${item.code}；证据：${item.evidence}）`;
 }
 
@@ -2677,10 +2754,21 @@ function batchAnomalyChineseText(item) {
 }
 
 function deliveryStatusLabel(deliverable, task) {
+  if (deliverable.deliveryStatus === 'integrated' && implementationTask(task) && task.integrationProof === null) return '台账曾标记已集成·Git 未验证';
   if (deliverable.attempt === task.attemptCount && task.status === 'reclaimed') return '已收回';
   if (deliverable.attempt === task.attemptCount && task.status === 'blocked') return '已阻塞';
   if (deliverable.attempt === task.attemptCount && task.status === 'changes_requested' && deliverable.reviewStatus === 'rejected') return '审查未通过';
   return ({ candidate: '候选', accepted_not_integrated: '已接受·未集成', integrated: '已集成', rejected: '未通过' })[deliverable.deliveryStatus];
+}
+
+function taskStatusLabel(task) {
+  if (task.status === 'integrated' && implementationTask(task)) return task.integrationProof ? '已集成·Git 已验证' : '台账曾标记已集成·Git 未验证';
+  return reportStatusLabel(task.status);
+}
+
+function taskStatusClass(task) {
+  if (task.status === 'integrated' && implementationTask(task) && task.integrationProof === null) return 'pending';
+  return reportStatusClass(task.status);
 }
 
 function secondsBetween(start, end) {
@@ -2784,24 +2872,47 @@ async function loadTimeDiagnosticsAnalyzer(input, codexHome) {
   return module.analyzeFile;
 }
 
-function diagnosticSummary(report, expectedThreadId) {
+function turnSegmentTotal(report, field, fallback) {
+  if (!Array.isArray(report.turnSegments) || report.turnSegments.length === 0) return fallback;
+  return Number(report.turnSegments.reduce((sum, segment) => sum + (Number.isFinite(segment[field]) ? segment[field] : 0), 0).toFixed(3));
+}
+
+function outsideTaskScopeSeconds(fullReport, lifecycle, scopedReport) {
+  if (!fullReport || !isTimestamp(fullReport.scope?.start) || !isTimestamp(fullReport.scope?.end) || !isTimestamp(lifecycle?.dispatchedAt)) return null;
+  const sessionStart = Date.parse(fullReport.scope.start);
+  const sessionEnd = Date.parse(fullReport.scope.end);
+  const taskStart = Math.max(sessionStart, Date.parse(lifecycle.dispatchedAt));
+  const taskEnd = Math.min(sessionEnd, isTimestamp(lifecycle.executionEndAt) ? Date.parse(lifecycle.executionEndAt) : Date.parse(scopedReport.scope.end));
+  const overlap = Math.max(0, taskEnd - taskStart);
+  return Number((Math.max(0, sessionEnd - sessionStart - overlap) / 1000).toFixed(3));
+}
+
+function diagnosticSummary(report, expectedThreadId, { fullReport = null, lifecycle = null } = {}) {
   if (report.sessionId !== expectedThreadId) fail('TIME_DIAGNOSTICS_THREAD_MISMATCH', `rollout session ${report.sessionId ?? 'unknown'} 不匹配 task ${expectedThreadId}`);
   const summary = report.summary;
   const otelObserved = summary.otel?.status === 'observed';
   const pairedTurns = report.turnEnvelopes.filter((turn) => turn.paired);
+  const activeTurnUnionSeconds = summary.activeTurns.activeUnionSeconds;
+  const activeTurnUnknownSeconds = Math.min(activeTurnUnionSeconds, turnSegmentTotal(report, 'unknownSeconds', summary.unknown.seconds));
+  const activeTurnResponseGapSeconds = Math.min(activeTurnUnionSeconds, turnSegmentTotal(report, 'responseGapSeconds', summary.responseGap.seconds));
   return {
     status: 'observed',
     sourcePath: report.input,
     scopeStart: report.scope.start,
     scopeEnd: report.scope.end,
-    activeTurnUnionSeconds: summary.activeTurns.activeUnionSeconds,
+    activeTurnUnionSeconds,
+    taskScopeSeconds: summary.wallClockSeconds,
+    taskWindowOutsideCompletedTurnsSeconds: summary.activeTurns.idleOutsideCompletedTurnsSeconds ?? Math.max(0, summary.wallClockSeconds - activeTurnUnionSeconds),
+    taskOutsideScopeSeconds: outsideTaskScopeSeconds(fullReport, lifecycle, report),
+    sourceConversationWallSeconds: fullReport?.summary?.wallClockSeconds ?? summary.wallClockSeconds,
     completedTurnCount: summary.activeTurns.completedCount,
     incompleteTurnCount: summary.activeTurns.incompleteCount,
     clientObservedTtftSeconds: summary.activeTurns.clientObservedTtftSeconds,
     toolUnionSeconds: summary.tool.completedUnionSeconds,
-    responseGapSeconds: summary.responseGap.seconds,
-    unknownSeconds: summary.unknown.seconds,
-    unknownRatio: summary.unknown.ratio,
+    responseGapSeconds: activeTurnResponseGapSeconds,
+    unknownSeconds: activeTurnUnknownSeconds,
+    unknownRatio: Number((activeTurnUnknownSeconds / Math.max(0.001, activeTurnUnionSeconds)).toFixed(4)),
+    scopeUnassignedSeconds: summary.unknown.seconds,
     contextPeakRatio: summary.context.peakRatio,
     compactions: summary.context.compactions,
     repeatedCommandCount: summary.repeatedCommandCount,
@@ -2831,7 +2942,7 @@ function taskAnomalies(task) {
     if (diagnostic.retryChainCount > 0) anomalies.push({ code: 'failed_rework', severity: 'critical', evidence: `${diagnostic.retryChainCount} retry chain(s)` });
     if (diagnostic.contextPeakRatio !== null && diagnostic.contextPeakRatio >= 0.75) anomalies.push({ code: 'context_pressure', severity: diagnostic.contextPeakRatio >= 0.85 ? 'critical' : 'warning', evidence: `peak=${diagnostic.contextPeakRatio}` });
     if (diagnostic.compactions > 0) anomalies.push({ code: 'compaction', severity: diagnostic.compactions >= 2 ? 'critical' : 'warning', evidence: `${diagnostic.compactions} compaction(s)` });
-    if (diagnostic.unknownRatio >= 0.5) anomalies.push({ code: 'large_unassigned_interval', severity: 'info', evidence: `${Math.round(diagnostic.unknownRatio * 100)}% unassigned; cause unknown` });
+    if (diagnostic.unknownRatio >= 0.5) anomalies.push({ code: 'large_unassigned_interval', severity: 'info', evidence: `${Math.round(diagnostic.unknownRatio * 100)}% active-turn unassigned; cause unknown` });
   }
   return anomalies;
 }
@@ -2851,8 +2962,10 @@ async function addObservability(data, input) {
       if (!rolloutPath) { task.timeDiagnostic = { status: 'unavailable', reason: 'rollout_not_found' }; continue; }
       if (!analyzeFile) { task.timeDiagnostic = { status: 'unavailable', reason: analyzerStatus }; continue; }
       try {
-        const report = await analyzeFile(rolloutPath, '', { otelJsonl: input.otelJsonl ?? '', desktopLog: input.desktopLog ?? '', segmentByTurn: true });
-        task.timeDiagnostic = diagnosticSummary(report, task.threadId);
+        const range = { otelJsonl: input.otelJsonl ?? '', desktopLog: input.desktopLog ?? '', segmentByTurn: true, ...(isTimestamp(task.lifecycle.dispatchedAt) ? { from: task.lifecycle.dispatchedAt } : {}), ...(isTimestamp(task.lifecycle.executionEndAt) ? { to: task.lifecycle.executionEndAt } : {}) };
+        const fullReport = isTimestamp(task.lifecycle.dispatchedAt) ? await analyzeFile(rolloutPath, '', { segmentByTurn: false }) : null;
+        const report = await analyzeFile(rolloutPath, '', range);
+        task.timeDiagnostic = diagnosticSummary(report, task.threadId, { fullReport, lifecycle: task.lifecycle });
         task.lifecycle.dispatchToFirstTurnSeconds = secondsBetween(task.lifecycle.dispatchedAt, task.timeDiagnostic.firstTurnAt);
       } catch (error) {
         task.timeDiagnostic = { status: 'unavailable', reason: error.code ?? error.message };
@@ -2931,7 +3044,7 @@ function renderObservabilitySection(data) {
       ? `<div class="token-pair"><span><b>累计输入</b>${renderHumanCount(diagnostic.tokens.inputTokens, 'Token')}</span><span><b>累计输出</b>${renderHumanCount(diagnostic.tokens.outputTokens, 'Token')}</span></div><small>这是已发生请求的累计上下文处理量；不是 OTel 额外消耗，也不是额度账单。</small>`
       : '不可用';
     const timing = diagnostic.status === 'observed'
-      ? `<ul class="compact-list"><li>派发到首次模型交互：${renderHumanDuration(task.lifecycle.dispatchToFirstTurnSeconds)}（观测上界）</li><li>活跃执行：${renderHumanDuration(diagnostic.activeTurnUnionSeconds)}</li><li>工具调用：${renderHumanDuration(diagnostic.toolUnionSeconds)}</li><li>首字返回中位数：${renderHumanDuration(diagnostic.clientObservedTtftSeconds?.median)}</li></ul>`
+      ? `<ul class="compact-list"><li>任务外空档：${renderHumanDuration(diagnostic.taskOutsideScopeSeconds)}（不计入该任务）</li><li>任务窗口内、已配对模型回合外空档：${renderHumanDuration(diagnostic.taskWindowOutsideCompletedTurnsSeconds)}（原因未归因）</li><li>活跃执行：${renderHumanDuration(diagnostic.activeTurnUnionSeconds)}</li><li>活跃执行内无法归因：${renderHumanDuration(diagnostic.unknownSeconds)}（${Math.round(diagnostic.unknownRatio * 100)}%）</li><li>工具调用：${renderHumanDuration(diagnostic.toolUnionSeconds)}</li><li>首字返回中位数：${renderHumanDuration(diagnostic.clientObservedTtftSeconds?.median)}</li></ul>`
       : escapeHtml(unavailableDiagnosticLabel(diagnostic));
     const anomalies = task.anomalies.length > 0 ? `<ul class="compact-list">${task.anomalies.map((item) => `<li>${escapeHtml(anomalyChineseText(item))}</li>`).join('')}</ul>` : '未命中确定性异常规则';
     return `<tr><td>${escapeHtml(task.displayKey)}</td><td class="route-cell">${renderTaskRoute(task)}</td><td>${escapeHtml(task.lifecycle.dispatchedAt ?? '未派发')}<br><small>派发窗口：${escapeHtml(compactChineseDuration(task.lifecycle.dispatchToEndSeconds))}</small></td><td>${timing}</td><td class="token-cell">${tokens}</td><td>${anomalies}</td></tr>`;
@@ -2939,11 +3052,11 @@ function renderObservabilitySection(data) {
   const actual = data.observability.activeTurnConcurrency;
   const batchAnomalies = data.observability.batchAnomalies.length > 0 ? `<div class="warning"><strong>并发异常：</strong><ul>${data.observability.batchAnomalies.map((item) => `<li>${escapeHtml(batchAnomalyChineseText(item))}</li>`).join('')}</ul></div>` : '';
   const mode = data.observability.mode === 'diagnostic' ? '深度诊断模式（diagnostic）' : '轻量报告模式（lean）';
-  return `<section><h2>按需观测与消耗诊断</h2><p class="subtitle">当前模式：${escapeHtml(mode)}。轻量模式只读取任务台账；只有深度诊断模式才读取任务过程日志（rollout）、OTel（本地遥测日志）以及用户明确提供的桌面客户端日志。</p><div class="metrics"><div class="metric"><strong>${data.observability.lifecycleConcurrency.maxConcurrent}</strong><span>派发窗口最大重叠数</span></div><div class="metric"><strong>${actual.maxConcurrent ?? '—'}</strong><span>完成的模型交互轮次最大并发数</span></div><div class="metric"><strong>${observed}/${data.taskCount}</strong><span>具有本地时间诊断的任务</span></div><div class="metric"><strong>${anomalyCount}</strong><span>异常证据项</span></div></div>${batchAnomalies}<div class="legacy"><strong>解释边界：</strong>派发到执行结束的台账窗口重叠，只能证明任务生命周期有重叠，不等于模型内部同时计算。已配对的任务开始/任务完成事件（task_started/task_complete）可以证明模型交互轮次同时活跃，但仍不等于处理器（CPU）或模型内部计算时间。Token 是模型处理文本的计量单位；这里只有同一对话的模型响应完成事件（response.completed）累计值。额度快照属于整个账户，并发时不能归因给单个任务。</div>${renderConsumptionComparison(data)}<h3>派发窗口时间线</h3>${renderLifecycleGantt(data)}<div class="table-wrap"><table><thead><tr><th>任务</th><th>模型与任务类型</th><th>台账时间</th><th>本地耗时证据</th><th>累计上下文处理量（非账单）</th><th>异常</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
+  return `<section><h2>按需观测与消耗诊断</h2><p class="subtitle">当前模式：${escapeHtml(mode)}。轻量模式只读取任务台账；只有深度诊断模式才读取任务过程日志（rollout）、OTel（本地遥测日志）以及用户明确提供的桌面客户端日志。</p><div class="metrics"><div class="metric"><strong>${data.observability.lifecycleConcurrency.maxConcurrent}</strong><span>派发窗口最大重叠数</span></div><div class="metric"><strong>${actual.maxConcurrent ?? '—'}</strong><span>完成的模型交互轮次最大并发数</span></div><div class="metric"><strong>${observed}/${data.taskCount}</strong><span>具有本地时间诊断的任务</span></div><div class="metric"><strong>${anomalyCount}</strong><span>异常证据项</span></div></div>${batchAnomalies}<div class="legacy"><strong>解释边界：</strong>任务外空档是同一对话日志中位于本任务派发—结束窗口之外的时间，不计入任务耗时，也不代表模型思考或额度消耗。任务窗口内、模型回合外空档只说明没有已配对的模型回合，原因仍不可见。只有“活跃执行内无法归因”参与无法归因比例与异常判断。派发窗口重叠不等于模型内部同时计算；已配对的任务开始/任务完成事件（task_started/task_complete）只能证明模型交互轮次同时活跃。Token 是模型处理文本的计量单位；这里只有同一对话的模型响应完成事件（response.completed）累计值。额度快照属于整个账户，并发时不能归因给单个任务。</div>${renderConsumptionComparison(data)}<h3>派发窗口时间线</h3>${renderLifecycleGantt(data)}<div class="table-wrap"><table><thead><tr><th>任务</th><th>模型与任务类型</th><th>台账时间</th><th>本地耗时证据</th><th>累计上下文处理量（非账单）</th><th>异常</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 
 function renderDeliveryReport(data) {
-  const statusRows = data.tasks.map((task) => `<tr><td>${escapeHtml(task.displayKey)}</td><td>${renderRecordedText(task.title)}</td><td><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(reportStatusLabel(task.status))}</span></td><td>${renderRecordedText(task.deliverables.at(-1)?.userVisibleSummary ?? '历史证据不可用')}</td><td>${renderRecordedText(task.nextGate)}</td></tr>`).join('');
+  const statusRows = data.tasks.map((task) => `<tr><td>${escapeHtml(task.displayKey)}</td><td>${renderRecordedText(task.title)}</td><td><span class="badge ${taskStatusClass(task)}">${escapeHtml(taskStatusLabel(task))}</span></td><td>${renderRecordedText(task.deliverables.at(-1)?.userVisibleSummary ?? '历史证据不可用')}</td><td>${renderRecordedText(task.nextGate)}</td></tr>`).join('');
   const timelines = data.tasks.map((task) => {
     const packages = task.deliverables.map((deliverable) => {
       const packageClass = ['reclaimed', 'blocked', 'changes_requested'].includes(task.status) || deliverable.deliveryStatus === 'rejected' ? 'failed' : reportStatusClass(task.status);
@@ -2958,14 +3071,20 @@ function renderDeliveryReport(data) {
     const diagnostics = task.diagnostics.length > 0 ? `<details class="legacy"><summary>诊断价值裁决（${task.diagnostics.length}）</summary><ul>${task.diagnostics.map((diagnostic) => `<li>${escapeHtml(reportEnumLabel(REPORT_DIAGNOSTIC_LABELS, diagnostic.classification, '未识别诊断分类'))} · ${renderRecordedText(diagnostic.summary)}</li>`).join('')}</ul></details>` : '';
     const objective = task.objective ? `<div class="legacy"><strong>任务目标：</strong>技术标识 ${escapeHtml(task.objective.objectiveId)} · 已替换 ${task.objective.replacementCount}/${OBJECTIVE_FUSE_REPLACEMENT_LIMIT} 次 · 累计执行 ${escapeHtml(compactChineseDuration(task.objective.cumulativeExecutionMs / 1000))}${task.objective.fuseOpen ? ` · 已熔断：${task.objective.reasons.map(renderRecordedText).join('；')}` : ''}</div>` : '';
     const closeout = task.closeout ? `<div class="review"><strong>事故收口：</strong>${renderRecordedText(task.closeout.userVisibleSummary)} · 通知状态：${escapeHtml(({ sent: '已发送', pending: '待发送', failed: '发送失败' })[task.closeout.notificationStatus] ?? `未识别（${task.closeout.notificationStatus}）`)} · 报告状态：${escapeHtml(({ synced: '已同步', pending: '待同步', failed: '同步失败' })[task.closeout.reportStatus] ?? `未识别（${task.closeout.reportStatus}）`)}</div>` : '';
-    const timeDiagnostic = task.timeDiagnostic.status === 'observed' ? `<div class="diagnostic"><strong>时间证据：</strong>活跃执行 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.activeTurnUnionSeconds))} · 工具调用 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.toolUnionSeconds))} · 无法归因 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.unknownSeconds))} · 上下文峰值占比 ${task.timeDiagnostic.contextPeakRatio === null ? '不可用' : `${Math.round(task.timeDiagnostic.contextPeakRatio * 100)}%`} · 上下文压缩 ${task.timeDiagnostic.compactions} 次</div>` : '';
+    const integrationEvidence = task.status === 'integrated' && implementationTask(task)
+      ? task.integrationProof
+        ? `<div class="review"><strong>集成真实性：</strong>Git 祖先关系已验证 · 候选 ${escapeHtml(task.integrationProof.candidateCommit)} · 目标 ${escapeHtml(task.integrationProof.targetRef)} = ${escapeHtml(task.integrationProof.targetCommit)} · ${escapeHtml(task.integrationProof.verifiedAt)}</div>`
+        : '<div class="warning"><strong>集成真实性：</strong>这是旧台账中的 integrated 标记，没有 Git 祖先证明；报告不会把它冒充为已经验证进入主线。</div>'
+      : '';
+    const timeDiagnostic = task.timeDiagnostic.status === 'observed' ? `<div class="diagnostic"><strong>时间证据：</strong>任务外空档 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.taskOutsideScopeSeconds))}（不计入任务） · 活跃执行 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.activeTurnUnionSeconds))} · 活跃执行内无法归因 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.unknownSeconds))}（${Math.round(task.timeDiagnostic.unknownRatio * 100)}%） · 工具调用 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.toolUnionSeconds))} · 上下文峰值占比 ${task.timeDiagnostic.contextPeakRatio === null ? '不可用' : `${Math.round(task.timeDiagnostic.contextPeakRatio * 100)}%`} · 上下文压缩 ${task.timeDiagnostic.compactions} 次</div>` : '';
     const routeSummary = `${reportEnumLabel(REPORT_TASK_MODE_LABELS, task.taskMode, '未识别任务模式')} · ${reportEnumLabel(REPORT_MODEL_LABELS, task.model, '未识别模型')} · ${reportEnumLabel(REPORT_THINKING_LABELS, task.thinking, '未识别推理强度')} · 第 ${task.attemptCount} 次尝试`;
-    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${renderRecordedText(task.title)}</h2><p>${escapeHtml(routeSummary)}</p><small>模型技术标识：${escapeHtml(task.model)}</small></div><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(reportStatusLabel(task.status))}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${renderRecordedText(task.blocker)}</div>` : ''}${closeout}${timeDiagnostic}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${renderRecordedText(task.nextGate)}</div></section>`;
+    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${renderRecordedText(task.title)}</h2><p>${escapeHtml(routeSummary)}</p><small>模型技术标识：${escapeHtml(task.model)}</small></div><span class="badge ${taskStatusClass(task)}">${escapeHtml(taskStatusLabel(task))}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${renderRecordedText(task.blocker)}</div>` : ''}${closeout}${integrationEvidence}${timeDiagnostic}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${renderRecordedText(task.nextGate)}</div></section>`;
   }).join('');
-  const integrated = data.tasks.filter((task) => task.status === 'integrated').length;
+  const integrated = data.tasks.filter((task) => task.status === 'integrated' && (!implementationTask(task) || task.integrationProof !== null)).length;
+  const unverifiedIntegrated = data.tasks.filter((task) => task.status === 'integrated' && implementationTask(task) && task.integrationProof === null).length;
   const failed = data.tasks.filter((task) => ['blocked', 'reclaimed', 'changes_requested'].includes(task.status)).length;
   const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32;--blue:#315f86;--purple:#73509b}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.translation-note{display:block;margin-top:3px;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty,.diagnostic{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}.diagnostic{background:#edf4fa;border-color:var(--blue)}.gantt{display:grid;gap:8px;margin:12px 0 18px}.gantt-row{display:grid;grid-template-columns:70px minmax(220px,1fr) minmax(280px,auto);gap:10px;align-items:center}.gantt-track{height:16px;position:relative;background:#e5ddd2;border-radius:8px;overflow:hidden}.gantt-bar{position:absolute;top:0;height:100%;background:var(--amber)}.gantt-bar.ok{background:var(--green)}.gantt-bar.failed{background:var(--red)}.comparison-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0 20px}.comparison-card{padding:14px;background:var(--panel);border:1px solid var(--line)}.comparison-row{display:grid;grid-template-columns:72px minmax(120px,1fr) 92px;gap:10px;align-items:center;margin:9px 0}.comparison-row>strong{text-align:right}.comparison-track{display:block;height:12px;background:#e5ddd2;border-radius:8px;overflow:hidden}.comparison-bar{display:block;height:100%;border-radius:8px}.comparison-bar.input{background:var(--purple)}.comparison-bar.output{background:var(--green)}.comparison-bar.active{background:var(--blue)}.comparison-bar.tool{background:var(--amber)}.route-cell{min-width:210px}.route-cell>*{display:block;margin-bottom:3px}.token-cell{min-width:210px}.token-pair{display:grid;gap:9px;margin-bottom:8px}.token-pair span,.human-number{display:block}.token-pair b{display:block;color:var(--muted);font-size:12px}.compact-list{margin:0;padding-left:18px}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid,.comparison-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}.gantt-row{grid-template-columns:48px 1fr}.gantt-row small{grid-column:1/-1}.comparison-row{grid-template-columns:64px minmax(90px,1fr) 84px}th:nth-child(4),td:nth-child(4){min-width:260px}}';
-  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.deliverableCount}</strong><span>历史成果包</span></div><div class="metric"><strong>${integrated}</strong><span>已集成</span></div><div class="metric"><strong>${failed}</strong><span>阻塞 / 收回 / 未通过</span></div></div></header><main><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
+  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.deliverableCount}</strong><span>历史成果包</span></div><div class="metric"><strong>${integrated} / ${unverifiedIntegrated}</strong><span>已验证集成 / 历史未验证</span></div><div class="metric"><strong>${failed}</strong><span>阻塞 / 收回 / 未通过</span></div></div></header><main><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
 }
 
 export async function controllerBuildDeliveryReport(input) {
@@ -3602,12 +3721,40 @@ export async function controllerMarkAccepted(input) {
   }});
 }
 
+async function resolveGitCommit(projectRoot, revision, errorCode, label) {
+  try {
+    const { stdout } = await execFile('git', ['-C', projectRoot, 'rev-parse', '--verify', '--end-of-options', `${revision}^{commit}`], { windowsHide: true, maxBuffer: 1024 * 1024 });
+    const commit = stdout.trim().toLowerCase();
+    if (!/^[0-9a-f]{40,64}$/.test(commit)) fail(errorCode, `${label} 未解析为完整 Git commit: ${revision}`);
+    return commit;
+  } catch (error) {
+    if (error instanceof TaskControlError) throw error;
+    fail(errorCode, `${label} 无法在项目 Git 仓库中解析: ${revision}`);
+  }
+}
+
+async function verifyGitIntegration(projectRoot, recordedCandidateCommit, targetRef = 'HEAD') {
+  if (!nonEmpty(recordedCandidateCommit)) fail('INTEGRATION_CANDIDATE_REQUIRED', '实施任务集成前必须有 candidateCommit');
+  if (!nonEmpty(targetRef) || targetRef.length > 512 || targetRef.includes('\0')) fail('INTEGRATION_TARGET_INVALID', 'integration target ref 无效');
+  const normalizedTargetRef = targetRef.trim();
+  const candidateCommit = await resolveGitCommit(projectRoot, recordedCandidateCommit, 'INTEGRATION_CANDIDATE_NOT_FOUND', '候选提交');
+  const targetCommit = await resolveGitCommit(projectRoot, normalizedTargetRef, 'INTEGRATION_TARGET_NOT_FOUND', '集成目标');
+  try {
+    await execFile('git', ['-C', projectRoot, 'merge-base', '--is-ancestor', candidateCommit, targetCommit], { windowsHide: true, maxBuffer: 1024 * 1024 });
+  } catch (error) {
+    if (error?.code === 1) fail('INTEGRATION_NOT_REACHABLE', `候选提交 ${recordedCandidateCommit} 不在集成目标 ${normalizedTargetRef} (${targetCommit}) 的历史中`);
+    fail('INTEGRATION_PROOF_FAILED', `无法验证候选提交是否进入集成目标 ${normalizedTargetRef}`);
+  }
+  return { schemaVersion: INTEGRATION_PROOF_PROTOCOL_VERSION, method: 'git_ancestor', recordedCandidateCommit, candidateCommit, targetRef: normalizedTargetRef, targetCommit, verifiedAt: new Date().toISOString() };
+}
+
 export async function controllerMarkIntegrated(input) {
-  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: async (task) => {
     if (task.status !== 'accepted') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 integrated`);
+    const integrationProof = implementationTask(task) ? await verifyGitIntegration(input.projectRoot, task.candidateCommit, input.integrationTargetRef ?? 'HEAD') : (task.integrationProof ?? null);
     const deliverableHistory = integrateCurrentDeliverable(task);
     const now = new Date().toISOString();
-    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'integrated', executionStatus: 'terminal', nextOwner: 'none', reviewVerdict: 'accepted', integrationStatus: 'integrated', updatedAt: now }, 'integrated', now);
+    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'integrated', executionStatus: 'terminal', nextOwner: 'none', reviewVerdict: 'accepted', integrationStatus: 'integrated', integrationProof, updatedAt: now }, 'integrated', now);
   }});
 }
 
@@ -3734,7 +3881,8 @@ export async function createProgressEvent(input) {
   if (!dispatchAllowed(result.task) || !currentAttemptDispatched(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交进度');
   if (!nonEmpty(input.summary)) fail('CLI_INVALID_ARGUMENTS', 'progress summary 不能为空');
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
-  const checkpoint = validateStageCheckpoint(result.task, input.stageId, input.evidence ?? []);
+  const pendingStages = implementationTask(result.task) ? await pendingStagesForCreation(result.paths, result.task) : new Map();
+  const checkpoint = validateStageCheckpoint(result.task, input.stageId, input.evidence ?? [], { pendingStages });
   return writeChildArtifact(result.paths, result.task.threadId, 'progress', { schemaVersion: 1, type: 'task_progress', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, summary: input.summary.trim(), ...(implementationTask(result.task) ? { ...checkpoint, ...contractSummary(result.task) } : {}), createdAt: new Date().toISOString() });
 }
 
@@ -3810,7 +3958,7 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.13.1',
+    'codex-task-control v0.13.2',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
@@ -3827,6 +3975,7 @@ function helpText() {
     '  controller-ingest-context-health --project-root <root> --controller <id> --receipt <json>',
     '  controller-record-diagnostic ... --diagnostic-id <id> --classification technical_debt|milestone_blocker --summary <text> ...',
     '  mark-accepted ... --reason <review-reason> [--selected-artifact <artifact-id> ...]',
+    '  mark-integrated ... [--integration-target-ref <git-ref>]  # implementation 默认验证 candidate 是 HEAD 的祖先',
     '  controller-confirm-heartbeat-action --project-root <root> --controller <id> --action-id <id> [--automation-id <new-or-deleted-id>] [--pending-create-cleanup-outcome deleted|not_found]',
     '  controller-finalize-cycle --project-root <root> --controller <id>',
     '  controller-assert-business-ready --project-root <root> --controller <id>',
@@ -3928,7 +4077,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-mark-closeout-notification-sent') result = await controllerMarkCloseoutNotificationSent({ ...controllerInput(args) });
   else if (command === 'controller-refresh-closeout-report') result = await controllerRefreshCloseoutReport({ ...controllerInput(args) });
   else if (command === 'mark-accepted') result = await controllerMarkAccepted({ ...controllerInput(args), reason: option(args, '--reason'), selectedArtifactIds: options(args, '--selected-artifact') });
-  else if (command === 'mark-integrated') result = await controllerMarkIntegrated({ ...controllerInput(args) });
+  else if (command === 'mark-integrated') result = await controllerMarkIntegrated({ ...controllerInput(args), integrationTargetRef: option(args, '--integration-target-ref') ?? 'HEAD' });
   else if (command === 'controller-record-title-synced') result = await controllerRecordTitleSynced({ ...controllerInput(args), title: required(args, '--title') });
   else if (command === 'controller-record-title-failed') result = await controllerRecordTitleFailed({ ...controllerInput(args), title: required(args, '--title'), reason: required(args, '--reason') });
   else if (command === 'controller-record-archive-succeeded') result = await controllerRecordArchiveSucceeded({ ...controllerInput(args) });

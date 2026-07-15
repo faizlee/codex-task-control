@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -107,6 +108,38 @@ function implementationInput(taskControlHome, projectRoot, overrides = {}) {
     taskMode: overrides.taskMode ?? 'implementation',
     implementationContractPath: overrides.implementationContractPath,
   };
+}
+
+async function createGitCandidate(projectRoot, label = 'candidate') {
+  execFileSync('git', ['-C', projectRoot, 'init'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', projectRoot, 'config', 'user.email', 'task-control@example.invalid'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', projectRoot, 'config', 'user.name', 'Task Control Test'], { stdio: 'ignore' });
+  await writeFile(join(projectRoot, `${label}.txt`), `${label}\n`, 'utf8');
+  execFileSync('git', ['-C', projectRoot, 'add', '.'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', projectRoot, 'commit', '-m', label], { stdio: 'ignore' });
+  return execFileSync('git', ['-C', projectRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+}
+
+async function assertForgedPredecessorCannotCreateVerification({ name, forge, expectedCode }) {
+  const taskControlHome = await mkdtemp(join(tmpdir(), `codex-task-control-forged-${name}-home-`));
+  const projectRoot = await mkdtemp(join(tmpdir(), `codex-task-control-forged-${name}-project-`));
+  const input = implementationInput(taskControlHome, projectRoot, { threadId: `forged-${name}-worker`, implementationContractPath: 'implementation-contract.json' });
+  try {
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    const validPredecessorPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'valid predecessor shape', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'inspection.txt' }] });
+    const validPredecessor = JSON.parse(await readFile(validPredecessorPath, 'utf8'));
+    await rm(validPredecessorPath);
+    const eventDir = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'events', input.threadId);
+    await mkdir(eventDir, { recursive: true });
+    for (const [index, event] of forge(validPredecessor).entries()) await writeFile(join(eventDir, `progress-${name}-${index}.json`), `${JSON.stringify(event, null, 2)}\n`, 'utf8');
+    await assert.rejects(createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'verification must not trust forged predecessor', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'targeted.txt' }] }), (error) => error instanceof TaskControlError && error.code === expectedCode, name);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 }
 
 function parallelCandidate({ candidateId, title, lane, workClass, taskMode, projectRoot, conflictDomains = [], dependencies = [], reviewCost = 1, blockingReasons = [] }) {
@@ -635,6 +668,47 @@ test('implementation progress enforces staged evidence before completion', async
   }
 });
 
+test('pending predecessor chain permits asynchronous stage creation while controller ingestion remains ordered', async () => {
+  for (const { name, forge, expectedCode } of [
+    { name: 'malformed', forge: () => [{}], expectedCode: 'STAGE_ORDER_INVALID' },
+    { name: 'wrong-project', forge: (event) => [{ ...event, projectKey: 'wrong-project' }], expectedCode: 'STAGE_ORDER_INVALID' },
+    { name: 'wrong-parent', forge: (event) => [{ ...event, parentThreadId: 'wrong-parent' }], expectedCode: 'STAGE_ORDER_INVALID' },
+    { name: 'wrong-task', forge: (event) => [{ ...event, threadId: 'wrong-worker' }], expectedCode: 'STAGE_ORDER_INVALID' },
+    { name: 'stale-attempt', forge: (event) => [{ ...event, attemptCount: 2 }], expectedCode: 'STAGE_ORDER_INVALID' },
+    { name: 'wrong-digest', forge: (event) => [{ ...event, contractDigest: '0'.repeat(64) }], expectedCode: 'STAGE_ORDER_INVALID' },
+    { name: 'wrong-revision', forge: (event) => [{ ...event, contractVersion: 'contract-r2' }], expectedCode: 'STAGE_ORDER_INVALID' },
+    { name: 'duplicate-replay', forge: (event) => [event, event], expectedCode: 'STAGE_PREDECESSOR_DUPLICATE' },
+    { name: 'out-of-order', forge: (event) => [{ ...event, stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'targeted.txt' }] }], expectedCode: 'STAGE_ALREADY_COMPLETED' },
+  ]) await assertForgedPredecessorCannotCreateVerification({ name, forge, expectedCode });
+
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-async-stages-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-async-stages-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  try {
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+
+    await assert.rejects(createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'out of order', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'targeted.txt' }] }), (error) => error instanceof TaskControlError && error.code === 'STAGE_ORDER_INVALID');
+    const reuseEvent = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Existing path inspected and retained.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'inspection.txt' }] });
+    assert.deepEqual((await querySelf({ taskControlHome, selfThreadId: input.threadId })).task.stageProgress, [], 'pending event must not mutate central stageProgress');
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'pending-only' }), (error) => error instanceof TaskControlError && error.code === 'REQUIRED_STAGE_INCOMPLETE');
+
+    await delay();
+    const verificationEvent = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Targeted verification passed.', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'targeted.txt' }] });
+    await assert.rejects(createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'duplicate verification', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'duplicate.txt' }] }), (error) => error instanceof TaskControlError && error.code === 'STAGE_ALREADY_COMPLETED');
+    await assert.rejects(controllerIngestProgress({ ...input, eventPath: verificationEvent }), (error) => error instanceof TaskControlError && error.code === 'STAGE_ORDER_INVALID');
+    await controllerIngestProgress({ ...input, eventPath: reuseEvent });
+    const ingested = await controllerIngestProgress({ ...input, eventPath: verificationEvent });
+    assert.deepEqual(ingested.completedStages, ['reuse-check', 'verification']);
+    await assert.rejects(controllerIngestProgress({ ...input, eventPath: verificationEvent }), (error) => error instanceof TaskControlError && error.code === 'EVENT_STALE');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('a worker cannot change the controller-fixed contract or error policy', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-drift-home-'));
   const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-drift-project-'));
@@ -796,8 +870,9 @@ test('nonvisual result packages allow a reasoned no-screenshot outcome and keep 
   const fixture = await createResultProtocolFixture();
   const { taskControlHome, projectRoot, input } = fixture;
   try {
-    const manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'nonvisual-candidate-1');
-    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'nonvisual-candidate-1', resultManifestPath: manifestPath });
+    const candidateCommit = await createGitCandidate(projectRoot, 'nonvisual-candidate-1');
+    const manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, candidateCommit);
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit, resultManifestPath: manifestPath });
     const candidate = await controllerIngestCompletion({ ...input, eventPath: completion });
     assert.equal(candidate.deliverableHistory[0].deliveryStatus, 'candidate');
     assert.match(candidate.deliverableHistory[0].noScreenshotReason, /without a player-visible surface/);
@@ -806,6 +881,8 @@ test('nonvisual result packages allow a reasoned no-screenshot outcome and keep 
     assert.equal(accepted.deliverableHistory[0].deliveryStatus, 'accepted_not_integrated');
     const integrated = await controllerMarkIntegrated(input);
     assert.equal(integrated.deliverableHistory[0].deliveryStatus, 'integrated');
+    assert.equal(integrated.integrationProof.method, 'git_ancestor');
+    assert.equal(integrated.integrationProof.candidateCommit, candidateCommit);
 
     await controllerRecordTitleSynced({ ...input, title: integrated.desiredThreadTitle });
     await controllerRecordArchiveSucceeded(input);
@@ -813,12 +890,58 @@ test('nonvisual result packages allow a reasoned no-screenshot outcome and keep 
     const firstHtml = await readFile(first.reportPath, 'utf8');
     const second = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
     assert.equal(await readFile(second.reportPath, 'utf8'), firstHtml, 'same ledger and artifacts must render byte-identical HTML');
-    assert.match(firstHtml, /已集成/);
+    assert.match(firstHtml, /已集成·Git 已验证/);
+    assert.match(firstHtml, /Git 祖先关系已验证/);
     await rm(first.reportPath, { force: true });
     const scan = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
     assert.equal(scan.reportNeedsRefresh, true);
     assert.equal(scan.shouldKeepHeartbeat, false, 'a missing report must not create heartbeat work');
     assert.equal(scan.needsControllerAttention, false);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('implementation integration fails closed unless the candidate is reachable from the declared Git target', async () => {
+  const fixture = await createResultProtocolFixture();
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    const headCommit = await createGitCandidate(projectRoot, 'integration-target');
+    const unreachableCommit = execFileSync('git', ['-C', projectRoot, 'commit-tree', `${headCommit}^{tree}`, '-m', 'unreachable candidate'], { encoding: 'utf8' }).trim();
+    const manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, unreachableCommit);
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: unreachableCommit, resultManifestPath: manifestPath });
+    await controllerIngestCompletion({ ...input, eventPath: completion });
+    await controllerMarkAccepted({ ...input, reason: 'The bounded result is accepted for integration.', selectedArtifactIds: [] });
+    await assert.rejects(controllerMarkIntegrated(input), (error) => error instanceof TaskControlError && error.code === 'INTEGRATION_NOT_REACHABLE');
+    const current = (await querySelf({ taskControlHome, selfThreadId: input.threadId })).task;
+    assert.equal(current.status, 'accepted');
+    assert.equal(current.integrationStatus, 'not_integrated');
+    assert.equal(current.integrationProof, null);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy integrated implementation remains readable but is reported as Git-unverified', async () => {
+  const fixture = await createResultProtocolFixture();
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    const candidateCommit = await createGitCandidate(projectRoot, 'legacy-integrated');
+    const manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, candidateCommit);
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit, resultManifestPath: manifestPath });
+    await controllerIngestCompletion({ ...input, eventPath: completion });
+    await controllerMarkAccepted({ ...input, reason: 'Accepted before the proof migration.', selectedArtifactIds: [] });
+    await controllerMarkIntegrated(input);
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    delete registry.tasks.find((entry) => entry.threadId === input.threadId).integrationProof;
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /台账曾标记已集成·Git 未验证/);
+    assert.match(html, /不会把它冒充为已经验证进入主线/);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
@@ -860,19 +983,31 @@ test('diagnostic observability renders Chinese explanations and human-readable c
     const before = await readFile(registryPath, 'utf8');
     const rolloutPath = join(projectRoot, `rollout-${input.threadId}.jsonl`);
     await writeFile(rolloutPath, '{}\n', 'utf8');
+    const lifecycleTask = (await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId })).tasks[0];
+    const dispatchedMs = Date.parse(lifecycleTask.lastDispatchedAt);
+    const fullStart = new Date(dispatchedMs - 60_000).toISOString();
+    const scopedStart = new Date(dispatchedMs).toISOString();
+    const scopedEnd = new Date(dispatchedMs + 120_000).toISOString();
+    const fullEnd = new Date(dispatchedMs + 600_000).toISOString();
     let analyzerCalls = 0;
     const analyzeFile = async (path, baseline, range) => {
       analyzerCalls += 1;
       assert.equal(path, rolloutPath);
       assert.equal(baseline, '');
+      if (!range.segmentByTurn) {
+        assert.equal(range.otelJsonl, undefined);
+        return { sessionId: input.threadId, input: rolloutPath, scope: { start: fullStart, end: fullEnd }, summary: { wallClockSeconds: 660 } };
+      }
       assert.equal(range.otelJsonl, join(projectRoot, 'otel'));
-      assert.equal(range.segmentByTurn, true);
+      assert.equal(range.from, scopedStart);
+      assert.equal(range.to, undefined);
       return {
         sessionId: input.threadId,
         input: rolloutPath,
-        scope: { start: '2026-07-15T00:00:00.000Z', end: '2026-07-15T00:02:00.000Z' },
+        scope: { start: scopedStart, end: scopedEnd },
         summary: {
-          activeTurns: { activeUnionSeconds: 100, completedCount: 2, incompleteCount: 0, clientObservedTtftSeconds: { median: 8, p90: 12 } },
+          wallClockSeconds: 120,
+          activeTurns: { activeUnionSeconds: 100, idleOutsideCompletedTurnsSeconds: 20, completedCount: 2, incompleteCount: 0, clientObservedTtftSeconds: { median: 8, p90: 12 } },
           tool: { completedUnionSeconds: 40, failedCount: 1 },
           responseGap: { seconds: 15 },
           unknown: { seconds: 45, ratio: 0.375 },
@@ -884,14 +1019,18 @@ test('diagnostic observability renders Chinese explanations and human-readable c
           rateLimits: { sampleCount: 2, primary: { usedPercent: { first: 10, last: 11 } }, secondary: null },
         },
         turnEnvelopes: [
-          { paired: true, startedAt: '2026-07-15T00:00:00.000Z', completedAt: '2026-07-15T00:00:50.000Z' },
-          { paired: true, startedAt: '2026-07-15T00:01:00.000Z', completedAt: '2026-07-15T00:01:50.000Z' },
+          { paired: true, startedAt: scopedStart, completedAt: new Date(dispatchedMs + 50_000).toISOString() },
+          { paired: true, startedAt: new Date(dispatchedMs + 60_000).toISOString(), completedAt: new Date(dispatchedMs + 110_000).toISOString() },
+        ],
+        turnSegments: [
+          { unknownSeconds: 20, responseGapSeconds: 7 },
+          { unknownSeconds: 25, responseGapSeconds: 8 },
         ],
         remedies: [{ rootCause: 'repeated_command', confidence: 'high', evidence: ['two repeated commands'], systemicPrevention: 'reuse valid evidence', verificationMetric: 'repeat count' }],
       };
     };
     const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'diagnostic', otelJsonl: join(projectRoot, 'otel'), rolloutPathsByThreadId: new Map([[input.threadId, rolloutPath]]), timeDiagnosticsAnalyzer: analyzeFile });
-    assert.equal(analyzerCalls, 1);
+    assert.equal(analyzerCalls, 2);
     assert.match(report.reportPath, /diagnostic\.html$/);
     assert.equal(report.observability.mode, 'diagnostic');
     assert.equal(report.observability.activeTurnConcurrency.maxConcurrent, 1);
@@ -904,11 +1043,76 @@ test('diagnostic observability renders Chinese explanations and human-readable c
     assert.match(html, /不是 OTel 额外消耗，也不是额度账单/);
     assert.match(html, /任务消耗直观对比/);
     assert.match(html, /发现重复命令（2 类重复指纹）/);
-    assert.match(html, /无法归因 45 秒/);
+    assert.match(html, /任务外空档：9 分/);
+    assert.match(html, /模型回合外空档：20 秒/);
+    assert.match(html, /活跃执行内无法归因：45 秒（45%）/);
     assert.match(html, /活跃执行：1 分 40 秒/);
     assert.match(html, /Terra（经济型代码理解模型）/);
     assert.match(html, /原始英文或技术记录/);
     assert.doesNotMatch(html, /2,824,623 in \/ 120,000,000 out|TTFT median|repeated_commands|unknown 45 秒|>executing</);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('post-completion conversation idle is shown outside the task and never inflates active-turn attribution', async () => {
+  const fixture = await createResultProtocolFixture();
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    const manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'diagnostic-candidate');
+    const completion = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'diagnostic-candidate', resultManifestPath: manifestPath });
+    await controllerIngestCompletion({ ...input, eventPath: completion });
+
+    const baseMs = Date.now() - 20_000_000;
+    const executionEndMs = baseMs + 322_806;
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const task = registry.tasks.find((entry) => entry.threadId === input.threadId);
+    task.lastDispatchedAt = new Date(baseMs).toISOString();
+    task.executionEndedAt = new Date(executionEndMs).toISOString();
+    task.completionEventCreatedAt = task.executionEndedAt;
+    registry.updatedAt = new Date().toISOString();
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+
+    const rolloutPath = join(projectRoot, `rollout-${input.threadId}.jsonl`);
+    await writeFile(rolloutPath, '{}\n', 'utf8');
+    const fullEnd = new Date(baseMs + 9_346_397).toISOString();
+    let analyzerCalls = 0;
+    const analyzeFile = async (_path, _baseline, range) => {
+      analyzerCalls += 1;
+      if (!range.segmentByTurn) return { sessionId: input.threadId, input: rolloutPath, scope: { start: new Date(baseMs).toISOString(), end: fullEnd }, summary: { wallClockSeconds: 9346.397 } };
+      assert.equal(range.from, new Date(baseMs).toISOString());
+      assert.equal(range.to, new Date(executionEndMs).toISOString());
+      return {
+        sessionId: input.threadId,
+        input: rolloutPath,
+        scope: { start: range.from, end: range.to },
+        summary: {
+          wallClockSeconds: 322.806,
+          activeTurns: { activeUnionSeconds: 322.806, idleOutsideCompletedTurnsSeconds: 0, completedCount: 3, incompleteCount: 0, clientObservedTtftSeconds: { median: 6.04, p90: 8 } },
+          tool: { completedUnionSeconds: 38.193, failedCount: 1 },
+          responseGap: { seconds: 102.029 },
+          unknown: { seconds: 182.584, ratio: 0.5656 },
+          context: { peakRatio: 0.51, compactions: 0 },
+          repeatedCommandCount: 1,
+          retryChainCount: 0,
+          threadHealth: { status: 'healthy', reasons: [] },
+          otel: { status: 'unavailable' },
+          rateLimits: { sampleCount: 0, primary: null, secondary: null },
+        },
+        turnEnvelopes: [{ paired: true, startedAt: range.from, completedAt: range.to }],
+        turnSegments: [{ unknownSeconds: 182.584, responseGapSeconds: 102.029 }],
+        remedies: [],
+      };
+    };
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'diagnostic', rolloutPathsByThreadId: new Map([[input.threadId, rolloutPath]]), timeDiagnosticsAnalyzer: analyzeFile });
+    assert.equal(analyzerCalls, 2);
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /任务外空档：2 小时 30 分 24 秒/);
+    assert.match(html, /活跃执行：5 分 23 秒/);
+    assert.match(html, /活跃执行内无法归因：3 分 3 秒[\s\S]*?（57%）/);
+    assert.doesNotMatch(html, /99%/);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });

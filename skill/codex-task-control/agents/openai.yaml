@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Parallel task control with Chinese diagnostic reports"
-  default_prompt: "Use $codex-task-control to fan out safe visible tasks and generate Chinese-first, human-readable diagnostic reports on demand."
+  short_description: "Parallel task control with scoped Chinese diagnostics"
+  default_prompt: "Use $codex-task-control to fan out safe visible tasks, verify implementation integration, and generate task-scoped Chinese diagnostic reports on demand."
