@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Fan out visible tasks without quota-burning loops"
-  default_prompt: "Use $codex-task-control to plan a schema-v1 parallel batch, enforce safe multi-task fan-out and WIP, bind every visible task to its candidate and implementation contract, queue ordinary messages, detect failures and stalls, review outcomes, and finalize the shared controller heartbeat before more project work."
+  short_description: "Parallel visible-task control with on-demand diagnostics"
+  default_prompt: "Use $codex-task-control to fan out safe visible tasks, preserve lightweight lifecycle receipts, and generate an on-demand timing and quota-proxy HTML report when requested."

@@ -71,6 +71,11 @@ export const RESULT_WORKSPACE_ROLES = Object.freeze(['candidate_worktree', 'proj
 export const RESULT_TEST_STATUSES = Object.freeze(['passed', 'failed', 'partial', 'not_run']);
 export const RESULT_REVIEW_STATUSES = Object.freeze(['pending', 'accepted', 'rejected']);
 export const DELIVERY_STATUSES = Object.freeze(['candidate', 'accepted_not_integrated', 'integrated', 'rejected']);
+export const OBSERVABILITY_PROTOCOL_VERSION = 1;
+export const OBSERVABILITY_MODES = Object.freeze(['lean', 'diagnostic']);
+export const OBSERVABILITY_PHASES = Object.freeze(['registered', 'dispatch_confirmed', 'progress_ingested', 'failure_ingested', 'completion_ingested', 'changes_requested', 'rework_prepared', 'reclaimed', 'blocked', 'review_accepted', 'integrated', 'archived']);
+export const OBSERVABILITY_CONFIDENCE = Object.freeze(['direct', 'bounded', 'unavailable']);
+const OBSERVABILITY_CLOCK_ID = `task-control-${process.pid}-${randomUUID().replaceAll('-', '')}`;
 export const HEARTBEAT_INTERVALS_MS = Object.freeze({
   repeatable: 3 * 60 * 1000,
   bounded_reasoning_medium: 5 * 60 * 1000,
@@ -859,6 +864,42 @@ function ensureParallelTaskControl(tasks) {
   } : { ...task, ...parallelTaskDefaults() });
 }
 
+function observabilityDefaults() {
+  return { observabilityProtocolVersion: 0, observabilityReceipts: [] };
+}
+
+function ensureObservabilityControl(tasks) {
+  return tasks.map((task) => 'observabilityProtocolVersion' in task ? {
+    ...task,
+    observabilityReceipts: Array.isArray(task.observabilityReceipts) ? task.observabilityReceipts : [],
+  } : { ...task, ...observabilityDefaults() });
+}
+
+function appendObservabilityReceipt(task, phase, observedAt = new Date().toISOString(), outcome = 'succeeded') {
+  if (task.observabilityProtocolVersion !== OBSERVABILITY_PROTOCOL_VERSION) return task;
+  if (!OBSERVABILITY_PHASES.includes(phase) || !isTimestamp(observedAt)) fail('OBSERVABILITY_RECEIPT_INVALID', 'observability phase 或时间无效');
+  const attempt = Number.isInteger(task.attemptCount) && task.attemptCount > 0 ? task.attemptCount : 1;
+  const receipt = {
+    schemaVersion: 1,
+    eventName: 'task_lifecycle',
+    phase,
+    outcome,
+    wallTimeUtc: observedAt,
+    monotonicTimeNs: process.hrtime.bigint().toString(),
+    clockId: OBSERVABILITY_CLOCK_ID,
+    threadId: task.threadId,
+    taskId: task.threadId,
+    turnId: null,
+    requestId: null,
+    callId: null,
+    correlationId: `${task.threadId}:attempt-${attempt}:${phase}:${observedAt}:${task.observabilityReceipts.length + 1}`,
+    attempt,
+    source: 'task_control',
+    confidence: 'direct',
+  };
+  return { ...task, observabilityReceipts: [...task.observabilityReceipts, receipt] };
+}
+
 function controllerHealthFor(registry, controllerThreadId) {
   return (registry.controllerHealth ?? []).find((entry) => entry.controllerThreadId === controllerThreadId) ?? null;
 }
@@ -1040,7 +1081,7 @@ function ensureThreadControl(tasks, rootControllers) {
 }
 
 function ensureTaskControls(tasks, rootControllers) {
-  return ensureParallelTaskControl(ensureDispatchControl(ensureExecutionControl(ensureObjectiveControl(ensureImplementationControl(ensureThreadControl(tasks, rootControllers))))));
+  return ensureObservabilityControl(ensureParallelTaskControl(ensureDispatchControl(ensureExecutionControl(ensureObjectiveControl(ensureImplementationControl(ensureThreadControl(tasks, rootControllers)))))));
 }
 
 function parallelTaskState(task) {
@@ -1659,6 +1700,18 @@ function validateTask(value, projectRoot) {
       if (!implementationTask(value) && value.parallelWorktreeIdentity !== null) fail('REGISTRY_INVALID', 'parallel control_only task 不得携带 worktreeIdentity');
     }
   }
+  const observabilityFields = ['observabilityProtocolVersion', 'observabilityReceipts'];
+  const presentObservabilityFields = observabilityFields.filter((key) => key in value);
+  if (presentObservabilityFields.length !== 0 && presentObservabilityFields.length !== observabilityFields.length) fail('REGISTRY_INVALID', 'observability 控制字段必须同时存在');
+  if (presentObservabilityFields.length === observabilityFields.length) {
+    if (![0, OBSERVABILITY_PROTOCOL_VERSION].includes(value.observabilityProtocolVersion) || !Array.isArray(value.observabilityReceipts)) fail('REGISTRY_INVALID', 'observability protocol/receipts 无效');
+    if (value.observabilityProtocolVersion === 0 && value.observabilityReceipts.length > 0) fail('REGISTRY_INVALID', 'legacy task 不得伪造 observability receipts');
+    const receiptIds = new Set();
+    for (const receipt of value.observabilityReceipts) {
+      if (!isObject(receipt) || receipt.schemaVersion !== 1 || receipt.eventName !== 'task_lifecycle' || !has(receipt.phase, OBSERVABILITY_PHASES) || receipt.outcome !== 'succeeded' || !isTimestamp(receipt.wallTimeUtc) || !/^\d+$/.test(receipt.monotonicTimeNs ?? '') || !nonEmpty(receipt.clockId) || receipt.threadId !== value.threadId || receipt.taskId !== value.threadId || receipt.turnId !== null || receipt.requestId !== null || receipt.callId !== null || !nonEmpty(receipt.correlationId) || receiptIds.has(receipt.correlationId) || !Number.isInteger(receipt.attempt) || receipt.attempt < 1 || receipt.source !== 'task_control' || receipt.confidence !== 'direct') fail('REGISTRY_INVALID', 'observability receipt 结构、归属或相关标识无效');
+      receiptIds.add(receipt.correlationId);
+    }
+  }
   const progressFields = ['progressEventCreatedAt', 'lastProgressSummary'];
   const presentProgressFields = progressFields.filter((key) => key in value);
   if (presentProgressFields.length !== 0 && presentProgressFields.length !== progressFields.length) fail('REGISTRY_INVALID', '进度字段必须同时存在');
@@ -2226,7 +2279,7 @@ export async function controllerRecordDispatched(input) {
       parallelBatches = registry.parallelBatches.map((entry) => entry.batchId === batch.batchId ? { ...batch, status: remaining.length === 0 ? 'running' : 'dispatching', pendingDispatchCandidateIds: remaining, dispatchWaveId: remaining.length === 0 ? null : batch.dispatchWaveId, updatedAt: new Date().toISOString() } : entry);
     }
     const now = new Date();
-    const nextTask = { ...task, lastDispatchedAttempt: task.attemptCount, lastDispatchedAt: now.toISOString(), updatedAt: now.toISOString() };
+    const nextTask = appendObservabilityReceipt({ ...task, lastDispatchedAttempt: task.attemptCount, lastDispatchedAt: now.toISOString(), updatedAt: now.toISOString() }, 'dispatch_confirmed', now.toISOString());
     let next = validateRegistry({ ...registry, tasks: registry.tasks.map((entry) => entry.threadId === task.threadId ? nextTask : entry), parallelBatches, updatedAt: now.toISOString() }, paths.projectKey, paths.projectRoot);
     const heartbeat = rearmControllerHeartbeatInRegistry(next, input.controllerThreadId, 'dispatch', task.threadId, now);
     next = validateRegistry(heartbeat.registry, paths.projectKey, paths.projectRoot);
@@ -2359,7 +2412,8 @@ export async function controllerRegisterTask(input) {
     const objectiveCreatedAt = replaced?.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? replaced.objectiveCreatedAt : now;
     const runtime = objectiveRuntime(controlledTasks, objectiveId);
     if (runtime.fuseOpen) fail('OBJECTIVE_RETRY_FUSE_OPEN', `objective ${objectiveId} 已熔断: ${runtime.reasons.join(', ')}`);
-    const draft = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, ...parallelControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: now };
+    const draftBase = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, ...parallelControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', observabilityProtocolVersion: OBSERVABILITY_PROTOCOL_VERSION, observabilityReceipts: [], updatedAt: now };
+    const draft = appendObservabilityReceipt(draftBase, 'registered', now);
     const tasks = ensureTaskControls([...controlledTasks, draft], rootControllers);
     const task = tasks.find((candidate) => candidate.threadId === input.threadId);
     const next = validateRegistry({ ...registry, rootControllerThreadIds: rootControllers, parallelBatches, updatedAt: new Date().toISOString(), tasks }, paths.projectKey, paths.projectRoot);
@@ -2439,9 +2493,9 @@ export async function auditArchiveBacklog(input = {}) {
   return { compliant: backlogCount === 0, backlogCount, ownerCount: owners.length, readyActionCount, owners, auditedAt: new Date().toISOString() };
 }
 
-function deliveryReportPath(home, projectKey, controllerThreadId) {
+function deliveryReportPath(home, projectKey, controllerThreadId, mode = 'lean') {
   assertSafeThreadId(controllerThreadId, 'controllerThreadId');
-  return join(home, 'reports', projectKey, controllerThreadId, 'index.html');
+  return join(home, 'reports', projectKey, controllerThreadId, mode === 'diagnostic' ? 'diagnostic.html' : 'index.html');
 }
 
 function taskBelongsToController(task, controllerThreadId, byId) {
@@ -2526,9 +2580,9 @@ export async function controllerQueryDeliverables(input) {
     const manifestReferences = new Set(deliverables.flatMap((deliverable) => deliverable.artifacts.flatMap((artifact) => [artifact.path, artifact.uri].filter(nonEmpty))));
     const legacyArtifacts = legacyEvidenceForTask(task).filter((artifact) => !manifestReferences.has(artifact.reference));
     const objective = task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? objectiveRuntime(registry.tasks, task.objectiveId, Date.parse(registry.updatedAt)) : null;
-    tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, resultProtocolVersion: task.resultProtocolVersion, attemptCount: task.attemptCount, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, objective, failureHistory: task.failureHistory, diagnostics: task.diagnostics, closeout: task.closeout, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
+    tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, model: task.model, thinking: task.thinking, workClass: task.workClass ?? null, parallelProtocolVersion: task.parallelProtocolVersion, parallelBatchId: task.parallelBatchId, parallelCandidateId: task.parallelCandidateId, parallelLane: task.parallelLane, attemptCount: task.attemptCount, lastDispatchedAt: task.lastDispatchedAt, progressEventCreatedAt: task.progressEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, failureEventCreatedAt: task.failureEventCreatedAt ?? null, executionEndedAt: task.executionEndedAt, archivedAt: task.archivedAt, stageProgress: task.stageProgress, observabilityProtocolVersion: task.observabilityProtocolVersion, observabilityReceipts: task.observabilityReceipts, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, objective, failureHistory: task.failureHistory, diagnostics: task.diagnostics, closeout: task.closeout, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
   }
-  return { reportSchemaVersion: 1, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount: tasks.reduce((total, task) => total + task.deliverables.length, 0), tasks };
+  return { reportSchemaVersion: 2, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount: tasks.reduce((total, task) => total + task.deliverables.length, 0), tasks };
 }
 
 function escapeHtml(value) {
@@ -2548,6 +2602,193 @@ function deliveryStatusLabel(deliverable, task) {
   return ({ candidate: '候选', accepted_not_integrated: '已接受·未集成', integrated: '已集成', rejected: '未通过' })[deliverable.deliveryStatus];
 }
 
+function secondsBetween(start, end) {
+  if (!isTimestamp(start) || !isTimestamp(end)) return null;
+  return Number((Math.max(0, Date.parse(end) - Date.parse(start)) / 1000).toFixed(3));
+}
+
+function receiptTimes(task, phase) {
+  return (task.observabilityReceipts ?? []).filter((receipt) => receipt.phase === phase).map((receipt) => receipt.wallTimeUtc).sort((left, right) => Date.parse(left) - Date.parse(right));
+}
+
+function firstTimestamp(...values) {
+  return values.flat().filter(isTimestamp).sort((left, right) => Date.parse(left) - Date.parse(right))[0] ?? null;
+}
+
+function lifecycleSummary(task, asOf) {
+  const registeredAt = firstTimestamp(receiptTimes(task, 'registered'));
+  const dispatchedAt = firstTimestamp(receiptTimes(task, 'dispatch_confirmed'), task.lastDispatchedAt);
+  const progressTimes = [...receiptTimes(task, 'progress_ingested'), ...(task.stageProgress ?? []).map((stage) => stage.createdAt)].filter(isTimestamp).sort((left, right) => Date.parse(left) - Date.parse(right));
+  const completionAt = firstTimestamp(receiptTimes(task, 'completion_ingested'), task.completionEventCreatedAt);
+  const failureAt = firstTimestamp(receiptTimes(task, 'failure_ingested'), task.failureEventCreatedAt);
+  const acceptedAt = firstTimestamp(receiptTimes(task, 'review_accepted'));
+  const integratedAt = firstTimestamp(receiptTimes(task, 'integrated'));
+  const executionEndAt = task.executionEndedAt ?? completionAt ?? failureAt;
+  const terminalAt = firstTimestamp(receiptTimes(task, 'blocked'), receiptTimes(task, 'reclaimed'), integratedAt, ['integrated', 'blocked', 'reclaimed'].includes(task.status) ? task.executionEndedAt : null);
+  const archivedAt = firstTimestamp(receiptTimes(task, 'archived'), task.archivedAt);
+  const end = executionEndAt ?? (isTimestamp(asOf) ? asOf : null);
+  const receiptEvents = (task.observabilityReceipts ?? []).map((receipt) => ({ phase: receipt.phase, at: receipt.wallTimeUtc, source: receipt.source, confidence: receipt.confidence, attempt: receipt.attempt }));
+  return {
+    status: task.observabilityProtocolVersion === OBSERVABILITY_PROTOCOL_VERSION ? 'recorded' : 'legacy_partial',
+    registeredAt,
+    dispatchedAt,
+    firstProgressAt: progressTimes[0] ?? null,
+    lastProgressAt: progressTimes.at(-1) ?? task.progressEventCreatedAt ?? null,
+    completionAt,
+    failureAt,
+    acceptedAt,
+    integratedAt,
+    executionEndAt,
+    terminalAt,
+    archivedAt,
+    dispatchToEndSeconds: secondsBetween(dispatchedAt, end),
+    dispatchToFirstProgressSeconds: secondsBetween(dispatchedAt, progressTimes[0]),
+    reviewWaitSeconds: secondsBetween(completionAt, firstTimestamp(acceptedAt, integratedAt, terminalAt)),
+    events: receiptEvents.sort((left, right) => Date.parse(left.at) - Date.parse(right.at) || left.phase.localeCompare(right.phase)),
+  };
+}
+
+function concurrencySummary(intervals) {
+  const events = intervals.flatMap((interval) => isTimestamp(interval.start) && isTimestamp(interval.end) && Date.parse(interval.end) >= Date.parse(interval.start) ? [{ at: Date.parse(interval.start), delta: 1 }, { at: Date.parse(interval.end), delta: -1 }] : []).sort((left, right) => left.at - right.at || left.delta - right.delta);
+  let active = 0; let maximum = 0; let overlapMs = 0; let previous = null;
+  for (let index = 0; index < events.length;) {
+    const at = events[index].at;
+    if (previous !== null && active >= 2) overlapMs += at - previous;
+    while (index < events.length && events[index].at === at) { active += events[index].delta; index += 1; }
+    maximum = Math.max(maximum, active);
+    previous = at;
+  }
+  return { intervalCount: intervals.length, maxConcurrent: maximum, overlapSeconds: Number((overlapMs / 1000).toFixed(3)) };
+}
+
+function diagnosticCodexHome(input) {
+  if (nonEmpty(input.codexHome)) return win32.resolve(input.codexHome);
+  if (nonEmpty(input.taskControlHome)) return win32.dirname(win32.resolve(input.taskControlHome));
+  return win32.resolve(process.env.CODEX_HOME || join(homedir(), '.codex'));
+}
+
+async function collectRolloutCandidates(root, threadIds, output) {
+  let entries;
+  try { entries = await readdir(root, { withFileTypes: true }); } catch (error) { if (error?.code === 'ENOENT') return; throw error; }
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) await collectRolloutCandidates(path, threadIds, output);
+    else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      for (const threadId of threadIds) if (entry.name.includes(threadId)) output.get(threadId).push(path);
+    }
+  }
+}
+
+async function rolloutPathsForTasks(codexHome, threadIds) {
+  const output = new Map(threadIds.map((threadId) => [threadId, []]));
+  for (const root of [join(codexHome, 'sessions'), join(codexHome, 'archived_sessions')]) await collectRolloutCandidates(root, threadIds, output);
+  const selected = new Map();
+  for (const [threadId, candidates] of output) {
+    const ranked = [];
+    for (const path of candidates) {
+      try { const info = await stat(path); ranked.push({ path, size: info.size }); } catch { /* unavailable candidate */ }
+    }
+    ranked.sort((left, right) => right.size - left.size || left.path.localeCompare(right.path));
+    selected.set(threadId, ranked[0]?.path ?? null);
+  }
+  return selected;
+}
+
+async function loadTimeDiagnosticsAnalyzer(input, codexHome) {
+  if (typeof input.timeDiagnosticsAnalyzer === 'function') return input.timeDiagnosticsAnalyzer;
+  const scriptPath = join(codexHome, 'skills', 'codex-time-diagnostics', 'scripts', 'analyze-session-timeline.mjs');
+  await access(scriptPath).catch(() => fail('TIME_DIAGNOSTICS_UNAVAILABLE', `未找到本地 codex-time-diagnostics analyzer: ${scriptPath}`));
+  const module = await import(pathToFileURL(scriptPath).href);
+  if (typeof module.analyzeFile !== 'function') fail('TIME_DIAGNOSTICS_UNAVAILABLE', '本地 codex-time-diagnostics 未导出 analyzeFile');
+  return module.analyzeFile;
+}
+
+function diagnosticSummary(report, expectedThreadId) {
+  if (report.sessionId !== expectedThreadId) fail('TIME_DIAGNOSTICS_THREAD_MISMATCH', `rollout session ${report.sessionId ?? 'unknown'} 不匹配 task ${expectedThreadId}`);
+  const summary = report.summary;
+  const otelObserved = summary.otel?.status === 'observed';
+  const pairedTurns = report.turnEnvelopes.filter((turn) => turn.paired);
+  return {
+    status: 'observed',
+    sourcePath: report.input,
+    scopeStart: report.scope.start,
+    scopeEnd: report.scope.end,
+    activeTurnUnionSeconds: summary.activeTurns.activeUnionSeconds,
+    completedTurnCount: summary.activeTurns.completedCount,
+    incompleteTurnCount: summary.activeTurns.incompleteCount,
+    clientObservedTtftSeconds: summary.activeTurns.clientObservedTtftSeconds,
+    toolUnionSeconds: summary.tool.completedUnionSeconds,
+    responseGapSeconds: summary.responseGap.seconds,
+    unknownSeconds: summary.unknown.seconds,
+    unknownRatio: summary.unknown.ratio,
+    contextPeakRatio: summary.context.peakRatio,
+    compactions: summary.context.compactions,
+    repeatedCommandCount: summary.repeatedCommandCount,
+    retryChainCount: summary.retryChainCount,
+    failedToolCount: summary.tool.failedCount,
+    threadHealth: summary.threadHealth,
+    tokens: otelObserved ? { status: 'direct_completed_responses', ...summary.otel.completedResponseTokens } : { status: 'unavailable', sampleCount: 0, inputTokens: null, outputTokens: null },
+    quotaSnapshot: { status: summary.rateLimits.sampleCount > 0 ? 'account_envelope_not_task_attribution' : 'unavailable', sampleCount: summary.rateLimits.sampleCount, primary: summary.rateLimits.primary, secondary: summary.rateLimits.secondary },
+    modelNames: otelObserved ? summary.otel.modelNames : [],
+    reasoningEfforts: otelObserved ? summary.otel.reasoningEfforts : [],
+    inferenceTimingAvailable: otelObserved ? summary.otel.inferenceTimingAvailable : false,
+    firstTurnAt: pairedTurns[0]?.startedAt ?? null,
+    lastTurnAt: pairedTurns.at(-1)?.completedAt ?? null,
+    turnEnvelopes: pairedTurns,
+    remedies: report.remedies.map((remedy) => ({ rootCause: remedy.rootCause, confidence: remedy.confidence, evidence: remedy.evidence, systemicPrevention: remedy.systemicPrevention, verificationMetric: remedy.verificationMetric })),
+  };
+}
+
+function taskAnomalies(task) {
+  const anomalies = [];
+  if (task.attemptCount > 1) anomalies.push({ code: 'multiple_attempts', severity: 'warning', evidence: `attempt=${task.attemptCount}` });
+  if (task.failureHistory.length > 0) anomalies.push({ code: 'recorded_failure', severity: 'warning', evidence: `${task.failureHistory.length} failure event(s)` });
+  if (task.workClass && (WORK_CLASS_MODELS[task.workClass] !== task.model || !WORK_CLASS_THINKING[task.workClass]?.includes(task.thinking))) anomalies.push({ code: 'routing_mismatch', severity: 'critical', evidence: `${task.workClass}/${task.model}/${task.thinking}` });
+  const diagnostic = task.timeDiagnostic;
+  if (diagnostic?.status === 'observed') {
+    if (diagnostic.repeatedCommandCount > 0) anomalies.push({ code: 'repeated_commands', severity: 'warning', evidence: `${diagnostic.repeatedCommandCount} repeated fingerprint(s)` });
+    if (diagnostic.retryChainCount > 0) anomalies.push({ code: 'failed_rework', severity: 'critical', evidence: `${diagnostic.retryChainCount} retry chain(s)` });
+    if (diagnostic.contextPeakRatio !== null && diagnostic.contextPeakRatio >= 0.75) anomalies.push({ code: 'context_pressure', severity: diagnostic.contextPeakRatio >= 0.85 ? 'critical' : 'warning', evidence: `peak=${diagnostic.contextPeakRatio}` });
+    if (diagnostic.compactions > 0) anomalies.push({ code: 'compaction', severity: diagnostic.compactions >= 2 ? 'critical' : 'warning', evidence: `${diagnostic.compactions} compaction(s)` });
+    if (diagnostic.unknownRatio >= 0.5) anomalies.push({ code: 'large_unassigned_interval', severity: 'info', evidence: `${Math.round(diagnostic.unknownRatio * 100)}% unassigned; cause unknown` });
+  }
+  return anomalies;
+}
+
+async function addObservability(data, input) {
+  const mode = input.observabilityMode ?? 'lean';
+  if (!OBSERVABILITY_MODES.includes(mode)) fail('OBSERVABILITY_MODE_INVALID', `observability 必须是 ${OBSERVABILITY_MODES.join(' 或 ')}`);
+  const tasks = data.tasks.map((task) => ({ ...task, lifecycle: lifecycleSummary(task, data.registryUpdatedAt), timeDiagnostic: { status: 'not_requested' } }));
+  let analyzerStatus = 'not_requested';
+  if (mode === 'diagnostic') {
+    const codexHome = diagnosticCodexHome(input);
+    const rolloutPaths = input.rolloutPathsByThreadId instanceof Map ? input.rolloutPathsByThreadId : await rolloutPathsForTasks(codexHome, tasks.map((task) => task.threadId));
+    let analyzeFile;
+    try { analyzeFile = await loadTimeDiagnosticsAnalyzer(input, codexHome); analyzerStatus = 'available'; } catch (error) { analyzerStatus = error.code ?? 'unavailable'; }
+    for (const task of tasks) {
+      const rolloutPath = rolloutPaths.get(task.threadId) ?? null;
+      if (!rolloutPath) { task.timeDiagnostic = { status: 'unavailable', reason: 'rollout_not_found' }; continue; }
+      if (!analyzeFile) { task.timeDiagnostic = { status: 'unavailable', reason: analyzerStatus }; continue; }
+      try {
+        const report = await analyzeFile(rolloutPath, '', { otelJsonl: input.otelJsonl ?? '', desktopLog: input.desktopLog ?? '', segmentByTurn: true });
+        task.timeDiagnostic = diagnosticSummary(report, task.threadId);
+        task.lifecycle.dispatchToFirstTurnSeconds = secondsBetween(task.lifecycle.dispatchedAt, task.timeDiagnostic.firstTurnAt);
+      } catch (error) {
+        task.timeDiagnostic = { status: 'unavailable', reason: error.code ?? error.message };
+      }
+    }
+  }
+  for (const task of tasks) task.anomalies = taskAnomalies(task);
+  const lifecycleConcurrency = concurrencySummary(tasks.map((task) => ({ start: task.lifecycle.dispatchedAt, end: task.lifecycle.executionEndAt ?? data.registryUpdatedAt })).filter((interval) => interval.start && interval.end));
+  const turnIntervals = tasks.flatMap((task) => task.timeDiagnostic?.status === 'observed' ? task.timeDiagnostic.turnEnvelopes.map((turn) => ({ start: turn.startedAt, end: turn.completedAt })) : []);
+  const activeTurnConcurrency = mode === 'diagnostic' ? concurrencySummary(turnIntervals) : { intervalCount: 0, maxConcurrent: null, overlapSeconds: null };
+  const batchAnomalies = [];
+  const parallelTaskCount = tasks.filter((task) => task.parallelProtocolVersion === PARALLEL_BATCH_PROTOCOL_VERSION).length;
+  if (parallelTaskCount >= 2 && lifecycleConcurrency.maxConcurrent < 2) batchAnomalies.push({ code: 'parallel_batch_without_overlapping_dispatch_windows', evidence: `${parallelTaskCount} batch tasks; max dispatched overlap=${lifecycleConcurrency.maxConcurrent}` });
+  if (mode === 'diagnostic' && lifecycleConcurrency.maxConcurrent >= 2 && activeTurnConcurrency.intervalCount > 0 && activeTurnConcurrency.maxConcurrent < 2) batchAnomalies.push({ code: 'dispatched_parallel_but_completed_turns_serial', evidence: `dispatch overlap=${lifecycleConcurrency.maxConcurrent}; completed-turn overlap=${activeTurnConcurrency.maxConcurrent}` });
+  return { ...data, reportPath: deliveryReportPath(resolveTaskControlHome(input), data.projectKey, data.controllerThreadId, mode), tasks, observability: { schemaVersion: 1, mode, analyzerStatus, lifecycleConcurrency: { ...lifecycleConcurrency, interpretation: '派发到执行结束的台账窗口重叠；不是实际模型执行时间。' }, activeTurnConcurrency: { ...activeTurnConcurrency, interpretation: '已配对 task_started/task_complete 包络的重叠；直接证明活跃 turn 同时存在，但不是 CPU 或模型内部时间。' }, batchAnomalies, quotaInterpretation: 'token 仅在同 conversation OTel response.completed 存在时按任务直接计数；额度快照是账户包络，并发时不得归因给单个任务。' } };
+}
+
 function renderArtifactHtml(artifact) {
   const meta = `${artifact.milestone} · ${artifact.workspaceRole} · ${artifact.createdAt}`;
   const missing = artifact.availability === 'missing' ? '<div class="missing">文件当前不可用；历史引用仍保留。</div>' : '';
@@ -2555,6 +2796,36 @@ function renderArtifactHtml(artifact) {
     ? `<a href="${escapeHtml(artifact.href)}"><img loading="lazy" src="${escapeHtml(artifact.href)}" alt="${escapeHtml(artifact.label)}"></a>`
     : `<a class="artifact-link" href="${escapeHtml(artifact.href)}">打开 ${escapeHtml(artifact.type)}</a>`;
   return `<figure class="artifact ${artifact.selected ? 'selected' : ''}">${visual}${missing}<figcaption><strong>${escapeHtml(artifact.label)}</strong><span>${escapeHtml(artifact.description)}</span><small>${escapeHtml(meta)}</small></figcaption></figure>`;
+}
+
+function secondsLabel(value) {
+  return Number.isFinite(value) ? `${value.toLocaleString('zh-CN')} 秒` : '不可用';
+}
+
+function numberLabel(value) {
+  return Number.isFinite(value) ? value.toLocaleString('en-US') : '?';
+}
+
+function renderLifecycleGantt(data) {
+  const rows = data.tasks.filter((task) => task.lifecycle.dispatchedAt).map((task) => ({ task, start: Date.parse(task.lifecycle.dispatchedAt), end: Date.parse(task.lifecycle.executionEndAt ?? data.registryUpdatedAt) }));
+  if (rows.length === 0) return '<div class="legacy">没有可绘制的派发时间窗口。</div>';
+  const min = Math.min(...rows.map((row) => row.start)); const max = Math.max(...rows.map((row) => row.end)); const span = Math.max(1, max - min);
+  return `<div class="gantt">${rows.map(({ task, start, end }) => { const left = ((start - min) / span) * 100; const width = Math.max(0.8, ((Math.max(start, end) - start) / span) * 100); return `<div class="gantt-row"><strong>${escapeHtml(task.displayKey)}</strong><div class="gantt-track"><span class="gantt-bar ${reportStatusClass(task.status)}" style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%"></span></div><small>${escapeHtml(task.lifecycle.dispatchedAt)} → ${escapeHtml(task.lifecycle.executionEndAt ?? `观测上界 ${data.registryUpdatedAt}`)}</small></div>`; }).join('')}</div>`;
+}
+
+function renderObservabilitySection(data) {
+  const observed = data.tasks.filter((task) => task.timeDiagnostic.status === 'observed').length;
+  const anomalyCount = data.tasks.reduce((total, task) => total + task.anomalies.length, 0) + data.observability.batchAnomalies.length;
+  const rows = data.tasks.map((task) => {
+    const diagnostic = task.timeDiagnostic;
+    const tokens = diagnostic.status === 'observed' && diagnostic.tokens.status === 'direct_completed_responses' ? `${numberLabel(diagnostic.tokens.inputTokens)} in / ${numberLabel(diagnostic.tokens.outputTokens)} out` : '不可用';
+    const timing = diagnostic.status === 'observed' ? `dispatch→first turn ${secondsLabel(task.lifecycle.dispatchToFirstTurnSeconds)}（上界）；active ${secondsLabel(diagnostic.activeTurnUnionSeconds)}；tool ${secondsLabel(diagnostic.toolUnionSeconds)}；TTFT median ${secondsLabel(diagnostic.clientObservedTtftSeconds?.median)}` : `未观测：${diagnostic.reason ?? diagnostic.status}`;
+    const anomalies = task.anomalies.length > 0 ? task.anomalies.map((item) => `${item.code}（${item.evidence}）`).join('；') : '未命中确定性异常规则';
+    return `<tr><td>${escapeHtml(task.displayKey)}</td><td>${escapeHtml(task.model)} / ${escapeHtml(task.thinking)}<br><small>${escapeHtml(task.workClass ?? 'legacy')}</small></td><td>${escapeHtml(task.lifecycle.dispatchedAt ?? '未派发')}<br><small>窗口 ${escapeHtml(secondsLabel(task.lifecycle.dispatchToEndSeconds))}</small></td><td>${escapeHtml(timing)}</td><td>${escapeHtml(tokens)}<br><small>额度代理，不是账单</small></td><td>${escapeHtml(anomalies)}</td></tr>`;
+  }).join('');
+  const actual = data.observability.activeTurnConcurrency;
+  const batchAnomalies = data.observability.batchAnomalies.length > 0 ? `<div class="warning"><strong>并发异常：</strong>${escapeHtml(data.observability.batchAnomalies.map((item) => `${item.code}（${item.evidence}）`).join('；'))}</div>` : '';
+  return `<section><h2>按需观测与消耗诊断</h2><p class="subtitle">模式：${escapeHtml(data.observability.mode)}。默认 lean 只读台账；diagnostic 才读取 rollout 和用户显式提供的 OTel/Desktop 日志。</p><div class="metrics"><div class="metric"><strong>${data.observability.lifecycleConcurrency.maxConcurrent}</strong><span>派发窗口最大重叠</span></div><div class="metric"><strong>${actual.maxConcurrent ?? '—'}</strong><span>完成 turn 最大并发</span></div><div class="metric"><strong>${observed}/${data.taskCount}</strong><span>有时间诊断的任务</span></div><div class="metric"><strong>${anomalyCount}</strong><span>异常证据项</span></div></div>${batchAnomalies}<div class="legacy"><strong>解释边界：</strong>${escapeHtml(data.observability.lifecycleConcurrency.interpretation)} ${escapeHtml(data.observability.activeTurnConcurrency.interpretation)} ${escapeHtml(data.observability.quotaInterpretation)}</div><h3>派发窗口时间线</h3>${renderLifecycleGantt(data)}<div class="table-wrap"><table><thead><tr><th>任务</th><th>路由</th><th>台账时间</th><th>本地耗时证据</th><th>Token / 额度代理</th><th>异常</th></tr></thead><tbody>${rows}</tbody></table></div></section>`;
 }
 
 function renderDeliveryReport(data) {
@@ -2572,19 +2843,20 @@ function renderDeliveryReport(data) {
     const diagnostics = task.diagnostics.length > 0 ? `<details class="legacy"><summary>诊断价值裁决（${task.diagnostics.length}）</summary><ul>${task.diagnostics.map((diagnostic) => `<li>${escapeHtml(diagnostic.classification)} · ${escapeHtml(diagnostic.summary)}</li>`).join('')}</ul></details>` : '';
     const objective = task.objective ? `<div class="legacy"><strong>Objective：</strong>${escapeHtml(task.objective.objectiveId)} · replacement ${task.objective.replacementCount}/${OBJECTIVE_FUSE_REPLACEMENT_LIMIT} · ${Math.round(task.objective.cumulativeExecutionMs / 60000)} min${task.objective.fuseOpen ? ` · 已熔断：${escapeHtml(task.objective.reasons.join(', '))}` : ''}</div>` : '';
     const closeout = task.closeout ? `<div class="review"><strong>事故收口：</strong>${escapeHtml(task.closeout.userVisibleSummary)} · notification=${escapeHtml(task.closeout.notificationStatus)} · report=${escapeHtml(task.closeout.reportStatus)}</div>` : '';
-    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${escapeHtml(task.title)}</h2><p>${escapeHtml(task.taskMode)} · attempt ${task.attemptCount}</p></div><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(task.status)}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${escapeHtml(task.blocker)}</div>` : ''}${closeout}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${escapeHtml(task.nextGate)}</div></section>`;
+    const timeDiagnostic = task.timeDiagnostic.status === 'observed' ? `<div class="diagnostic"><strong>时间证据：</strong>active ${escapeHtml(secondsLabel(task.timeDiagnostic.activeTurnUnionSeconds))} · tool ${escapeHtml(secondsLabel(task.timeDiagnostic.toolUnionSeconds))} · unknown ${escapeHtml(secondsLabel(task.timeDiagnostic.unknownSeconds))}（不归因）· context ${escapeHtml(task.timeDiagnostic.contextPeakRatio ?? '不可用')} · compaction ${task.timeDiagnostic.compactions}</div>` : '';
+    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${escapeHtml(task.title)}</h2><p>${escapeHtml(task.taskMode)} · ${escapeHtml(task.model)}/${escapeHtml(task.thinking)} · attempt ${task.attemptCount}</p></div><span class="badge ${reportStatusClass(task.status)}">${escapeHtml(task.status)}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${escapeHtml(task.blocker)}</div>` : ''}${closeout}${timeDiagnostic}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${escapeHtml(task.nextGate)}</div></section>`;
   }).join('');
   const integrated = data.tasks.filter((task) => task.status === 'integrated').length;
   const failed = data.tasks.filter((task) => ['blocked', 'reclaimed', 'changes_requested'].includes(task.status)).length;
-  const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}th:nth-child(4),td:nth-child(4){min-width:260px}}';
-  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><title>Codex 任务成果总览</title><style>${css}</style></head><body><header><h1>任务成果历史总览</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.deliverableCount}</strong><span>历史成果包</span></div><div class="metric"><strong>${integrated}</strong><span>已集成</span></div><div class="metric"><strong>${failed}</strong><span>阻塞 / 收回 / 未通过</span></div></div></header><main><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${timelines}</main></body></html>\n`;
+  const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32;--blue:#315f86}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty,.diagnostic{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}.diagnostic{background:#edf4fa;border-color:var(--blue)}.gantt{display:grid;gap:8px;margin:12px 0 18px}.gantt-row{display:grid;grid-template-columns:70px minmax(220px,1fr) minmax(280px,auto);gap:10px;align-items:center}.gantt-track{height:16px;position:relative;background:#e5ddd2;border-radius:8px;overflow:hidden}.gantt-bar{position:absolute;top:0;height:100%;background:var(--amber)}.gantt-bar.ok{background:var(--green)}.gantt-bar.failed{background:var(--red)}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}.gantt-row{grid-template-columns:48px 1fr}.gantt-row small{grid-column:1/-1}th:nth-child(4),td:nth-child(4){min-width:260px}}';
+  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.deliverableCount}</strong><span>历史成果包</span></div><div class="metric"><strong>${integrated}</strong><span>已集成</span></div><div class="metric"><strong>${failed}</strong><span>阻塞 / 收回 / 未通过</span></div></div></header><main><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
 }
 
 export async function controllerBuildDeliveryReport(input) {
-  const data = await controllerQueryDeliverables(input);
+  const data = await addObservability(await controllerQueryDeliverables(input), input);
   const html = renderDeliveryReport(data);
   await atomicWriteText(data.reportPath, html);
-  return { reportPath: data.reportPath, reportFileUri: pathToFileURL(data.reportPath).href, projectKey: data.projectKey, controllerThreadId: data.controllerThreadId, registryUpdatedAt: data.registryUpdatedAt, taskCount: data.taskCount, deliverableCount: data.deliverableCount };
+  return { reportPath: data.reportPath, reportFileUri: pathToFileURL(data.reportPath).href, projectKey: data.projectKey, controllerThreadId: data.controllerThreadId, registryUpdatedAt: data.registryUpdatedAt, taskCount: data.taskCount, deliverableCount: data.deliverableCount, observability: data.observability };
 }
 
 export async function controllerIngestContextHealth(input) {
@@ -2771,7 +3043,7 @@ export async function controllerIngestFailure(input) {
     }
     const failureRecord = { type: expectedType, attemptedStage: event.attemptedStage, failureClass: event.failureClass, failureDomain: event.failureDomain, commandSummary: event.commandSummary.trim(), evidence: normalizeEvidenceReferences(event.evidence), mechanicalRetryEligible: event.mechanicalRetryEligible, attemptCount: task.attemptCount, createdAt: event.createdAt };
     const reason = `${event.failureDomain}/${event.failureClass}: ${event.commandSummary.trim()}`;
-    return { ...task, failureHistory: [...task.failureHistory, failureRecord], status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: event.failureClass, changesRequestedReason: reason, reviewVerdict: 'changes_requested', failureEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, updatedAt: new Date().toISOString() };
+    return appendObservabilityReceipt({ ...task, failureHistory: [...task.failureHistory, failureRecord], status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: event.failureClass, changesRequestedReason: reason, reviewVerdict: 'changes_requested', failureEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, updatedAt: new Date().toISOString() }, 'failure_ingested', event.createdAt);
   }});
 }
 
@@ -2789,7 +3061,7 @@ export async function controllerIngestProgress(input) {
     assertEventContractMatches(task, event);
     const checkpoint = validateStageCheckpoint(task, event.stageId, event.evidence ?? []);
     const stageProgress = implementationTask(task) ? [...task.stageProgress, { ...checkpoint, summary: event.summary.trim(), attemptCount: task.attemptCount, createdAt: event.createdAt, contractDigest: task.contractDigest, contractVersion: contractVersion(task) }] : task.stageProgress;
-    return { ...task, stageProgress, progressEventCreatedAt: event.createdAt, lastProgressSummary: event.summary.trim(), updatedAt: new Date().toISOString() };
+    return appendObservabilityReceipt({ ...task, stageProgress, progressEventCreatedAt: event.createdAt, lastProgressSummary: event.summary.trim(), updatedAt: new Date().toISOString() }, 'progress_ingested', event.createdAt);
   }});
 }
 
@@ -2825,7 +3097,7 @@ export async function controllerIngestCompletion(input) {
     } else if (event.resultManifest !== undefined) {
       fail('RESULT_MANIFEST_NOT_APPLICABLE', 'legacy completion event 不得伪造 result manifest');
     }
-    return { ...task, deliverableHistory, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() };
+    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() }, 'completion_ingested', event.createdAt);
   }});
 }
 
@@ -3126,7 +3398,7 @@ export async function controllerMarkChangesRequested(input) {
     if (task.status !== 'executing' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 changes_requested`);
     const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
     const now = new Date().toISOString();
-    return { ...task, deliverableHistory, status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: input.failureClass, changesRequestedReason: input.reason.trim(), reviewVerdict: 'changes_requested', executionEndedAt: now, updatedAt: now };
+    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: input.failureClass, changesRequestedReason: input.reason.trim(), reviewVerdict: 'changes_requested', executionEndedAt: now, updatedAt: now }, 'changes_requested', now);
   }});
 }
 
@@ -3136,7 +3408,8 @@ export async function controllerDispatchRework(input) {
     if (task.status !== 'changes_requested') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 重新派发`);
     if (task.failureClass !== 'mechanical') fail('REWORK_REQUIRES_CONTROLLER', `${task.failureClass} 失败不得继续交给原 worker；必须由主控收回并重新分类`);
     if ((task.attemptCount ?? 1) >= 2) fail('REWORK_LIMIT_REACHED', '同一可见任务只允许一次机械返工；必须由主控收回');
-    return { ...task, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: (task.attemptCount ?? 1) + 1, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: new Date().toISOString() };
+    const now = new Date().toISOString();
+    return appendObservabilityReceipt({ ...task, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: (task.attemptCount ?? 1) + 1, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'rework_prepared', now);
   }});
 }
 
@@ -3151,7 +3424,7 @@ export async function controllerReclaimTask(input) {
     if (task.status !== 'changes_requested' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 由主控收回`);
     const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
     const now = new Date().toISOString();
-    return { ...task, deliverableHistory, status: 'reclaimed', executionStatus: 'terminal', nextOwner: 'controller', reclaimedReason: input.reason.trim(), closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now };
+    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'reclaimed', executionStatus: 'terminal', nextOwner: 'controller', reclaimedReason: input.reason.trim(), closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now }, 'reclaimed', now);
   }});
 }
 
@@ -3166,7 +3439,7 @@ export async function controllerMarkBlocked(input) {
     }
     const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
     const now = new Date().toISOString();
-    return { ...task, deliverableHistory, status: 'blocked', executionStatus: 'terminal', nextOwner: 'none', blockedReason: input.reason.trim(), blockerSource: input.blockerSource, blockedDiagnosticId: input.diagnosticId ?? null, closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now };
+    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'blocked', executionStatus: 'terminal', nextOwner: 'none', blockedReason: input.reason.trim(), blockerSource: input.blockerSource, blockedDiagnosticId: input.diagnosticId ?? null, closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now }, 'blocked', now);
   }});
 }
 
@@ -3208,7 +3481,8 @@ export async function controllerMarkAccepted(input) {
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'awaiting_review' || !nonEmpty(task.candidateCommit)) fail('TASK_TRANSITION_INVALID', '只有有 candidateCommit 的 awaiting_review 可以 accepted');
     const deliverableHistory = reviewCurrentDeliverable(task, 'accepted', input.reason, input.selectedArtifactIds ?? []);
-    return { ...task, deliverableHistory, status: 'accepted', executionStatus: 'stopped', nextOwner: 'controller', reviewVerdict: 'accepted', updatedAt: new Date().toISOString() };
+    const now = new Date().toISOString();
+    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'accepted', executionStatus: 'stopped', nextOwner: 'controller', reviewVerdict: 'accepted', updatedAt: now }, 'review_accepted', now);
   }});
 }
 
@@ -3216,7 +3490,8 @@ export async function controllerMarkIntegrated(input) {
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.status !== 'accepted') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 integrated`);
     const deliverableHistory = integrateCurrentDeliverable(task);
-    return { ...task, deliverableHistory, status: 'integrated', executionStatus: 'terminal', nextOwner: 'none', reviewVerdict: 'accepted', integrationStatus: 'integrated', updatedAt: new Date().toISOString() };
+    const now = new Date().toISOString();
+    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'integrated', executionStatus: 'terminal', nextOwner: 'none', reviewVerdict: 'accepted', integrationStatus: 'integrated', updatedAt: now }, 'integrated', now);
   }});
 }
 
@@ -3247,7 +3522,7 @@ export async function controllerRecordArchiveSucceeded(input) {
     if (!descendantsOf(registry.tasks, task.threadId).every((descendant) => descendant.archiveStatus === 'archived')) fail('THREAD_ARCHIVE_NOT_READY', '必须先归档所有可见后代任务');
     if (task.archiveStatus !== 'pending') fail('THREAD_ACTION_NOT_PENDING', 'archive action 不是 pending；failed 必须先由直接主控显式重新排队');
     const now = new Date().toISOString();
-    return { ...appendThreadActionHistory(task, 'set_thread_archived', 'succeeded', 'archived', now), archiveStatus: 'archived', archivedAt: now, archiveError: null, updatedAt: now };
+    return appendObservabilityReceipt({ ...appendThreadActionHistory(task, 'set_thread_archived', 'succeeded', 'archived', now), archiveStatus: 'archived', archivedAt: now, archiveError: null, updatedAt: now }, 'archived', now);
   }});
 }
 
@@ -3419,7 +3694,7 @@ function requiredBoolean(args, name) {
 
 function helpText() {
   return [
-    'codex-task-control v0.12.0',
+    'codex-task-control v0.13.0',
     '',
     '实施合同命令：',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
@@ -3432,7 +3707,7 @@ function helpText() {
     '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--evidence-ref <id=reference> ...]',
     '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json>',
     '  controller-query-deliverables --project-root <root> --controller <id>',
-    '  controller-build-delivery-report --project-root <root> --controller <id>',
+    '  controller-build-delivery-report --project-root <root> --controller <id> [--observability lean|diagnostic] [--otel-jsonl <file-or-dir>] [--desktop-log <file>]',
     '  controller-ingest-context-health --project-root <root> --controller <id> --receipt <json>',
     '  controller-record-diagnostic ... --diagnostic-id <id> --classification technical_debt|milestone_blocker --summary <text> ...',
     '  mark-accepted ... --reason <review-reason> [--selected-artifact <artifact-id> ...]',
@@ -3444,7 +3719,7 @@ function helpText() {
     '  controller-record-message-delivery --project-root <root> --controller <id> --message-id <id> --action-id <id> --outcome delivered|failed [--receipt <host-receipt>] [--reason <host-error>]',
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
-    'implementation 成果包按 attempt 追加保存；HTML 报告确定性生成到 task-control/reports，刷新不维持 heartbeat。',
+    'implementation 成果包按 attempt 追加保存；lean HTML 只读现有台账，diagnostic 才按需读取 rollout 与显式提供的 OTel/Desktop 日志；两者都不维持 heartbeat。',
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
     'heartbeat 使用 prepare/create-new/confirm/switch/delete-old 两阶段协议；终态必须 finalize 并确认删除，stale invocation 只返回受限自删除动作。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
@@ -3515,7 +3790,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-ingest-failure') result = await controllerIngestFailure({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event'), eventType: required(args, '--event-type') });
   else if (command === 'controller-ingest-notification-failed') result = await controllerIngestNotificationFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
   else if (command === 'controller-query-deliverables') result = await controllerQueryDeliverables({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
-  else if (command === 'controller-build-delivery-report') result = await controllerBuildDeliveryReport({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
+  else if (command === 'controller-build-delivery-report') result = await controllerBuildDeliveryReport({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), observabilityMode: option(args, '--observability') ?? 'lean', otelJsonl: option(args, '--otel-jsonl'), desktopLog: option(args, '--desktop-log') });
   else if (command === 'controller-ingest-context-health') result = await controllerIngestContextHealth({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
   else if (command === 'controller-scan-events') result = await controllerScanPendingEvents({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), heartbeatGeneration: option(args, '--heartbeat-generation'), heartbeatAutomationId: option(args, '--automation-id'), heartbeatActionId: option(args, '--heartbeat-action-id'), heartbeatOccurrence: option(args, '--heartbeat-occurrence'), heartbeatRrule: option(args, '--heartbeat-rrule'), heartbeatFiredAt: option(args, '--heartbeat-fired-at') });
   else if (command === 'controller-rearm-heartbeat') result = await controllerRearmHeartbeat({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: option(args, '--reason') ?? 'reconcile' });

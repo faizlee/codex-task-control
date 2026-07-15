@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.12.0 是 Windows-first preview。并发批次、台账、合同/成果校验、主控消息队列、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
+> v0.13.0 是 Windows-first preview。并发批次、轻量生命周期回执、按需本地耗时诊断、合同/成果校验、主控消息队列、停滞/熔断审计、历史 HTML、heartbeat 协议与路由预检完全保存在本地，不会调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,14 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.12.0 已经解决什么
+## v0.13.0 已经解决什么
+
+- 登记、真实派发、有效 progress 入账、失败/完成、审查、集成和归档时，顺便追加 schema-v1 observability receipt；不会为了计时增加 worker 命令或 progress。
+- 默认 `lean` 报告只读现有台账，不扫描 rollout、Desktop 或 OTel。
+- 只有用户明确要求时才生成 `diagnostic` 报告：复用已安装的 `codex-time-diagnostics` analyzer，定位对应可见任务 rollout，并可读取用户显式传入的本地 OTel/Desktop 证据。
+- 严格区分“派发窗口重叠”和“已配对 active turn 重叠”，不会把计划并发或仅已派发冒充真实并发执行。
+- 按子任务展示模型/thinking、attempt、生命周期时间、active-turn union、工具/TTFT/上下文/压缩/重试、同 conversation completed-response token，以及不能归因到单个任务的账户额度快照。
+- 普通成果页仍写入确定性的 `index.html`；按需诊断另写 `diagnostic.html`，不会覆盖日常 closeout 页面，也不会维持 heartbeat。
 
 - 创建 task 前先登记 schema-v1 `parallel_batch`，记录候选车道、依赖、冲突域、动态 WIP、review 容量和 implementation worktree 身份链。
 - 有两个安全候选时强制 fan-out；只有一个时必须提交带类型、说明和证据的退化回执。代码候选与无冲突 QA/no-code/readonly 候选同时存在时，禁止只派代码任务。
@@ -67,12 +74,12 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.12.0 不做什么
+## v0.13.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.12.0 用本地 dispatch wave 和消息延后做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.13.0 用本地 dispatch wave 和消息延后做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
 - 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能在主控 turn 进行中原子延后定时消息，或取消已经挂起的宿主工具调用。Skill 会阻止后续受控业务动作并返回有界清理选择器，但彻底解决仍需要宿主级 compare-and-delete/defer hook。
 - 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
@@ -205,9 +212,14 @@ node $TaskControl controller-assert-business-ready `
 node $TaskControl mark-accepted --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --reason "合同和视觉预言均通过。" --selected-artifact "after"
 node $TaskControl controller-query-deliverables --project-root "C:\work\example" --controller "controller-1"
 node $TaskControl controller-build-delivery-report --project-root "C:\work\example" --controller "controller-1"
+
+# 只有用户要求排查耗时或消耗时才运行：
+node $TaskControl controller-build-delivery-report --project-root "C:\work\example" --controller "controller-1" --observability diagnostic --otel-jsonl "$HOME\.codex\otel-local\data"
 ```
 
-非视觉成果包参考 [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json)，视觉成果包参考 [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json)。旧任务没有可信历史资料时只显示“历史证据不可用”，不会伪造截图或阻塞当前任务。
+默认 `lean` 只生成 `index.html`，不读取 rollout/OTel。显式 `diagnostic` 在同目录生成 `diagnostic.html`。只有同 conversation OTel completed-response 回执存在时，token 才能按 task 直接统计；rate-limit snapshot 仍是账户级包络，不能冒充单任务账单；unknown 永远保持未归因。
+
+非视觉成果包参考 [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json)，视觉成果包参考 [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json)，回执结构参考 [`assets/observability-receipt.example.json`](skill/codex-task-control/assets/observability-receipt.example.json)。旧任务没有可信历史资料时只显示“历史证据不可用”，不会伪造截图或阻塞当前任务。
 
 如果侧边栏改名或归档工具调用失败，只记录一次失败。它会成为不再自动执行的审计债务；没有其他工作时 heartbeat 必须停止。登记的直接主控以后可以有意识地重新排队：
 
@@ -277,8 +289,8 @@ npm test
 - 在 work-class 路由之上增加可选的项目级具体模型名验证。
 - 扩展当前改名/归档工具之外的 Codex task 界面兼容性。
 - 可见任务的 fan-out、深度和停止点预算。
-- 本地 task dashboard。
-- 在数据源可靠时增加 usage-window telemetry。
+- 宿主原生的 request/queue/model 分阶段回执；用户级诊断无法自行制造这些相关边界。
+- 产品提供可信关联源后，再展示精确的单任务额度账单。
 
 ## License
 

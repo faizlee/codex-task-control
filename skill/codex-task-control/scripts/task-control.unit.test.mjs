@@ -825,6 +825,85 @@ test('nonvisual result packages allow a reasoned no-screenshot outcome and keep 
   }
 });
 
+test('lean observability piggybacks existing lifecycle events and never invokes time diagnostics', async () => {
+  const fixture = await createResultProtocolFixture();
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const before = await readFile(registryPath, 'utf8');
+    const query = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(query.tasks[0].observabilityProtocolVersion, 1);
+    assert.deepEqual(query.tasks[0].observabilityReceipts.map((receipt) => receipt.phase), ['registered', 'dispatch_confirmed', 'progress_ingested', 'progress_ingested']);
+    let analyzerCalls = 0;
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'lean', timeDiagnosticsAnalyzer: async () => { analyzerCalls += 1; throw new Error('must not run'); } });
+    assert.equal(analyzerCalls, 0);
+    assert.match(report.reportPath, /index\.html$/);
+    assert.equal(report.observability.mode, 'lean');
+    assert.equal(await readFile(registryPath, 'utf8'), before, 'lean reporting must not mutate the task ledger');
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /按需观测与消耗诊断/);
+    assert.match(html, /默认 lean 只读台账/);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('diagnostic observability reads local evidence only on demand and labels tokens as a quota proxy', async () => {
+  const fixture = await createResultProtocolFixture();
+  const { taskControlHome, projectRoot, input } = fixture;
+  try {
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const before = await readFile(registryPath, 'utf8');
+    const rolloutPath = join(projectRoot, `rollout-${input.threadId}.jsonl`);
+    await writeFile(rolloutPath, '{}\n', 'utf8');
+    let analyzerCalls = 0;
+    const analyzeFile = async (path, baseline, range) => {
+      analyzerCalls += 1;
+      assert.equal(path, rolloutPath);
+      assert.equal(baseline, '');
+      assert.equal(range.otelJsonl, join(projectRoot, 'otel'));
+      assert.equal(range.segmentByTurn, true);
+      return {
+        sessionId: input.threadId,
+        input: rolloutPath,
+        scope: { start: '2026-07-15T00:00:00.000Z', end: '2026-07-15T00:02:00.000Z' },
+        summary: {
+          activeTurns: { activeUnionSeconds: 100, completedCount: 2, incompleteCount: 0, clientObservedTtftSeconds: { median: 8, p90: 12 } },
+          tool: { completedUnionSeconds: 40, failedCount: 1 },
+          responseGap: { seconds: 15 },
+          unknown: { seconds: 45, ratio: 0.375 },
+          context: { peakRatio: 0.82, compactions: 1 },
+          repeatedCommandCount: 2,
+          retryChainCount: 1,
+          threadHealth: { status: 'warning', reasons: [] },
+          otel: { status: 'observed', completedResponseTokens: { sampleCount: 2, inputTokens: 12000, outputTokens: 900 }, modelNames: ['gpt-5.6-terra'], reasoningEfforts: ['medium'], inferenceTimingAvailable: false },
+          rateLimits: { sampleCount: 2, primary: { usedPercent: { first: 10, last: 11 } }, secondary: null },
+        },
+        turnEnvelopes: [
+          { paired: true, startedAt: '2026-07-15T00:00:00.000Z', completedAt: '2026-07-15T00:00:50.000Z' },
+          { paired: true, startedAt: '2026-07-15T00:01:00.000Z', completedAt: '2026-07-15T00:01:50.000Z' },
+        ],
+        remedies: [{ rootCause: 'repeated_command', confidence: 'high', evidence: ['two repeated commands'], systemicPrevention: 'reuse valid evidence', verificationMetric: 'repeat count' }],
+      };
+    };
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'diagnostic', otelJsonl: join(projectRoot, 'otel'), rolloutPathsByThreadId: new Map([[input.threadId, rolloutPath]]), timeDiagnosticsAnalyzer: analyzeFile });
+    assert.equal(analyzerCalls, 1);
+    assert.match(report.reportPath, /diagnostic\.html$/);
+    assert.equal(report.observability.mode, 'diagnostic');
+    assert.equal(report.observability.activeTurnConcurrency.maxConcurrent, 1);
+    assert.equal(await readFile(registryPath, 'utf8'), before, 'diagnostic reporting must not mutate the task ledger or heartbeat');
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /12,000 in \/ 900 out/);
+    assert.match(html, /额度代理，不是账单/);
+    assert.match(html, /repeated_commands/);
+    assert.match(html, /unknown 45 秒（不归因）/);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('deliverable history appends attempts and reclaimed visual work stays red instead of overwriting prior artifacts', async () => {
   const fixture = await createResultProtocolFixture({ visual: true });
   const { taskControlHome, projectRoot, input } = fixture;
@@ -873,7 +952,7 @@ test('legacy tasks without result fields remain readable and report historical e
     const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const legacy = registry.tasks[0];
-    for (const key of ['taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress']) delete legacy[key];
+    for (const key of ['taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'observabilityProtocolVersion', 'observabilityReceipts']) delete legacy[key];
     await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
     const before = await readFile(registryPath, 'utf8');
     const query = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
@@ -1469,7 +1548,7 @@ test('v0.3 changes-requested titles migrate safely to a stopped pending decision
     const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const task = registry.tasks[0];
-    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason', 'taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress']) delete task[key];
+    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason', 'taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'observabilityProtocolVersion', 'observabilityReceipts']) delete task[key];
     task.status = 'changes_requested';
     task.reviewVerdict = 'changes_requested';
     task.desiredThreadTitle = '返工｜01 审计 Provider 调用';

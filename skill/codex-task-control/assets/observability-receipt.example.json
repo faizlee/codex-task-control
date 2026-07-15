@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "eventName": "task_lifecycle",
+  "phase": "dispatch_confirmed",
+  "outcome": "succeeded",
+  "wallTimeUtc": "2026-07-15T00:00:00.000Z",
+  "monotonicTimeNs": "123456789000",
+  "clockId": "task-control-process-clock-id",
+  "threadId": "worker-thread-id",
+  "taskId": "worker-thread-id",
+  "turnId": null,
+  "requestId": null,
+  "callId": null,
+  "correlationId": "worker-thread-id:attempt-1:dispatch_confirmed:2026-07-15T00:00:00.000Z:2",
+  "attempt": 1,
+  "source": "task_control",
+  "confidence": "direct"
+}

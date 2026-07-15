@@ -16,7 +16,7 @@ The project key is derived from a normalized, case-folded Windows path and a has
 
 ## Registry contract
 
-Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControllerThreadIds`, `controllerHeartbeats`, `parallelBatches`, `updatedAt`, and `tasks`. New task records include delegation evidence plus `displayKey`, `desiredThreadTitle`, `titleSyncStatus`, `lastSyncedTitle`, `titleSyncError`, `archiveStatus`, `archivedAt`, `archiveError`, and append-only `threadActionHistory`. `lastDispatchedAttempt` and `lastDispatchedAt` prove that the current work prompt was really sent; title sync alone is not execution evidence. Progress ingestion records `progressEventCreatedAt` and `lastProgressSummary`; completion ingestion records `completionEventCreatedAt` as the notification-failure freshness anchor. Legacy records remain readable; controller writes migrate them deterministically, while partial field groups fail closed. A task's `directControllerThreadId` equals its `parentThreadId`.
+Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControllerThreadIds`, `controllerHeartbeats`, `parallelBatches`, `updatedAt`, and `tasks`. New task records include delegation evidence plus `displayKey`, `desiredThreadTitle`, `titleSyncStatus`, `lastSyncedTitle`, `titleSyncError`, `archiveStatus`, `archivedAt`, `archiveError`, append-only `threadActionHistory`, and schema-v1 lightweight `observabilityReceipts`. `lastDispatchedAttempt` and `lastDispatchedAt` prove that the current work prompt was really sent; title sync alone is not execution evidence. Progress ingestion records `progressEventCreatedAt` and `lastProgressSummary`; completion ingestion records `completionEventCreatedAt` as the notification-failure freshness anchor. Legacy records remain readable; missing observability fields become protocol 0 in memory without rewriting the registry, while partial field groups fail closed. A task's `directControllerThreadId` equals its `parentThreadId`.
 
 Each `controllerHeartbeats` entry stores one direct controller's confirmed `generation`, `status`, `dueAt`, `intervalMs`, `reason`, optional triggering task, and `updatedAt`. Protocol v2 also stores the confirmed `automationId`, `lastSuccessfulGeneration`, `lastSuccessfulAt`, one `pendingAction`, stale/trigger/delete-failure counters, fuse/notification state, bounded action history, and retired automation IDs. It is a durable two-phase lease record, not the host automation itself. A rearm prepares generation `N+1` but leaves confirmed generation `N` unchanged until App success is confirmed.
 
@@ -49,7 +49,7 @@ Use `repeatable` only when the worker can follow explicit rules and a fixed test
 
 ## Parallel batch and fan-out gate
 
-Parallel protocol v1 is opt-in at the storage boundary and mandatory for new work initiated through the v0.12 workflow. Old registrations without batch fields remain readable as `parallelProtocolVersion: 0`; `audit-parallel-routing` reports active legacy migration debt without mutating it. A new v1 task uses `--parallel-policy batch_v1` and binds one controller-owned batch/candidate. A registered visible parent may own a batch, so `rootControllerThreadIds` are entry points rather than permanent project singletons.
+Parallel protocol v1 is opt-in at the storage boundary and mandatory for new work initiated through the v0.13 workflow. Old registrations without batch fields remain readable as `parallelProtocolVersion: 0`; `audit-parallel-routing` reports active legacy migration debt without mutating it. A new v1 task uses `--parallel-policy batch_v1` and binds one controller-owned batch/candidate. A registered visible parent may own a batch, so `rootControllerThreadIds` are entry points rather than permanent project singletons.
 
 A schema-v1 batch manifest is project-relative and stores:
 
@@ -164,6 +164,26 @@ History is append-only by attempt. Review updates only the matching package: `ca
 `controller-query-deliverables` returns the registered controller subtree and all packages. `controller-build-delivery-report` deterministically writes `$CODEX_HOME/task-control/reports/<project-key>/<controller-thread-id>/index.html`. The page contains work-package state, every attempt, actual changes, tests/metrics, blockers, next gates, selected images, and a chronological artifact timeline. It links local paths with absolute file URIs and does not copy project files. Legacy stage references may appear as unverified references; missing history is shown as `historical_evidence_unavailable` and never blocks a current task.
 
 The report embeds the registry `updatedAt` value. A current scan compares this marker and returns `reportNeedsRefresh`, but that flag is informational: it must not affect `needsControllerAttention`, `shouldKeepHeartbeat`, controller queues, or heartbeat rearm.
+
+## Lightweight observability and on-demand diagnostics
+
+New registrations use `observabilityProtocolVersion: 1` with an append-only `observabilityReceipts` array. Registration, confirmed dispatch, meaningful progress ingestion, failure/completion ingestion, controller review transitions, integration, and archive append receipts inside the lifecycle mutation that already occurs. No receipt may require an extra worker command, synthetic progress, notification, heartbeat, or provider call. Records created before v0.13.0 remain read-compatible as protocol 0 with no fabricated history.
+
+Every receipt has schema version, event name, phase, outcome, UTC wall time, process-scoped monotonic time plus `clockId`, task/thread identity, attempt, correlation ID, source, and confidence. Monotonic values are comparable only inside the same `clockId`; cross-command lifecycle intervals use wall-clock event bounds and remain labelled as ledger timing. Prompt text, response text, command arguments/output, account identity, and secrets are never stored.
+
+`controller-build-delivery-report` defaults to `--observability lean`. Lean mode reads only the registry, derives lifecycle bounds from existing receipts/fields, and writes deterministic `index.html`. It never discovers rollout files, imports `$codex-time-diagnostics`, or reads OTel/Desktop logs. Normal event/closeout refreshes always use lean mode.
+
+`--observability diagnostic` is explicit and on demand. It writes `diagnostic.html`, searches the standard `$CODEX_HOME/sessions` and `archived_sessions` trees for each exact thread ID, chooses the largest matching candidate deterministically, and then requires the analyzer's returned `sessionId` to equal that task. It imports only the installed `$CODEX_HOME/skills/codex-time-diagnostics/scripts/analyze-session-timeline.mjs`. `--otel-jsonl` and `--desktop-log` are read only when explicitly passed. Missing, ambiguous, mismatched, or malformed timing evidence degrades that task to `unavailable` without changing lifecycle truth.
+
+The report keeps evidence classes separate:
+
+- dispatch-to-execution-end overlap is a ledger window and does not prove active model work;
+- overlap of paired rollout `task_started`/`task_complete` envelopes proves simultaneous completed-turn envelopes, not CPU or model-internal time;
+- same-conversation OTel `response.completed` input/output tokens are direct completed-response counts;
+- rate-limit snapshots are account-level envelopes and cannot be attributed to one task during concurrency;
+- response gaps and unknown intervals remain unassigned and are never renamed model reasoning, network, queueing, or service work.
+
+Report generation never mutates the registry, creates a second ledger, changes `reportNeedsRefresh`, or creates/retains heartbeat work. Detailed diagnostics may be slower because they parse local history, but that cost occurs only on explicit report generation.
 
 ## Controller-to-worker message contract
 

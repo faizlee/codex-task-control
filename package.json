@@ -1,8 +1,8 @@
 {
   "name": "codex-task-control",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
-  "description": "A quota-aware controller that enforces parallel fan-out, queues messages, reviews, and archives visible Codex tasks while forbidding internal subagents.",
+  "description": "A quota-aware controller with parallel fan-out, lightweight lifecycle receipts, on-demand timing diagnostics, review gates, and visible-task-only delegation.",
   "type": "module",
   "scripts": {
     "check": "node --check skill/codex-task-control/scripts/task-control.mjs",
