@@ -64,6 +64,7 @@ import {
   querySelf,
   runCli,
 } from './task-control.mjs';
+import * as taskControlModule from './task-control.mjs';
 
 const delay = () => new Promise((resolve) => setTimeout(resolve, 5));
 const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
@@ -915,6 +916,72 @@ test('evidence failure modes keep advisory and recoverable first failures diagno
   }
 });
 
+test('mechanical contract amendment binds only an audited direct-controller contract and carries predecessors', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-amendment-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-amendment-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  const contractPath = join(projectRoot, 'implementation-contract.json');
+  try {
+    const original = implementationManifest();
+    await writeFile(contractPath, `${JSON.stringify(original, null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    const reuse = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Reuse completed.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'reuse.txt' }] });
+    await controllerIngestProgress({ ...input, eventPath: reuse });
+    await delay();
+    const failure = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'The bounded command was malformed.', evidenceCommandId: 'targeted-test', mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'failure.txt' }] });
+    await controllerIngestFailure({ ...input, eventPath: failure, eventType: 'task_failed' });
+    const unsafeBoundary = structuredClone(original);
+    unsafeBoundary.contractRevision = 'contract-unsafe';
+    unsafeBoundary.allowedWritePaths.push('src/replacement/**');
+    await writeFile(contractPath, `${JSON.stringify(unsafeBoundary, null, 2)}\n`, 'utf8');
+    await assert.rejects(taskControlModule.controllerAmendImplementationContract({ ...input, implementationContractPath: 'implementation-contract.json', reason: 'Unsafe scope expansion.', hostReceipt: 'host-delivered-unsafe-contract' }), (error) => error instanceof TaskControlError && error.code === 'CONTRACT_AMENDMENT_SAFETY_INVARIANT_CHANGED');
+    await writeFile(contractPath, `${JSON.stringify(original, null, 2)}\n`, 'utf8');
+    await assert.rejects(taskControlModule.controllerAmendImplementationContract({ ...input, controllerThreadId: 'wrong-controller', implementationContractPath: 'implementation-contract.json', reason: 'Wrong controller must fail.', hostReceipt: 'forged-host-receipt' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_UNAUTHORIZED');
+    const amended = structuredClone(original);
+    amended.contractRevision = 'contract-r2';
+    amended.evidenceCommands[1].command = 'npm test -- contract --fixed';
+    amended.evidenceCommands[1].failureMode = 'recoverable';
+    await writeFile(contractPath, `${JSON.stringify(amended, null, 2)}\n`, 'utf8');
+    const resumed = await taskControlModule.controllerAmendImplementationContract({ ...input, implementationContractPath: 'implementation-contract.json', reason: 'Correct the fixed verification command without widening scope.', hostReceipt: 'host-delivered-amended-contract' });
+    assert.equal(resumed.status, 'executing');
+    assert.equal(resumed.attemptCount, 2);
+    assert.deepEqual(resumed.completedStages, ['reuse-check']);
+    assert.equal(resumed.contractAmendmentHistory.at(-1).beforeContractDigest, registered.contractDigest);
+    assert.equal(resumed.contractAmendmentHistory.at(-1).reason, 'Correct the fixed verification command without widening scope.');
+    assert.equal(resumed.contractAmendmentHistory.at(-1).hostReceipt, 'host-delivered-amended-contract');
+    const unsafe = structuredClone(amended);
+    unsafe.allowedWritePaths.push('src/new/**');
+    await writeFile(contractPath, `${JSON.stringify(unsafe, null, 2)}\n`, 'utf8');
+    await assert.rejects(taskControlModule.controllerAmendImplementationContract({ ...input, implementationContractPath: 'implementation-contract.json', reason: 'Must not widen scope.', hostReceipt: 'forged-second-amendment' }), (error) => error instanceof TaskControlError && error.code === 'CONTRACT_AMENDMENT_NOT_ELIGIBLE');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('explicit execution and observability evidence classes are accepted before lifecycle policy is applied', async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-evidence-class-red-'));
+  try {
+    const manifest = implementationManifest();
+    manifest.evidenceCommands[0].evidenceClass = 'execution';
+    manifest.evidenceCommands.push({ id: 'telemetry-note', command: 'node scripts/collect-telemetry.mjs', evidenceClass: 'observability' });
+    const contractPath = join(projectRoot, 'implementation-contract.json');
+    await writeFile(contractPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const audit = await auditImplementationContract({ projectRoot, implementationContractPath: 'implementation-contract.json', taskMode: 'implementation' });
+    assert.equal(audit.valid, true);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('failure-domain value classification distinguishes product and control-plane fuses', () => {
+  assert.equal(typeof taskControlModule.failureValueClassForDomain, 'function');
+  assert.equal(taskControlModule.failureValueClassForDomain('contract'), 'control_plane');
+  assert.equal(taskControlModule.failureValueClassForDomain('test'), 'product');
+});
+
 test('mechanical rework carries valid predecessors and accepts worker artifacts before lifecycle title sync', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-resumable-rework-home-'));
   const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-resumable-rework-project-'));
@@ -1009,7 +1076,7 @@ test('stalled execution is audited even without completion or ordinary worker me
   }
 });
 
-test('objective retry fuse prevents the historical 18-attempt pattern by rejecting r3 after two failed replacements', async () => {
+test('objective retry fuse counts only authoritative product failures across the full replacement chain', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-fuse-home-'));
   const projectRoot = 'E:\\work\\project\\objective-fuse';
   try {
@@ -1022,7 +1089,9 @@ test('objective retry fuse prevents the historical 18-attempt pattern by rejecti
         await controllerRecordTitleSynced({ ...currentInput, title: registered.desiredThreadTitle });
         await controllerRecordDispatched(currentInput);
       }
-      const blocked = await controllerMarkBlocked({ ...currentInput, reason: `replacement ${ordinal} produced no candidate`, userSummary: `Attempt ${ordinal} stopped without a candidate commit.`, blockerSource: 'contract' });
+      const failure = await createFailureEvent({ taskControlHome, selfThreadId: currentInput.threadId, eventType: 'task_failed', attemptedStage: 'runner', failureClass: 'mechanical', failureDomain: 'test', commandSummary: `replacement ${ordinal} failed the product test without a candidate`, mechanicalRetryEligible: false, evidence: [{ id: 'runner-log', reference: `logs/replacement-${ordinal}.txt` }] });
+      await controllerIngestFailure({ ...currentInput, eventPath: failure, eventType: 'task_failed' });
+      const blocked = await controllerReclaimTask({ ...currentInput, reason: `replacement ${ordinal} produced no candidate`, userSummary: `Attempt ${ordinal} stopped without a candidate commit.` });
       await controllerMarkCloseoutNotificationSent(currentInput);
       await controllerRefreshCloseoutReport(currentInput);
       previous = currentInput.threadId;
@@ -1033,6 +1102,38 @@ test('objective retry fuse prevents the historical 18-attempt pattern by rejecti
     const scan = await controllerScanPendingEvents(input);
     assert.equal(scan.objectiveFuses.length, 1);
     assert.equal(scan.objectiveFuses[0].failedReplacementCount, 2);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
+test('control-plane failures across a full replacement chain do not consume the product replacement fuse', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-control-plane-fuse-home-'));
+  const projectRoot = 'E:\\work\\project\\objective-control-plane-fuse';
+  try {
+    const { input } = await createHeartbeatFixture(taskControlHome, projectRoot, { threadId: 'objective-control-original' });
+    let previous = input.threadId;
+    for (let ordinal = 0; ordinal < 3; ordinal += 1) {
+      const currentInput = ordinal === 0 ? input : { ...input, threadId: `objective-control-r${ordinal}`, title: `Control replacement ${ordinal}`, replacementOfThreadId: previous };
+      if (ordinal > 0) {
+        const registered = await controllerRegisterTask(currentInput);
+        await controllerRecordTitleSynced({ ...currentInput, title: registered.desiredThreadTitle });
+        await controllerRecordDispatched(currentInput);
+      }
+      const failure = await createFailureEvent({ taskControlHome, selfThreadId: currentInput.threadId, eventType: 'task_failed', attemptedStage: 'runner', failureClass: 'mechanical', failureDomain: 'contract', commandSummary: `replacement ${ordinal} hit a controller contract issue`, mechanicalRetryEligible: false, evidence: [{ id: 'runner-log', reference: `logs/control-${ordinal}.txt` }] });
+      await controllerIngestFailure({ ...currentInput, eventPath: failure, eventType: 'task_failed' });
+      await controllerReclaimTask({ ...currentInput, reason: `control-plane replacement ${ordinal} produced no candidate`, userSummary: `Control-plane attempt ${ordinal} stopped without a candidate.` });
+      await controllerMarkCloseoutNotificationSent(currentInput);
+      await controllerRefreshCloseoutReport(currentInput);
+      previous = currentInput.threadId;
+    }
+    const r3 = { ...input, threadId: 'objective-control-r3', title: 'Control replacement 3', replacementOfThreadId: previous };
+    const beforeRegistration = await controllerScanPendingEvents(input);
+    assert.deepEqual(beforeRegistration.objectiveFuses, []);
+    const registered = await controllerRegisterTask(r3);
+    assert.equal(registered.replacementOrdinal, 3);
+    const scan = await controllerScanPendingEvents(input);
+    assert.equal(scan.objectiveFuses.length, 0);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
@@ -2115,10 +2216,7 @@ test('terminal closeout supersedes an unconfirmed create without blocking unrela
       evidence: [{ id: 'runner-log', reference: 'logs/runner-blocked.txt' }],
     });
     const failed = await controllerIngestFailure({ ...input, eventPath: failurePath, eventType: 'task_blocked' });
-    assert.equal(failed.heartbeatAction.type, 'create_controller_heartbeat');
-    assert.equal(failed.heartbeatAction.previousAutomationId, 'heartbeat-confirmed-generation-155');
-    const supersededCreateActionId = failed.heartbeatAction.actionId;
-    const supersededCreateGeneration = failed.heartbeatAction.generation;
+    assert.equal(failed.heartbeatAction, null, 'failure must reuse the untriggered confirmed one-shot');
 
     const reclaimed = await controllerReclaimTask({ ...input, reason: 'A second blocker requires controller recovery.', userSummary: 'The failed attempt was closed without another automatic replacement.' });
     await controllerMarkCloseoutNotificationSent(input);
@@ -2127,10 +2225,7 @@ test('terminal closeout supersedes an unconfirmed create without blocking unrela
     const archived = await controllerRecordArchiveSucceeded(input);
 
     assert.equal(archived.heartbeatAction.type, 'finalize_controller_cycle');
-    assert.deepEqual(archived.heartbeatAction.hostActions, [
-      { type: 'compare_and_delete_pending_create', actionId: supersededCreateActionId, generation: supersededCreateGeneration, requiresActionIdMatch: true },
-      { type: 'delete_confirmed_automation', automationId: 'heartbeat-confirmed-generation-155', generation: dispatched.heartbeatAction.generation },
-    ]);
+    assert.deepEqual(archived.heartbeatAction.hostActions.at(-1), { type: 'delete_confirmed_automation', automationId: 'heartbeat-confirmed-generation-155', generation: dispatched.heartbeatAction.generation });
 
     const finalized = await controllerFinalizeCycle(input);
     assert.equal(finalized.finalized, false);
