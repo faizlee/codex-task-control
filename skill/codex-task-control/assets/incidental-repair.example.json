@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "type": "incidental_repair",
+  "projectKey": "project-example",
+  "threadId": "worker-thread-id",
+  "parentThreadId": "controller-thread-id",
+  "controllerThreadId": "controller-thread-id",
+  "displayKey": "01.2",
+  "title": "验收同一玩家流程",
+  "attemptCount": 1,
+  "repairId": "result-button-input-route",
+  "originalBlocker": "结果页表现层拦截了下一步按钮点击。",
+  "sameObjectiveReason": "修复只恢复当前验收中的同一结果页流程，不改变产品规则。",
+  "functionalDomain": "battle-result-ui",
+  "affectedFiles": [
+    {
+      "path": "ui/BattleResultOverlay.gd",
+      "changeType": "modified",
+      "reason": "探索后确认它是真实输入路由 owner；该文件无需预先列入白名单。"
+    }
+  ],
+  "conflictDomains": [],
+  "localOnly": true,
+  "reversible": true,
+  "productRuleDecision": false,
+  "architectureDecision": false,
+  "trustSourceDecision": false,
+  "safetyDecision": false,
+  "economyDecision": false,
+  "saveDataDecision": false,
+  "externalEffect": false,
+  "irreversibleMigration": false,
+  "dependencyDecision": false,
+  "forbiddenDecisionTouched": false,
+  "riskAssessment": "单一输入属性的小型可逆改动；不跨冲突域，不涉及产品、存档、经济或外部影响。",
+  "redEvidence": [
+    {
+      "id": "gui-red",
+      "reference": "artifacts/button-click-blocked.png"
+    }
+  ],
+  "greenEvidence": [
+    {
+      "id": "gui-green",
+      "reference": "artifacts/button-click-advances.png"
+    }
+  ],
+  "contractVersion": "brief-v1",
+  "contractDigest": "replace-with-ledger-brief-digest",
+  "createdAt": "2026-07-16T00:00:00.000Z"
+}

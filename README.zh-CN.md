@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.18.0 将 implementation 默认改为自适应任务简报和执行者自选证据；硬合同只允许真实风险升级。不可变检查点、安全交接和稳定优先 watchdog 继续保留，全程不调用模型 provider。
+> v0.19.0 在自适应任务简报上加入“同任务有界附带修复”：同目标、同功能域、本地可逆的小缺陷可以原任务修复，严格范围和硬合同仍然 fail closed。全程不调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,7 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.18.0 已经解决什么
+## v0.19.0 已经解决什么
 
 - 对话检查点独立保存到 `$CODEX_HOME/task-control/checkpoints/`，每次只保留 1-12 条带 authority 和来源索引的摘要，不复制原始 prompt、response、工具输出或项目内容。
 - 默认 preload 只返回用户确认、项目事实、主控决策和已接受成果；候选、失败、争议与已废弃路径必须按 fact ID 或 full 模式显式查询。
@@ -70,6 +70,10 @@
 - 架构/合同/错误策略未决、scope 或验收证据不明确时，登记直接 fail closed。
 - 新登记必须显式分类为 `control_only`、`implementation` 或 `visual_implementation`。实施任务默认由登记信息生成 schema-v1 adaptive brief，也可绑定只含探索/验证提示和安全护栏的简报文件。
 - adaptive brief 不允许文件白名单、固定实现路线、固定阶段或唯一 validator。worker 完成时必须在 schema-v2 成果包里报告实际影响文件、修改理由、所选验证及其适用理由。
+- adaptive brief 默认使用 `bounded_incidental`：验收中发现同一目标、同一功能域的小缺陷，只要本地可逆、不跨冲突域、不碰禁止决策或产品/架构/安全/经济/存档/外部影响，并有真实 RED/GREEN（或等价前后）证据，就可登记附带修复后继续原任务。真实 owner 文件不必提前列出，但必须在回执和最终成果包披露路径与理由。
+- 附带修复不会增加 failure、mechanical retry、replacement 或 objective fuse；主控仍审查真实 diff 和证据。显式 `strict_scope` 与所有 hard contract 均不放宽。
+- 并行 implementation/visual 任务以台账登记的 candidate worktree 为成果根，而不是 main projectRoot。complete 会核验真实路径、同一 Git 仓库、分支、base/last-sync 祖先关系和 candidate=HEAD；邻近未登记目录、路径逃逸或身份漂移直接拒绝。无 worktree identity 的任务继续使用 projectRoot。
+- 旧版 task-control 的 tooling/contract 缺陷若已经阻塞真实完成候选，直接主控可执行“仅 completion 恢复”：保留历史失败，冻结同一候选与 manifest，禁止重跑/改业务，不消耗机械返工、replacement 或 objective fuse，也不需要新建任务。
 - hard contract 必须记录允许的风险触发与具体理由；单一 validator 不能直接定论，GUI/截图必须由 GUI、MCP 或 interactive 表面证明，headless 只验证逻辑。
 - completion 与 review 输出明确返回合同版本/摘要以及已完成、缺失阶段；旧台账只读时安全识别为 `legacy_unclassified`，不会因扫描被重写。
 - 将 `repeatable` 硬绑定到 `gpt-5.6-luna`，将 `bounded_reasoning` 硬绑定到 `gpt-5.6-terra`；旧模型或错配模型在登记时直接 fail closed。
@@ -100,14 +104,14 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.18.0 不做什么
+## v0.19.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.18.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.19.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.18.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.19.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
 - 不替项目判断截图“好不好看”；adaptive 视觉任务由 worker 选择真实交互证据并交直接主控审查，hard contract 才可绑定固定 visual oracle。
 - 当前只对 Windows 项目路径做了完整验证。
 
@@ -174,6 +178,7 @@ $Registration = node $TaskControl register `
   --forbidden-decisions "Do not change authentication contracts or error policy." `
   --task-mode "implementation" `
   --execution-policy "adaptive_brief" `
+  --scope-policy "bounded_incidental" `
   --parallel-policy "batch_v1" `
   --batch-id "auth-batch" `
   --candidate-id "auth-code"
@@ -205,6 +210,19 @@ node $TaskControl controller-record-dispatched `
 node $TaskControl query-self --self "worker-1"
 node $TaskControl query-parent --self "worker-1"
 node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" --result-manifest "docs/test-reports/task-result.json"
+```
+
+验收中发现同域、低风险、可逆小缺陷时，worker 可以原任务登记后继续；任何受保护风险标志都会 fail closed：
+
+```powershell
+node $TaskControl incidental-repair --self "worker-1" --repair-id "result-button-route" --original-blocker "结果页表现层拦截按钮点击。" --same-objective-reason "只恢复当前结果页验收流程。" --functional-domain "result-ui" --affected-file "ui/ResultOverlay.gd|modified|探索后确认它是真实输入路由 owner。" --local-only true --reversible true --risk-assessment "本地输入修复，不涉及产品、存档、经济、依赖或外部影响。" --red-evidence-ref "red=artifacts/click-blocked.png" --green-evidence-ref "green=artifacts/click-advances.png"
+node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\example" --controller "controller-1" --event "<返回的事件路径>"
+```
+
+如果旧版 task-control 已经把有效 worktree 候选停成 `changes_requested`，安装修复版本后由直接主控只恢复同一 completion：
+
+```powershell
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.19.0" --reason "v0.19.0 修复已登记 worktree 的成果根；业务 scope 与证据未改变。" --host-receipt "<真实主控授权回执>"
 ```
 
 不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。
@@ -262,7 +280,7 @@ node $TaskControl controller-cancel-handoff --project-root "C:\work\example" --c
 
 默认 `lean` 只生成 `index.html`，不读取 rollout/OTel。显式 `diagnostic` 在同目录生成 `diagnostic.html`，并分别显示任务外空档、任务窗口内但不在已配对 turn 中的空档、active turn 和 active turn 内无法归因；只有最后一个比例参与异常判断。页面采用中文解释与万/亿紧凑数字，并保留精确值和任务间比较条。只有同 conversation OTel completed-response 回执存在时，token 才能按 task 直接统计；这些 token 是已发生请求的累计处理量，不是 OTel 开销，也不是额度账单。rate-limit snapshot 仍是账户级包络；unknown 永远保持未归因。
 
-非视觉成果包参考 [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json)，视觉成果包参考 [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json)，回执结构参考 [`assets/observability-receipt.example.json`](skill/codex-task-control/assets/observability-receipt.example.json)。旧任务没有可信历史资料时只显示“历史证据不可用”，不会伪造截图或阻塞当前任务。
+非视觉成果包参考 [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json)，视觉成果包参考 [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json)，附带修复参考 [`assets/incidental-repair.example.json`](skill/codex-task-control/assets/incidental-repair.example.json)，回执结构参考 [`assets/observability-receipt.example.json`](skill/codex-task-control/assets/observability-receipt.example.json)。旧任务没有可信历史资料时只显示“历史证据不可用”，不会伪造截图或阻塞当前任务。
 
 如果侧边栏改名或归档工具调用失败，只记录一次失败。它会成为不再自动执行的审计债务；没有其他工作时 heartbeat 必须停止。登记的直接主控以后可以有意识地重新排队：
 

@@ -76,8 +76,15 @@ export const PARALLEL_POLICY_MODES = Object.freeze(['legacy_compat', 'batch_v1']
 export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
+export const TASK_CONTROL_VERSION = '0.19.0';
 export const REGISTER_TASK_MODES = Object.freeze(['control_only', 'implementation', 'visual_implementation']);
 export const IMPLEMENTATION_POLICIES = Object.freeze(['adaptive_brief', 'hard_contract']);
+export const SCOPE_POLICIES = Object.freeze(['bounded_incidental', 'strict_scope']);
+export const INCIDENTAL_REPAIR_PROTOCOL_VERSION = 1;
+export const INCIDENTAL_REPAIR_RISK_FLAGS = Object.freeze(['productRuleDecision', 'architectureDecision', 'trustSourceDecision', 'safetyDecision', 'economyDecision', 'saveDataDecision', 'externalEffect', 'irreversibleMigration', 'dependencyDecision', 'forbiddenDecisionTouched']);
+export const CONTROL_PLANE_RECOVERY_PROTOCOL_VERSION = 1;
+export const CONTROL_PLANE_RECOVERY_STATUSES = Object.freeze(['completion_only', 'completed', 'cancelled']);
+export const CONTROL_PLANE_RECOVERY_COMPONENTS = Object.freeze(['task_control_protocol']);
 export const HARD_CONTRACT_TRIGGERS = Object.freeze(['high_risk_irreversible', 'shared_conflict', 'parallel_coordination', 'user_explicit']);
 export const IMPLEMENTATION_BRIEF_SCHEMA_VERSION = 1;
 export const IMPLEMENTATION_CONTRACT_SCHEMA_VERSION = 3;
@@ -96,7 +103,7 @@ export const RESULT_REVIEW_STATUSES = Object.freeze(['pending', 'accepted', 'rej
 export const DELIVERY_STATUSES = Object.freeze(['candidate', 'accepted_not_integrated', 'integrated', 'rejected']);
 export const OBSERVABILITY_PROTOCOL_VERSION = 1;
 export const OBSERVABILITY_MODES = Object.freeze(['lean', 'diagnostic']);
-export const OBSERVABILITY_PHASES = Object.freeze(['registered', 'dispatch_confirmed', 'progress_ingested', 'failure_ingested', 'failure_diagnostic_ingested', 'completion_ingested', 'changes_requested', 'rework_prepared', 'rework_dispatched', 'rework_cancelled', 'contract_amended', 'reclaimed', 'blocked', 'review_accepted', 'integrated', 'archived']);
+export const OBSERVABILITY_PHASES = Object.freeze(['registered', 'dispatch_confirmed', 'progress_ingested', 'incidental_repair_ingested', 'failure_ingested', 'failure_diagnostic_ingested', 'completion_ingested', 'changes_requested', 'control_plane_candidate_recovered', 'rework_prepared', 'rework_dispatched', 'rework_cancelled', 'contract_amended', 'reclaimed', 'blocked', 'review_accepted', 'integrated', 'archived']);
 export const OBSERVABILITY_CONFIDENCE = Object.freeze(['direct', 'bounded', 'unavailable']);
 export const INTEGRATION_PROOF_PROTOCOL_VERSION = 1;
 const OBSERVABILITY_CLOCK_ID = `task-control-${process.pid}-${randomUUID().replaceAll('-', '')}`;
@@ -422,13 +429,13 @@ export async function auditImplementationContract(input) {
   return { valid: findings.errors.length === 0, taskMode: input.taskMode, implementationContractPath: snapshot.implementationContractPath, contractDigest: snapshot.contractDigest, contractVersion: snapshot.contractRevision ?? snapshot.contractCommit, ...findings };
 }
 
-function resolveResultManifestPath(projectRoot, reference) {
+function resolveResultManifestPath(resultRoot, reference, workspaceRole = 'project_main') {
   if (!nonEmpty(reference)) fail('RESULT_MANIFEST_REQUIRED', 'resultProtocolVersion=1 的实施任务必须提供 result manifest');
-  const root = win32.resolve(projectRoot.replaceAll('/', '\\'));
+  const root = win32.resolve(resultRoot.replaceAll('/', '\\'));
   const resolved = win32.resolve(root, reference.replaceAll('/', '\\'));
   const normalizedRoot = root.toLowerCase();
   const normalizedResolved = resolved.toLowerCase();
-  if (normalizedResolved !== normalizedRoot && !normalizedResolved.startsWith(`${normalizedRoot}\\`)) fail('RESULT_MANIFEST_OUTSIDE_PROJECT', 'result manifest 必须位于项目根目录内');
+  if (normalizedResolved !== normalizedRoot && !normalizedResolved.startsWith(`${normalizedRoot}\\`)) fail(workspaceRole === 'candidate_worktree' ? 'RESULT_MANIFEST_OUTSIDE_WORKTREE' : 'RESULT_MANIFEST_OUTSIDE_PROJECT', workspaceRole === 'candidate_worktree' ? 'result manifest 必须位于台账登记的候选 worktree 内' : 'result manifest 必须位于项目根目录内');
   return resolved;
 }
 
@@ -436,6 +443,62 @@ function windowsPathInside(filePath, rootPath) {
   const normalizedFile = win32.resolve(filePath).toLowerCase();
   const normalizedRoot = win32.resolve(rootPath).toLowerCase();
   return normalizedFile === normalizedRoot || normalizedFile.startsWith(`${normalizedRoot}\\`);
+}
+
+async function gitResultOutput(root, args, code, message) {
+  try {
+    const { stdout } = await execFile('git', ['-C', root, ...args], { windowsHide: true, encoding: 'utf8' });
+    return stdout.trim();
+  } catch (error) {
+    fail(code, `${message}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function assertGitAncestor(root, ancestor, descendant, code, message) {
+  try {
+    await execFile('git', ['-C', root, 'merge-base', '--is-ancestor', ancestor, descendant], { windowsHide: true });
+  } catch {
+    fail(code, message);
+  }
+}
+
+async function resolveResultWorkspace(task, projectRoot, candidateCommit) {
+  const identity = task.parallelWorktreeIdentity;
+  if (identity === null || identity === undefined) {
+    let rootPath;
+    try { rootPath = await realpath(projectRoot); } catch (error) { fail('RESULT_PROJECT_ROOT_INVALID', `项目根目录无法解析: ${error instanceof Error ? error.message : String(error)}`); }
+    return { schemaVersion: 1, workspaceRole: 'project_main', rootPath, registeredWorktreePath: null, branch: null, registeredBaseCommit: null, registeredLastMainSyncCommit: null, registeredCleanupOwner: null, baseCommit: null, lastMainSyncCommit: null, candidateCommit: null };
+  }
+  let rootPath;
+  let mainRoot;
+  try {
+    [rootPath, mainRoot] = await Promise.all([realpath(identity.worktreePath), realpath(projectRoot)]);
+  } catch (error) {
+    fail('RESULT_WORKTREE_IDENTITY_INVALID', `登记的 main/worktree 路径无法解析: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const topLevel = await gitResultOutput(rootPath, ['rev-parse', '--show-toplevel'], 'RESULT_WORKTREE_IDENTITY_INVALID', '登记路径不是可验证的 Git worktree');
+  let realTopLevel;
+  try { realTopLevel = await realpath(topLevel); } catch (error) { fail('RESULT_WORKTREE_IDENTITY_INVALID', `Git worktree 根无法解析: ${error instanceof Error ? error.message : String(error)}`); }
+  if (!windowsPathInside(realTopLevel, rootPath) || !windowsPathInside(rootPath, realTopLevel)) fail('RESULT_WORKTREE_IDENTITY_MISMATCH', 'Git worktree 根与台账登记 worktreePath 不精确匹配');
+  const [worktreeCommonRaw, mainCommonRaw] = await Promise.all([
+    gitResultOutput(rootPath, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 'RESULT_WORKTREE_IDENTITY_INVALID', '无法读取候选 worktree 的 Git common dir'),
+    gitResultOutput(mainRoot, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 'RESULT_WORKTREE_IDENTITY_INVALID', '无法读取主项目的 Git common dir'),
+  ]);
+  let worktreeCommon;
+  let mainCommon;
+  try { [worktreeCommon, mainCommon] = await Promise.all([realpath(worktreeCommonRaw), realpath(mainCommonRaw)]); } catch (error) { fail('RESULT_WORKTREE_IDENTITY_INVALID', `Git common dir 无法解析: ${error instanceof Error ? error.message : String(error)}`); }
+  if (!windowsPathInside(worktreeCommon, mainCommon) || !windowsPathInside(mainCommon, worktreeCommon)) fail('RESULT_WORKTREE_REPOSITORY_MISMATCH', '候选 worktree 不属于台账登记的主项目仓库');
+  const branch = await gitResultOutput(rootPath, ['symbolic-ref', '--quiet', '--short', 'HEAD'], 'RESULT_WORKTREE_BRANCH_MISMATCH', '候选 worktree 处于 detached HEAD 或无法读取分支');
+  if (branch.toLowerCase() !== identity.branch.toLowerCase()) fail('RESULT_WORKTREE_BRANCH_MISMATCH', `候选 worktree 分支 ${branch} 与台账 ${identity.branch} 不匹配`);
+  if (!/^[0-9a-f]{40,64}$/i.test(candidateCommit)) fail('RESULT_WORKTREE_CANDIDATE_INVALID', 'worktree candidateCommit 必须是完整 Git commit');
+  const headCommit = await gitResultOutput(rootPath, ['rev-parse', 'HEAD^{commit}'], 'RESULT_WORKTREE_CANDIDATE_INVALID', '无法读取候选 worktree HEAD');
+  const candidate = await gitResultOutput(rootPath, ['rev-parse', `${candidateCommit}^{commit}`], 'RESULT_WORKTREE_CANDIDATE_INVALID', 'candidateCommit 不存在于登记 worktree');
+  if (candidate.toLowerCase() !== headCommit.toLowerCase()) fail('RESULT_WORKTREE_CANDIDATE_MISMATCH', 'candidateCommit 必须精确等于登记 worktree 的当前 HEAD');
+  const baseCommit = await gitResultOutput(rootPath, ['rev-parse', `${identity.baseCommit}^{commit}`], 'RESULT_WORKTREE_BASE_MISMATCH', 'baseCommit 无法在登记仓库解析');
+  const lastMainSyncCommit = await gitResultOutput(rootPath, ['rev-parse', `${identity.lastMainSyncCommit}^{commit}`], 'RESULT_WORKTREE_BASE_MISMATCH', 'lastMainSyncCommit 无法在登记仓库解析');
+  await assertGitAncestor(rootPath, baseCommit, candidate, 'RESULT_WORKTREE_BASE_MISMATCH', 'candidateCommit 不是登记 baseCommit 的后代');
+  await assertGitAncestor(rootPath, lastMainSyncCommit, candidate, 'RESULT_WORKTREE_BASE_MISMATCH', 'candidateCommit 不是登记 lastMainSyncCommit 的后代');
+  return { schemaVersion: 1, workspaceRole: 'candidate_worktree', rootPath, registeredWorktreePath: identity.worktreePath, branch, registeredBaseCommit: identity.baseCommit, registeredLastMainSyncCommit: identity.lastMainSyncCommit, registeredCleanupOwner: identity.cleanupOwner, baseCommit, lastMainSyncCommit, candidateCommit: candidate };
 }
 
 function parallelStringArray(value, field, { allowEmpty = true } = {}) {
@@ -559,6 +622,7 @@ async function normalizeLocalResultArtifact(artifact, resultManifestPath, projec
   } catch (error) {
     fail('RESULT_ARTIFACT_PATH_INVALID', `artifact 路径不存在: ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (!windowsPathInside(resolved, projectRoot)) fail('RESULT_ARTIFACT_OUTSIDE_ALLOWED_ROOT', `artifact 真实路径超出当前结果工作区: ${resolved}`);
   const allowedRoots = [];
   for (const rootRef of allowedArtifactRoots) {
     const rootCandidate = win32.isAbsolute(rootRef) ? win32.resolve(rootRef) : win32.resolve(projectRoot, rootRef.replaceAll('/', '\\'));
@@ -599,11 +663,13 @@ function normalizeResultTestSummary(value) {
 
 async function loadResultManifest(projectRoot, reference, task, candidateCommit) {
   if (!implementationTask(task) || task.resultProtocolVersion !== RESULT_PROTOCOL_VERSION || task.resultRequirements === null) fail('RESULT_MANIFEST_NOT_APPLICABLE', '当前任务未启用 result protocol');
-  const lexicalResultManifestPath = resolveResultManifestPath(projectRoot, reference);
+  const sourceWorkspace = await resolveResultWorkspace(task, projectRoot, candidateCommit);
+  const resultRoot = sourceWorkspace.rootPath;
+  const lexicalResultManifestPath = resolveResultManifestPath(resultRoot, reference, sourceWorkspace.workspaceRole);
   let resultManifestPath;
   try {
-    const [realManifest, realProjectRoot] = await Promise.all([realpath(lexicalResultManifestPath), realpath(projectRoot)]);
-    if (!windowsPathInside(realManifest, realProjectRoot)) fail('RESULT_MANIFEST_OUTSIDE_PROJECT', 'result manifest 的真实路径超出项目根目录');
+    const realManifest = await realpath(lexicalResultManifestPath);
+    if (!windowsPathInside(realManifest, resultRoot)) fail(sourceWorkspace.workspaceRole === 'candidate_worktree' ? 'RESULT_MANIFEST_OUTSIDE_WORKTREE' : 'RESULT_MANIFEST_OUTSIDE_PROJECT', sourceWorkspace.workspaceRole === 'candidate_worktree' ? 'result manifest 的真实路径逃逸台账登记 worktree' : 'result manifest 的真实路径超出项目根目录');
     resultManifestPath = realManifest;
   } catch (error) {
     if (error instanceof TaskControlError) throw error;
@@ -643,6 +709,12 @@ async function loadResultManifest(projectRoot, reference, task, candidateCommit)
       return { path, changeType: entry.changeType, reason: entry.reason.trim() };
     });
     validationRationale = value.validationRationale.trim();
+    const reportedPaths = new Set(affectedFiles.map((entry) => entry.path.toLowerCase()));
+    const missingRepairPaths = (task.incidentalRepairs ?? [])
+      .filter((repair) => repair.attemptCount === task.attemptCount)
+      .flatMap((repair) => repair.affectedFiles.map((entry) => entry.path))
+      .filter((path) => !reportedPaths.has(path.toLowerCase()));
+    if (missingRepairPaths.length > 0) fail('INCIDENTAL_REPAIR_RESULT_MISMATCH', `成果包必须披露附带修复影响文件: ${[...new Set(missingRepairPaths)].join(', ')}`);
   }
   const incompleteItems = stringArray(value.incompleteItems, 'incompleteItems');
   const testSummary = normalizeResultTestSummary(value.testSummary);
@@ -663,7 +735,7 @@ async function loadResultManifest(projectRoot, reference, task, candidateCommit)
     if (['screenshot', 'contact_sheet'].includes(artifact.type) && !hasPath) fail('RESULT_IMAGE_PATH_REQUIRED', `视觉 artifact 必须提供可验证的本地 path: ${artifact.id}`);
     let location;
     if (hasPath) {
-      location = await normalizeLocalResultArtifact(artifact, resultManifestPath, projectRoot, task.resultRequirements.allowedArtifactRoots);
+      location = await normalizeLocalResultArtifact(artifact, resultManifestPath, resultRoot, task.resultRequirements.allowedArtifactRoots);
       if (artifactHashes.has(location.sha256)) fail('RESULT_ARTIFACT_DUPLICATE_HASH', `成果包不得重复登记同一文件内容: ${artifact.id}`);
       artifactHashes.add(location.sha256);
     } else {
@@ -689,6 +761,7 @@ async function loadResultManifest(projectRoot, reference, task, candidateCommit)
     resultManifestSchemaVersion: expectedManifestSchemaVersion,
     resultManifestPath,
     resultManifestDigest: createHash('sha256').update(raw, 'utf8').digest('hex'),
+    sourceWorkspace,
     projectKey: value.projectKey,
     controllerThreadId: value.controllerThreadId,
     threadId: value.threadId,
@@ -983,6 +1056,7 @@ function emptyContractControl(taskMode = 'legacy_unclassified') {
   return {
     taskMode,
     implementationPolicy: null,
+    scopePolicy: null,
     implementationBriefPath: null,
     briefSchemaVersion: null,
     implementationBrief: null,
@@ -1007,6 +1081,7 @@ function emptyContractControl(taskMode = 'legacy_unclassified') {
     resultRequirements: null,
     deliverableHistory: [],
     stageProgress: [],
+    incidentalRepairs: [],
   };
 }
 
@@ -1015,6 +1090,7 @@ function ensureImplementationControl(tasks) {
     if (!('taskMode' in task)) return { ...task, ...emptyContractControl('legacy_unclassified') };
     const isImplementation = task.taskMode === 'implementation' || task.taskMode === 'visual_implementation';
     const implementationPolicy = task.implementationPolicy ?? (isImplementation ? (nonEmpty(task.implementationContractPath) ? 'hard_contract' : 'adaptive_brief') : null);
+    const scopePolicy = task.scopePolicy ?? (isImplementation ? (implementationPolicy === 'hard_contract' ? 'strict_scope' : 'bounded_incidental') : null);
     const legacyBrief = isImplementation ? validateImplementationBriefManifest({
       schemaVersion: IMPLEMENTATION_BRIEF_SCHEMA_VERSION,
       objective: task.scope ?? task.title,
@@ -1027,6 +1103,7 @@ function ensureImplementationControl(tasks) {
     return {
       ...task,
       implementationPolicy,
+      scopePolicy,
       implementationBriefPath: task.implementationBriefPath ?? null,
       briefSchemaVersion: implementationBrief === null ? null : (task.briefSchemaVersion ?? IMPLEMENTATION_BRIEF_SCHEMA_VERSION),
       implementationBrief,
@@ -1039,6 +1116,7 @@ function ensureImplementationControl(tasks) {
       resultRequirements: task.resultRequirements ?? null,
       deliverableHistory: Array.isArray(task.deliverableHistory) ? task.deliverableHistory : [],
       stageProgress: Array.isArray(task.stageProgress) ? task.stageProgress : [],
+      incidentalRepairs: Array.isArray(task.incidentalRepairs) ? task.incidentalRepairs : [],
       allowedWritePaths: Array.isArray(task.allowedWritePaths) ? task.allowedWritePaths : [],
     };
   });
@@ -1210,7 +1288,7 @@ function missingRequiredStageIds(task) {
 }
 
 function contractSummary(task) {
-  return { taskMode: task.taskMode ?? 'legacy_unclassified', implementationPolicy: task.implementationPolicy ?? null, contractVersion: contractVersion(task), contractDigest: adaptiveBriefTask(task) ? task.briefDigest : (task.contractDigest ?? null), resultProtocolVersion: task.resultProtocolVersion ?? 0, completedStages: completedStageIds(task), missingStages: missingRequiredStageIds(task), deliverableCount: task.deliverableHistory?.length ?? 0 };
+  return { taskMode: task.taskMode ?? 'legacy_unclassified', implementationPolicy: task.implementationPolicy ?? null, scopePolicy: task.scopePolicy ?? null, contractVersion: contractVersion(task), contractDigest: adaptiveBriefTask(task) ? task.briefDigest : (task.contractDigest ?? null), resultProtocolVersion: task.resultProtocolVersion ?? 0, completedStages: completedStageIds(task), missingStages: missingRequiredStageIds(task), incidentalRepairCount: task.incidentalRepairs?.length ?? 0, deliverableCount: task.deliverableHistory?.length ?? 0 };
 }
 
 async function assertImplementationContractCurrent(task, projectRoot) {
@@ -1229,6 +1307,38 @@ function normalizeEvidenceReferences(value = []) {
     seen.add(id);
     return { id, reference: entry.reference.trim() };
   });
+}
+
+function normalizeRepairAffectedFiles(value = []) {
+  if (!Array.isArray(value) || value.length === 0) fail('INCIDENTAL_REPAIR_FILES_REQUIRED', '附带修复必须记录至少一个实际影响文件');
+  const seen = new Set();
+  return value.map((entry) => {
+    if (!isObject(entry) || !nonEmpty(entry.path) || !nonEmpty(entry.reason) || !has(entry.changeType, RESULT_FILE_CHANGE_TYPES)) fail('INCIDENTAL_REPAIR_FILE_INVALID', '影响文件必须包含项目相对 path、changeType 和 reason');
+    if (win32.isAbsolute(entry.path) || entry.path.replaceAll('/', '\\').split('\\').includes('..')) fail('INCIDENTAL_REPAIR_FILE_INVALID', `影响文件必须留在项目内: ${entry.path}`);
+    const path = entry.path.trim().replaceAll('\\', '/');
+    const key = path.toLowerCase();
+    if (seen.has(key)) fail('INCIDENTAL_REPAIR_FILE_INVALID', `影响文件重复: ${path}`);
+    seen.add(key);
+    return { path, changeType: entry.changeType, reason: entry.reason.trim() };
+  });
+}
+
+function validateIncidentalRepairReceipt(value, task) {
+  const allowed = new Set(['schemaVersion', 'type', 'projectKey', 'threadId', 'parentThreadId', 'controllerThreadId', 'displayKey', 'title', 'attemptCount', 'repairId', 'originalBlocker', 'sameObjectiveReason', 'functionalDomain', 'affectedFiles', 'conflictDomains', 'localOnly', 'reversible', ...INCIDENTAL_REPAIR_RISK_FLAGS, 'riskAssessment', 'redEvidence', 'greenEvidence', 'contractVersion', 'contractDigest', 'createdAt']);
+  if (!isObject(value) || value.schemaVersion !== INCIDENTAL_REPAIR_PROTOCOL_VERSION || value.type !== 'incidental_repair' || Object.keys(value).some((key) => !allowed.has(key))) fail('INCIDENTAL_REPAIR_INVALID', '附带修复回执 schema 或字段无效');
+  if (!adaptiveBriefTask(task) || task.scopePolicy !== 'bounded_incidental') fail('INCIDENTAL_REPAIR_NOT_ALLOWED', '只有 bounded_incidental 的 adaptive_brief 可以在同任务内附带修复');
+  if (value.threadId !== task.threadId || value.parentThreadId !== task.parentThreadId || value.controllerThreadId !== task.directControllerThreadId || value.displayKey !== task.displayKey || !Number.isInteger(value.attemptCount) || value.attemptCount < 1 || value.attemptCount > task.attemptCount || !isTimestamp(value.createdAt)) fail('INCIDENTAL_REPAIR_OWNERSHIP_MISMATCH', '附带修复回执的任务身份、attempt 或时间不匹配');
+  if (!isSafeThreadId(value.repairId) || !nonEmpty(value.originalBlocker) || !nonEmpty(value.sameObjectiveReason) || !nonEmpty(value.functionalDomain) || !nonEmpty(value.riskAssessment)) fail('INCIDENTAL_REPAIR_INVALID', '附带修复缺少 repairId、阻塞、同目标理由、功能域或风险判断');
+  if (value.localOnly !== true || value.reversible !== true || INCIDENTAL_REPAIR_RISK_FLAGS.some((flag) => value[flag] !== false)) fail('INCIDENTAL_REPAIR_ESCALATION_REQUIRED', '该改动涉及禁止风险或无法证明本地可逆，必须停止并交回直接主控');
+  const affectedFiles = normalizeRepairAffectedFiles(value.affectedFiles);
+  if (!Array.isArray(value.conflictDomains) || !value.conflictDomains.every(isSafeThreadId) || new Set(value.conflictDomains).size !== value.conflictDomains.length) fail('INCIDENTAL_REPAIR_CONFLICT_DOMAIN_INVALID', 'conflictDomains 必须是无重复安全标识数组');
+  const registeredDomains = new Set(task.parallelConflictDomains ?? []);
+  if (value.conflictDomains.some((domain) => !registeredDomains.has(domain))) fail('INCIDENTAL_REPAIR_CROSS_CONFLICT_DOMAIN', '附带修复跨越未登记 conflict domain，必须交回直接主控');
+  const redEvidence = normalizeEvidenceReferences(value.redEvidence);
+  const greenEvidence = normalizeEvidenceReferences(value.greenEvidence);
+  if (redEvidence.length === 0 || greenEvidence.length === 0) fail('INCIDENTAL_REPAIR_EVIDENCE_REQUIRED', '附带修复必须同时提供真实 RED 和 GREEN（或等价前后）证据');
+  if (value.contractVersion !== contractVersion(task) || value.contractDigest !== task.contractDigest) fail('EVENT_CONTRACT_MISMATCH', '附带修复回执绑定的简报版本已变化');
+  return { ...value, affectedFiles, conflictDomains: [...value.conflictDomains], redEvidence, greenEvidence };
 }
 
 function validateStageCheckpoint(task, stageId, evidence, { pendingStages = new Map() } = {}) {
@@ -1319,6 +1429,23 @@ async function pendingStagesForCreation(paths, task) {
     pendingStages.set(stage.stageId, existing);
   }
   return pendingStages;
+}
+
+async function pendingIncidentalRepairs(paths, task, beforeAt = null) {
+  const ingestedIds = new Set((task.incidentalRepairs ?? []).map((repair) => repair.repairId));
+  const pending = [];
+  for (const eventPath of await listTaskEventFiles(paths, task)) {
+    if (artifactTypeForPath(eventPath) !== 'incidental_repair') continue;
+    let event;
+    try {
+      event = await readArtifact(eventPath, 'incidental_repair');
+      if (ingestedIds.has(event.repairId) || event.attemptCount !== task.attemptCount || (beforeAt !== null && Date.parse(event.createdAt) > Date.parse(beforeAt))) continue;
+      pending.push(validateIncidentalRepairReceipt(event, task));
+    } catch {
+      continue;
+    }
+  }
+  return pending.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
 }
 
 function assertEventContractMatches(task, event) {
@@ -1929,7 +2056,22 @@ function validateControllerHeartbeat(value, knownControllers) {
 }
 
 function validateDeliverablePackage(value, task, projectRoot) {
-  if (!isObject(value) || !RESULT_MANIFEST_SCHEMA_VERSIONS.includes(value.resultManifestSchemaVersion) || value.resultManifestSchemaVersion !== task.resultProtocolVersion || !nonEmpty(value.resultManifestPath) || !win32.isAbsolute(value.resultManifestPath) || !windowsPathInside(value.resultManifestPath, projectRoot) || !/^[0-9a-f]{64}$/.test(value.resultManifestDigest ?? '')) fail('REGISTRY_INVALID', 'deliverable result manifest 元数据无效');
+  if (!isObject(value)) fail('REGISTRY_INVALID', 'deliverable 必须是对象');
+  const hasSourceWorkspace = value.sourceWorkspace !== undefined;
+  let resultRoot = projectRoot;
+  if (hasSourceWorkspace) {
+    const source = value.sourceWorkspace;
+    const expectedIdentity = task.parallelWorktreeIdentity;
+    const expectedRole = expectedIdentity === null || expectedIdentity === undefined ? 'project_main' : 'candidate_worktree';
+    if (!isObject(source) || source.schemaVersion !== 1 || source.workspaceRole !== expectedRole || !nonEmpty(source.rootPath) || !win32.isAbsolute(source.rootPath)) fail('REGISTRY_INVALID', 'deliverable sourceWorkspace 身份无效');
+    if (expectedRole === 'candidate_worktree') {
+      if (![source.registeredWorktreePath, source.branch, source.registeredBaseCommit, source.registeredLastMainSyncCommit, source.registeredCleanupOwner, source.baseCommit, source.lastMainSyncCommit, source.candidateCommit].every(nonEmpty) || !windowsPathInside(source.rootPath, expectedIdentity.worktreePath) || !windowsPathInside(expectedIdentity.worktreePath, source.rootPath) || !windowsPathInside(source.registeredWorktreePath, expectedIdentity.worktreePath) || !windowsPathInside(expectedIdentity.worktreePath, source.registeredWorktreePath) || source.branch.toLowerCase() !== expectedIdentity.branch.toLowerCase() || source.registeredBaseCommit !== expectedIdentity.baseCommit || source.registeredLastMainSyncCommit !== expectedIdentity.lastMainSyncCommit || source.registeredCleanupOwner !== expectedIdentity.cleanupOwner || source.candidateCommit !== value.candidateCommit) fail('REGISTRY_INVALID', 'deliverable candidate-worktree source identity 与台账不一致');
+    } else if (source.registeredWorktreePath !== null || source.branch !== null || source.registeredBaseCommit !== null || source.registeredLastMainSyncCommit !== null || source.registeredCleanupOwner !== null || source.baseCommit !== null || source.lastMainSyncCommit !== null || source.candidateCommit !== null || !windowsPathInside(source.rootPath, projectRoot) || !windowsPathInside(projectRoot, source.rootPath)) {
+      fail('REGISTRY_INVALID', 'project_main deliverable 不得伪造候选 worktree identity');
+    }
+    resultRoot = source.rootPath;
+  }
+  if (!RESULT_MANIFEST_SCHEMA_VERSIONS.includes(value.resultManifestSchemaVersion) || value.resultManifestSchemaVersion !== task.resultProtocolVersion || !nonEmpty(value.resultManifestPath) || !win32.isAbsolute(value.resultManifestPath) || !windowsPathInside(value.resultManifestPath, resultRoot) || !/^[0-9a-f]{64}$/.test(value.resultManifestDigest ?? '')) fail('REGISTRY_INVALID', 'deliverable result manifest 元数据无效');
   if (value.projectKey !== projectKeyForRoot(projectRoot) || value.controllerThreadId !== task.directControllerThreadId || value.threadId !== task.threadId || value.displayKey !== task.displayKey || !Number.isInteger(value.attempt) || value.attempt < 1 || value.contractVersion !== contractVersion(task) || value.contractDigest !== task.contractDigest || !nonEmpty(value.candidateCommit) || value.manifestIntegrationStatus !== 'candidate' || !nonEmpty(value.userVisibleSummary)) fail('REGISTRY_INVALID', 'deliverable 身份、合同或候选状态无效');
   if (!Array.isArray(value.actualChanges) || value.actualChanges.length === 0 || !value.actualChanges.every(nonEmpty) || !Array.isArray(value.incompleteItems) || !value.incompleteItems.every(nonEmpty)) fail('REGISTRY_INVALID', 'deliverable changes/incompleteItems 无效');
   if (value.resultManifestSchemaVersion >= 2) {
@@ -1946,7 +2088,7 @@ function validateDeliverablePackage(value, task, projectRoot) {
   const artifactIds = new Set();
   const artifactHashes = new Set();
   const stageIds = new Set(task.stageGates.map((gate) => gate.id));
-  const allowedRoots = (task.resultRequirements?.allowedArtifactRoots ?? []).map((root) => win32.isAbsolute(root) ? win32.resolve(root) : win32.resolve(projectRoot, root.replaceAll('/', '\\')));
+  const allowedRoots = (task.resultRequirements?.allowedArtifactRoots ?? []).map((root) => win32.isAbsolute(root) ? win32.resolve(root) : win32.resolve(resultRoot, root.replaceAll('/', '\\')));
   const artifacts = value.artifacts.map((artifact) => {
     const sourceStageValid = adaptiveBriefTask(task) ? isSafeThreadId(artifact.sourceStageId) : stageIds.has(artifact.sourceStageId);
     if (!isObject(artifact) || !isSafeThreadId(artifact.id) || artifactIds.has(artifact.id) || !RESULT_ARTIFACT_TYPES.includes(artifact.type) || !RESULT_ARTIFACT_MILESTONES.includes(artifact.milestone) || !nonEmpty(artifact.label) || !nonEmpty(artifact.description) || !isTimestamp(artifact.createdAt) || !nonEmpty(artifact.sourceStageId) || !sourceStageValid || artifact.sourceTaskThreadId !== task.threadId || !RESULT_WORKSPACE_ROLES.includes(artifact.workspaceRole)) fail('REGISTRY_INVALID', 'deliverable artifact 结构无效');
@@ -1956,7 +2098,7 @@ function validateDeliverablePackage(value, task, projectRoot) {
     const remote = nonEmpty(artifact.uri);
     if (local === remote) fail('REGISTRY_INVALID', 'deliverable artifact 必须且只能保留 path 或 uri');
     if (local) {
-      if (!win32.isAbsolute(artifact.path) || !allowedRoots.some((root) => windowsPathInside(artifact.path, root)) || !/^[0-9a-f]{64}$/.test(artifact.sha256 ?? '') || artifactHashes.has(artifact.sha256)) fail('REGISTRY_INVALID', '本地 deliverable artifact path/hash 无效、越界或重复');
+      if (!win32.isAbsolute(artifact.path) || (hasSourceWorkspace && !windowsPathInside(artifact.path, resultRoot)) || !allowedRoots.some((root) => windowsPathInside(artifact.path, root)) || !/^[0-9a-f]{64}$/.test(artifact.sha256 ?? '') || artifactHashes.has(artifact.sha256)) fail('REGISTRY_INVALID', '本地 deliverable artifact path/hash 无效、越界或重复');
       artifactHashes.add(artifact.sha256);
     } else {
       let parsed;
@@ -2020,7 +2162,7 @@ function validateTask(value, projectRoot) {
     for (const key of ['scope', 'acceptance', 'forbiddenDecisions']) if (!nonEmpty(value[key])) fail('REGISTRY_INVALID', `${key} 无效`);
   }
   value = ensureImplementationControl([value])[0];
-  const contractFields = ['taskMode', 'implementationPolicy', 'implementationBriefPath', 'briefSchemaVersion', 'implementationBrief', 'briefDigest', 'hardContractTrigger', 'hardContractReason', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'stageProgress'];
+  const contractFields = ['taskMode', 'implementationPolicy', 'scopePolicy', 'implementationBriefPath', 'briefSchemaVersion', 'implementationBrief', 'briefDigest', 'hardContractTrigger', 'hardContractReason', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'stageProgress', 'incidentalRepairs'];
   const resultControlFields = ['resultProtocolVersion', 'resultRequirements', 'deliverableHistory'];
   const presentContractFields = contractFields.filter((key) => key in value);
   const presentResultControlFields = resultControlFields.filter((key) => key in value);
@@ -2034,12 +2176,12 @@ function validateTask(value, projectRoot) {
       value.deliverableHistory = [];
     }
     if (!has(value.taskMode, TASK_MODES)) fail('REGISTRY_INVALID', `taskMode 无效: ${value.taskMode}`);
-    if (!Array.isArray(value.stageProgress) || !Array.isArray(value.deliverableHistory) || !RESULT_PROTOCOL_VERSIONS.includes(value.resultProtocolVersion)) fail('REGISTRY_INVALID', 'stageProgress/deliverableHistory/resultProtocolVersion 无效');
+    if (!Array.isArray(value.stageProgress) || !Array.isArray(value.incidentalRepairs) || !Array.isArray(value.deliverableHistory) || !RESULT_PROTOCOL_VERSIONS.includes(value.resultProtocolVersion)) fail('REGISTRY_INVALID', 'stageProgress/incidentalRepairs/deliverableHistory/resultProtocolVersion 无效');
     if (value.taskMode === 'legacy_unclassified' || value.taskMode === 'control_only') {
-      if (value.implementationPolicy !== null || value.implementationBriefPath !== null || value.briefSchemaVersion !== null || value.implementationBrief !== null || value.briefDigest !== null || value.hardContractTrigger !== null || value.hardContractReason !== null || value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractDigest !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.validationPolicy !== null || value.visualOracle !== null || value.resultProtocolVersion !== 0 || value.resultRequirements !== null) fail('REGISTRY_INVALID', '非实施任务不得绑定实施简报、硬合同或成果协议');
-      if (![value.allowedWritePaths ?? [], value.reuseRequirements, value.forbiddenNewPaths, value.forbiddenReimplementations, value.stageGates, value.evidenceCommands, value.stageProgress, value.deliverableHistory].every((entry) => Array.isArray(entry) && entry.length === 0)) fail('REGISTRY_INVALID', '非实施任务不得保留合同、阶段或成果数据');
+      if (value.implementationPolicy !== null || value.scopePolicy !== null || value.implementationBriefPath !== null || value.briefSchemaVersion !== null || value.implementationBrief !== null || value.briefDigest !== null || value.hardContractTrigger !== null || value.hardContractReason !== null || value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractDigest !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.validationPolicy !== null || value.visualOracle !== null || value.resultProtocolVersion !== 0 || value.resultRequirements !== null) fail('REGISTRY_INVALID', '非实施任务不得绑定实施简报、scope policy、硬合同或成果协议');
+      if (![value.allowedWritePaths ?? [], value.reuseRequirements, value.forbiddenNewPaths, value.forbiddenReimplementations, value.stageGates, value.evidenceCommands, value.stageProgress, value.incidentalRepairs, value.deliverableHistory].every((entry) => Array.isArray(entry) && entry.length === 0)) fail('REGISTRY_INVALID', '非实施任务不得保留合同、阶段、附带修复或成果数据');
     } else {
-      if (!has(value.implementationPolicy, IMPLEMENTATION_POLICIES) || value.briefSchemaVersion !== IMPLEMENTATION_BRIEF_SCHEMA_VERSION || !isObject(value.implementationBrief) || !/^[0-9a-f]{64}$/.test(value.briefDigest ?? '')) fail('REGISTRY_INVALID', '实施任务 policy/brief/digest 无效');
+      if (!has(value.implementationPolicy, IMPLEMENTATION_POLICIES) || !has(value.scopePolicy, SCOPE_POLICIES) || value.briefSchemaVersion !== IMPLEMENTATION_BRIEF_SCHEMA_VERSION || !isObject(value.implementationBrief) || !/^[0-9a-f]{64}$/.test(value.briefDigest ?? '')) fail('REGISTRY_INVALID', '实施任务 policy/scope-policy/brief/digest 无效');
       const normalizedBrief = validateImplementationBriefManifest(value.implementationBrief);
       if (createHash('sha256').update(JSON.stringify(normalizedBrief), 'utf8').digest('hex') !== value.briefDigest) fail('REGISTRY_INVALID', 'implementation brief digest 不匹配');
       if (value.implementationBriefPath !== null && (!nonEmpty(value.implementationBriefPath) || !win32.isAbsolute(value.implementationBriefPath) || !windowsPathInside(value.implementationBriefPath, projectRoot))) fail('REGISTRY_INVALID', 'implementation brief path 无效或越界');
@@ -2047,6 +2189,7 @@ function validateTask(value, projectRoot) {
         if (value.hardContractTrigger !== null || value.hardContractReason !== null || value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.validationPolicy !== null || value.visualOracle !== null || value.contractDigest !== value.briefDigest) fail('REGISTRY_INVALID', 'adaptive brief 不得保留硬合同字段，binding digest 必须匹配 brief');
         if (![value.allowedWritePaths ?? [], value.reuseRequirements, value.forbiddenNewPaths, value.forbiddenReimplementations, value.stageGates, value.evidenceCommands].every((entry) => Array.isArray(entry) && entry.length === 0)) fail('REGISTRY_INVALID', 'adaptive brief 不得强制 write path、stage 或 validator');
       } else {
+        if (value.scopePolicy !== 'strict_scope' || value.incidentalRepairs.length > 0) fail('REGISTRY_INVALID', 'hard contract 必须保持 strict_scope 且不得登记附带修复');
         if (!HARD_CONTRACT_TRIGGERS.includes(value.hardContractTrigger) || !nonEmpty(value.hardContractReason) || !IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.includes(value.contractSchemaVersion) || !nonEmpty(value.implementationContractPath) || !win32.isAbsolute(value.implementationContractPath) || !/^[0-9a-f]{64}$/.test(value.contractDigest ?? '')) fail('REGISTRY_INVALID', 'hard contract trigger/reason/path/schema/digest 无效');
         const normalizedRoot = win32.resolve(projectRoot).toLowerCase();
         const normalizedContractPath = win32.resolve(value.implementationContractPath).toLowerCase();
@@ -2072,6 +2215,13 @@ function validateTask(value, projectRoot) {
           seenEvidence.add(evidence.id);
         }
       }
+      const repairIds = new Set();
+      for (const repair of value.incidentalRepairs) {
+        if (repairIds.has(repair.repairId)) fail('REGISTRY_INVALID', `附带修复 repairId 重复: ${repair.repairId}`);
+        repairIds.add(repair.repairId);
+        const normalizedRepair = validateIncidentalRepairReceipt(repair, value);
+        if (normalizedRepair.attemptCount !== repair.attemptCount || !Number.isInteger(repair.attemptCount) || repair.attemptCount < 1 || !isTimestamp(repair.createdAt)) fail('REGISTRY_INVALID', '附带修复 attempt 或时间无效');
+      }
       value.deliverableHistory = value.deliverableHistory.map((entry) => validateDeliverablePackage(entry, value, projectRoot));
       if (value.status === 'integrated' && 'integrationProof' in value && value.integrationProof === null) fail('REGISTRY_INVALID', '新协议实施任务标记 integrated 前必须记录 Git 祖先证明');
     }
@@ -2094,6 +2244,13 @@ function validateTask(value, projectRoot) {
   if ('pendingRework' in value && value.pendingRework !== null) {
     const pending = value.pendingRework;
     if (!isObject(pending) || !isSafeThreadId(pending.actionId) || pending.nextAttempt !== value.attemptCount + 1 || pending.mode !== 'continue_same_attempt' || !isTimestamp(pending.preparedAt) || !isTimestamp(pending.expiresAt) || Date.parse(pending.expiresAt) <= Date.parse(pending.preparedAt) || value.status !== 'changes_requested') fail('REGISTRY_INVALID', 'pendingRework 结构或生命周期无效');
+  }
+  if ('controlPlaneRecovery' in value && value.controlPlaneRecovery !== null) {
+    const recovery = value.controlPlaneRecovery;
+    if (!isObject(recovery) || recovery.schemaVersion !== CONTROL_PLANE_RECOVERY_PROTOCOL_VERSION || !isSafeThreadId(recovery.recoveryId) || !has(recovery.status, CONTROL_PLANE_RECOVERY_STATUSES) || !has(recovery.component, CONTROL_PLANE_RECOVERY_COMPONENTS) || recovery.attemptCount !== value.attemptCount || !/^[0-9a-f]{40,64}$/i.test(recovery.candidateCommit ?? '') || !nonEmpty(recovery.resultManifestPath) || !win32.isAbsolute(recovery.resultManifestPath) || !/^[0-9a-f]{64}$/.test(recovery.resultManifestDigest ?? '') || !isObject(recovery.sourceWorkspace) || recovery.sourceWorkspace.workspaceRole !== 'candidate_worktree' || recovery.sourceWorkspace.candidateCommit !== recovery.candidateCommit || !nonEmpty(recovery.skillVersion) || !/^\d+\.\d+\.\d+$/.test(recovery.skillVersion) || !nonEmpty(recovery.reason) || !nonEmpty(recovery.hostReceipt) || !isTimestamp(recovery.preparedAt)) fail('REGISTRY_INVALID', 'controlPlaneRecovery 结构、候选或审计证据无效');
+    if (recovery.status === 'completion_only' && (value.status !== 'executing' || recovery.completedAt !== null || recovery.cancelledAt !== null)) fail('REGISTRY_INVALID', 'completion_only 恢复必须处于 executing 且未收口');
+    if (recovery.status === 'completed' && (!isTimestamp(recovery.completedAt) || recovery.cancelledAt !== null || !['awaiting_review', 'accepted', 'integrated', 'changes_requested', 'reclaimed', 'blocked'].includes(value.status))) fail('REGISTRY_INVALID', '已完成 control-plane recovery 状态无效');
+    if (recovery.status === 'cancelled' && (!isTimestamp(recovery.cancelledAt) || recovery.completedAt !== null)) fail('REGISTRY_INVALID', '已取消 control-plane recovery 缺少时间');
   }
   if ('contractAmendmentHistory' in value) {
     if (!Array.isArray(value.contractAmendmentHistory)) fail('REGISTRY_INVALID', 'contractAmendmentHistory 无效');
@@ -2139,6 +2296,7 @@ function validateTask(value, projectRoot) {
   const presentProgressFields = progressFields.filter((key) => key in value);
   if (presentProgressFields.length !== 0 && presentProgressFields.length !== progressFields.length) fail('REGISTRY_INVALID', '进度字段必须同时存在');
   if (presentProgressFields.length === progressFields.length && (!isTimestamp(value.progressEventCreatedAt) || !nonEmpty(value.lastProgressSummary))) fail('REGISTRY_INVALID', 'progressEventCreatedAt 或 lastProgressSummary 无效');
+  if ('incidentalRepairEventCreatedAt' in value && !isTimestamp(value.incidentalRepairEventCreatedAt)) fail('REGISTRY_INVALID', 'incidentalRepairEventCreatedAt 无效');
   if ('objectiveProtocolVersion' in value) {
     if (![0, OBJECTIVE_PROTOCOL_VERSION].includes(value.objectiveProtocolVersion) || !Array.isArray(value.failureHistory) || !Array.isArray(value.diagnostics)) fail('REGISTRY_INVALID', 'objective 控制字段无效');
     if (value.objectiveProtocolVersion === 0) {
@@ -2895,11 +3053,13 @@ export async function controllerRegisterTask(input) {
   if (parallelPolicy === 'batch_v1' && !hasBatchBinding) fail('PARALLEL_BATCH_BINDING_REQUIRED', 'batch_v1 registration 必须绑定 batch-id 和 candidate-id');
   let contractControl;
   if (input.taskMode === 'control_only') {
-    if ([input.implementationContractPath, input.implementationBriefPath, input.implementationPolicy, input.hardContractTrigger, input.hardContractReason].some(nonEmpty)) fail('IMPLEMENTATION_CONTRACT_NOT_APPLICABLE', 'control_only 任务不得绑定 implementation brief/policy/contract');
+    if ([input.implementationContractPath, input.implementationBriefPath, input.implementationPolicy, input.scopePolicy, input.hardContractTrigger, input.hardContractReason].some(nonEmpty)) fail('IMPLEMENTATION_CONTRACT_NOT_APPLICABLE', 'control_only 任务不得绑定 implementation brief/policy/scope-policy/contract');
     contractControl = emptyContractControl('control_only');
   } else {
     const implementationPolicy = input.implementationPolicy ?? 'adaptive_brief';
     if (!has(implementationPolicy, IMPLEMENTATION_POLICIES)) fail('IMPLEMENTATION_POLICY_INVALID', `implementation policy 必须是 ${IMPLEMENTATION_POLICIES.join(' 或 ')}`);
+    const scopePolicy = input.scopePolicy ?? (implementationPolicy === 'adaptive_brief' ? 'bounded_incidental' : 'strict_scope');
+    if (!has(scopePolicy, SCOPE_POLICIES)) fail('SCOPE_POLICY_INVALID', `scope policy 必须是 ${SCOPE_POLICIES.join(' 或 ')}`);
     const brief = await loadImplementationBrief(input.projectRoot, input.implementationBriefPath, input);
     if (implementationPolicy === 'adaptive_brief') {
       if (nonEmpty(input.implementationContractPath) || nonEmpty(input.hardContractTrigger) || nonEmpty(input.hardContractReason)) fail('ADAPTIVE_BRIEF_HARD_CONTRACT_FIELDS_FORBIDDEN', 'adaptive_brief 不得携带 implementation contract 或 hard-contract 升级字段');
@@ -2907,19 +3067,21 @@ export async function controllerRegisterTask(input) {
         ...emptyContractControl(input.taskMode),
         taskMode: input.taskMode,
         implementationPolicy,
+        scopePolicy,
         ...brief,
         contractDigest: brief.briefDigest,
         resultProtocolVersion: RESULT_PROTOCOL_VERSION,
         resultRequirements: adaptiveResultRequirements(input.taskMode),
       };
     } else {
+      if (scopePolicy !== 'strict_scope') fail('HARD_CONTRACT_SCOPE_POLICY_INVALID', 'hard_contract 必须保持 strict_scope，不能被附带修复机制放宽');
       if (!has(input.hardContractTrigger, HARD_CONTRACT_TRIGGERS)) fail('HARD_CONTRACT_TRIGGER_REQUIRED', `hard_contract 必须记录触发条件: ${HARD_CONTRACT_TRIGGERS.join('、')}`);
       if (!nonEmpty(input.hardContractReason) || input.hardContractReason.trim().length < 20) fail('HARD_CONTRACT_REASON_REQUIRED', 'hard_contract 必须记录不少于 20 个字符的具体风险或协调理由');
       const snapshot = await loadImplementationContract(input.projectRoot, input.implementationContractPath, input.taskMode, { requireResultRequirements: true, requireCurrentSchema: true });
       const contractAudit = await implementationContractAuditFindings(snapshot, input.projectRoot);
       if (contractAudit.errors.length > 0) fail('IMPLEMENTATION_CONTRACT_AUDIT_FAILED', contractAudit.errors.map((finding) => `${finding.code}:${finding.evidenceCommandId}`).join(', '));
       if (['shared_conflict', 'parallel_coordination'].includes(input.hardContractTrigger) && snapshot.allowedWritePaths.length === 0) fail('HARD_CONTRACT_COORDINATION_PATHS_REQUIRED', '共享冲突或并行协调 hard contract 必须明确冲突路径；其他高风险合同不默认要求路径白名单');
-      contractControl = { taskMode: input.taskMode, implementationPolicy, ...brief, hardContractTrigger: input.hardContractTrigger, hardContractReason: input.hardContractReason.trim(), ...snapshot, resultProtocolVersion: RESULT_PROTOCOL_VERSION, deliverableHistory: [], stageProgress: [] };
+      contractControl = { taskMode: input.taskMode, implementationPolicy, scopePolicy, ...brief, hardContractTrigger: input.hardContractTrigger, hardContractReason: input.hardContractReason.trim(), ...snapshot, resultProtocolVersion: RESULT_PROTOCOL_VERSION, deliverableHistory: [], stageProgress: [], incidentalRepairs: [] };
     }
   }
   const { paths } = await ensureProject(home, input.projectRoot, input.controllerThreadId);
@@ -2971,7 +3133,7 @@ export async function controllerRegisterTask(input) {
     const objectiveCreatedAt = replaced?.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? replaced.objectiveCreatedAt : now;
     const runtime = objectiveRuntime(controlledTasks, objectiveId);
     if (runtime.fuseOpen) fail('OBJECTIVE_RETRY_FUSE_OPEN', `objective ${objectiveId} 已熔断: ${runtime.reasons.join(', ')}`);
-    const draftBase = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, ...parallelControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', integrationProof: null, notificationStatus: 'pending', observabilityProtocolVersion: OBSERVABILITY_PROTOCOL_VERSION, observabilityReceipts: [], updatedAt: now };
+    const draftBase = { threadId: input.threadId, parentThreadId: input.parentThreadId, directControllerThreadId: input.controllerThreadId, title: input.title.trim().replace(/\s+/g, ' '), model: input.model, thinking: input.thinking, delegationMode: input.delegationMode, executionSurface: input.executionSurface, modelClass: input.modelClass, quotaReason: input.quotaReason.trim(), workClass: input.workClass, decisionStatus: input.decisionStatus, scope: input.scope.trim(), acceptance: input.acceptance.trim(), forbiddenDecisions: input.forbiddenDecisions.trim(), ...contractControl, ...parallelControl, objectiveProtocolVersion: OBJECTIVE_PROTOCOL_VERSION, objectiveId, replacementOfThreadId, replacementOrdinal, objectiveBudgetMinutes, objectiveCreatedAt, failureHistory: [], diagnostics: [], closeout: null, controlPlaneRecovery: null, executionEndedAt: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: 1, failureClass: null, changesRequestedReason: null, reclaimedReason: null, lastDispatchedAttempt: 0, lastDispatchedAt: null, candidateCommit: null, reviewVerdict: 'pending', integrationStatus: 'not_integrated', integrationProof: null, notificationStatus: 'pending', observabilityProtocolVersion: OBSERVABILITY_PROTOCOL_VERSION, observabilityReceipts: [], updatedAt: now };
     const draft = appendObservabilityReceipt(draftBase, 'registered', now);
     const tasks = ensureTaskControls([...controlledTasks, draft], rootControllers);
     const task = tasks.find((candidate) => candidate.threadId === input.threadId);
@@ -3107,6 +3269,7 @@ function taskBlocker(task) {
 }
 
 function taskNextGate(task) {
+  if (task.controlPlaneRecovery?.status === 'completion_only') return '只重新提交已冻结的同一 candidate commit 与 result manifest；禁止重跑或修改业务';
   return ({
     executing: '完成当前合同阶段并提交成果包',
     awaiting_review: '直接主控审查成果包并记录 accepted/rejected 理由',
@@ -3139,7 +3302,7 @@ export async function controllerQueryDeliverables(input) {
     const manifestReferences = new Set(deliverables.flatMap((deliverable) => deliverable.artifacts.flatMap((artifact) => [artifact.path, artifact.uri].filter(nonEmpty))));
     const legacyArtifacts = legacyEvidenceForTask(task).filter((artifact) => !manifestReferences.has(artifact.reference));
     const objective = task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION ? objectiveRuntime(registry.tasks, task.objectiveId, Date.parse(registry.updatedAt)) : null;
-    tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, model: task.model, thinking: task.thinking, workClass: task.workClass ?? null, parallelProtocolVersion: task.parallelProtocolVersion, parallelBatchId: task.parallelBatchId, parallelCandidateId: task.parallelCandidateId, parallelLane: task.parallelLane, attemptCount: task.attemptCount, lastDispatchedAt: task.lastDispatchedAt, progressEventCreatedAt: task.progressEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, failureEventCreatedAt: task.failureEventCreatedAt ?? null, executionEndedAt: task.executionEndedAt, archivedAt: task.archivedAt, stageProgress: task.stageProgress, observabilityProtocolVersion: task.observabilityProtocolVersion, observabilityReceipts: task.observabilityReceipts, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, integrationProof: task.integrationProof ?? null, objective, failureHistory: task.failureHistory, diagnostics: task.diagnostics, closeout: task.closeout, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
+    tasks.push({ threadId: task.threadId, parentThreadId: task.parentThreadId, directControllerThreadId: task.directControllerThreadId, displayKey: task.displayKey, title: task.title, status: task.status, taskMode: task.taskMode, implementationPolicy: task.implementationPolicy, scopePolicy: task.scopePolicy, model: task.model, thinking: task.thinking, workClass: task.workClass ?? null, parallelProtocolVersion: task.parallelProtocolVersion, parallelBatchId: task.parallelBatchId, parallelCandidateId: task.parallelCandidateId, parallelLane: task.parallelLane, parallelWorktreeIdentity: task.parallelWorktreeIdentity, attemptCount: task.attemptCount, lastDispatchedAt: task.lastDispatchedAt, progressEventCreatedAt: task.progressEventCreatedAt ?? null, incidentalRepairEventCreatedAt: task.incidentalRepairEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, failureEventCreatedAt: task.failureEventCreatedAt ?? null, executionEndedAt: task.executionEndedAt, archivedAt: task.archivedAt, stageProgress: task.stageProgress, incidentalRepairs: task.incidentalRepairs, controlPlaneRecovery: task.controlPlaneRecovery ?? null, observabilityProtocolVersion: task.observabilityProtocolVersion, observabilityReceipts: task.observabilityReceipts, candidateCommit: task.candidateCommit, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, integrationProof: task.integrationProof ?? null, objective, failureHistory: task.failureHistory, diagnostics: task.diagnostics, closeout: task.closeout, blocker: taskBlocker(task), nextGate: taskNextGate(task), deliverables, legacyArtifacts, historicalEvidenceStatus: deliverables.length > 0 ? 'manifest_history_available' : legacyArtifacts.length > 0 ? 'stage_references_unverified' : 'historical_evidence_unavailable', updatedAt: task.updatedAt });
   }
   const deliverableCount = tasks.reduce((total, task) => total + task.deliverables.length, 0);
   const businessDeliverableCount = tasks.filter((task) => implementationTask(task) && task.integrationStatus === 'integrated' && task.integrationProof !== null && task.deliverables.some((entry) => entry.deliveryStatus === 'integrated')).length;
@@ -3147,7 +3310,7 @@ export async function controllerQueryDeliverables(input) {
   const controlReviewPassedCount = tasks.filter((task) => task.taskMode === 'control_only' && task.status === 'integrated').length;
   const checkpointState = checkpointPointerFor(registry, input.controllerThreadId);
   const handoffState = preparedHandoffFor(registry, input.controllerThreadId) ?? acceptedHandoffFor(registry, input.controllerThreadId);
-  return { reportSchemaVersion: 4, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount, businessDeliverableCount, candidateCommitCount, controlReviewPassedCount, checkpointState, handoffState, tasks };
+  return { reportSchemaVersion: 5, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount, businessDeliverableCount, candidateCommitCount, controlReviewPassedCount, checkpointState, handoffState, tasks };
 }
 
 function escapeHtml(value) {
@@ -3556,11 +3719,14 @@ function renderDeliveryReport(data) {
       const testStatus = ({ passed: '通过', failed: '失败', partial: '部分通过', blocked: '受阻' })[deliverable.testSummary.status] ?? `未识别状态（${deliverable.testSummary.status}）`;
       const affectedFiles = (deliverable.affectedFiles ?? []).map((file) => `<li><code>${escapeHtml(file.path)}</code> · ${escapeHtml(file.changeType)} · ${renderRecordedText(file.reason)}</li>`).join('');
       const evidenceChoice = deliverable.validationRationale ? `<div class="review"><strong>为什么选择这些验证：</strong>${renderRecordedText(deliverable.validationRationale)}</div>` : '';
-      return `<article class="package ${packageClass}"><div class="package-head"><div><h3>第 ${deliverable.attempt} 次尝试 · ${renderRecordedText(deliverable.userVisibleSummary)}</h3><p>${escapeHtml(deliverable.recordedAt)} · 执行策略：${escapeHtml(deliverable.implementationPolicy === 'adaptive_brief' ? '自适应简报' : '风险硬合同')} · 候选提交：${escapeHtml(deliverable.candidateCommit)}</p></div><span class="badge ${packageClass}">${escapeHtml(deliveryStatusLabel(deliverable, task))}</span></div><div class="columns"><div><h4>实际改变</h4><ul>${deliverable.actualChanges.map((item) => `<li>${renderRecordedText(item)}</li>`).join('')}</ul>${affectedFiles ? `<h4>实际影响文件与理由</h4><ul>${affectedFiles}</ul>` : ''}</div><div><h4>测试 / 数值</h4><p>${escapeHtml(testStatus)}：${renderRecordedText(deliverable.testSummary.summary)}</p><ul>${metrics}</ul></div></div>${evidenceChoice}${deliverable.incompleteItems.length > 0 ? `<div class="warning"><strong>未完成：</strong>${deliverable.incompleteItems.map(renderRecordedText).join('；')}</div>` : ''}${deliverable.reviewReason ? `<div class="review"><strong>主控审查：</strong>${renderRecordedText(deliverable.reviewReason)}</div>` : ''}${artifacts}</article>`;
+      const sourceWorkspace = deliverable.sourceWorkspace ? `<div class="diagnostic"><strong>成果来源工作区：</strong>${escapeHtml(deliverable.sourceWorkspace.workspaceRole === 'candidate_worktree' ? '台账登记的候选 worktree' : '项目主工作区')} · <code>${escapeHtml(deliverable.sourceWorkspace.rootPath)}</code>${deliverable.sourceWorkspace.branch ? ` · 分支 ${escapeHtml(deliverable.sourceWorkspace.branch)}` : ''}</div>` : '<div class="legacy">旧成果没有工作区身份快照；按旧台账兼容读取。</div>';
+      return `<article class="package ${packageClass}"><div class="package-head"><div><h3>第 ${deliverable.attempt} 次尝试 · ${renderRecordedText(deliverable.userVisibleSummary)}</h3><p>${escapeHtml(deliverable.recordedAt)} · 执行策略：${escapeHtml(deliverable.implementationPolicy === 'adaptive_brief' ? '自适应简报' : '风险硬合同')} · 候选提交：${escapeHtml(deliverable.candidateCommit)}</p></div><span class="badge ${packageClass}">${escapeHtml(deliveryStatusLabel(deliverable, task))}</span></div>${sourceWorkspace}<div class="columns"><div><h4>实际改变</h4><ul>${deliverable.actualChanges.map((item) => `<li>${renderRecordedText(item)}</li>`).join('')}</ul>${affectedFiles ? `<h4>实际影响文件与理由</h4><ul>${affectedFiles}</ul>` : ''}</div><div><h4>测试 / 数值</h4><p>${escapeHtml(testStatus)}：${renderRecordedText(deliverable.testSummary.summary)}</p><ul>${metrics}</ul></div></div>${evidenceChoice}${deliverable.incompleteItems.length > 0 ? `<div class="warning"><strong>未完成：</strong>${deliverable.incompleteItems.map(renderRecordedText).join('；')}</div>` : ''}${deliverable.reviewReason ? `<div class="review"><strong>主控审查：</strong>${renderRecordedText(deliverable.reviewReason)}</div>` : ''}${artifacts}</article>`;
     }).join('');
     const legacy = task.deliverables.length === 0 && task.legacyArtifacts.length === 0 ? '<div class="legacy">历史证据不可用；不据此伪造完成状态。</div>' : '';
     const stageRefs = task.legacyArtifacts.length > 0 ? `<details class="legacy"><summary>阶段证据参考（未验证）</summary><ul>${task.legacyArtifacts.map((artifact) => `<li>${escapeHtml(artifact.createdAt)} · ${renderRecordedText(artifact.label)} · 证据路径：${escapeHtml(artifact.reference)}</li>`).join('')}</ul></details>` : '';
     const failures = task.failureHistory.length > 0 ? `<details class="warning"><summary>失败 / 阻塞事件（${task.failureHistory.length}）</summary><ul>${task.failureHistory.map((failure) => `<li>${escapeHtml(failure.createdAt)} · 阶段：${renderRecordedText(failure.attemptedStage)} · 领域：${escapeHtml(reportEnumLabel(REPORT_FAILURE_DOMAIN_LABELS, failure.failureDomain, '未识别领域'))} · 分类：${escapeHtml(reportEnumLabel(REPORT_FAILURE_CLASS_LABELS, failure.failureClass, '未识别分类'))} · ${renderRecordedText(failure.commandSummary)}</li>`).join('')}</ul></details>` : '';
+    const repairs = task.incidentalRepairs.length > 0 ? `<details class="review"><summary>同任务有界附带修复（${task.incidentalRepairs.length}）</summary>${task.incidentalRepairs.map((repair) => `<div><strong>${escapeHtml(repair.repairId)}</strong> · 第 ${repair.attemptCount} 次尝试 · 功能域：${renderRecordedText(repair.functionalDomain)}<br><strong>原始阻塞：</strong>${renderRecordedText(repair.originalBlocker)}<br><strong>为何仍属原目标：</strong>${renderRecordedText(repair.sameObjectiveReason)}<br><strong>风险判断：</strong>${renderRecordedText(repair.riskAssessment)}<ul>${repair.affectedFiles.map((file) => `<li><code>${escapeHtml(file.path)}</code> · ${escapeHtml(file.changeType)} · ${renderRecordedText(file.reason)}</li>`).join('')}</ul><small>RED 证据 ${repair.redEvidence.length} 条 · GREEN 证据 ${repair.greenEvidence.length} 条；此记录不计入失败、替换或熔断。</small></div>`).join('')}</details>` : '';
+    const recovery = task.controlPlaneRecovery ? `<div class="diagnostic"><strong>控制面候选恢复：</strong>${escapeHtml(task.controlPlaneRecovery.status === 'completion_only' ? '仅允许重新提交 completion' : task.controlPlaneRecovery.status === 'completed' ? '同一候选已恢复并完成' : '已取消')} · Skill ${escapeHtml(task.controlPlaneRecovery.skillVersion)} · 候选 ${escapeHtml(task.controlPlaneRecovery.candidateCommit)}<br>${renderRecordedText(task.controlPlaneRecovery.reason)}<br><small>历史失败保留；不计 worker 机械返工、replacement 或 objective fuse。</small></div>` : '';
     const diagnostics = task.diagnostics.length > 0 ? `<details class="legacy"><summary>诊断价值裁决（${task.diagnostics.length}）</summary><ul>${task.diagnostics.map((diagnostic) => `<li>${escapeHtml(reportEnumLabel(REPORT_DIAGNOSTIC_LABELS, diagnostic.classification, '未识别诊断分类'))} · ${renderRecordedText(diagnostic.summary)}</li>`).join('')}</ul></details>` : '';
     const objective = task.objective ? `<div class="legacy"><strong>任务目标：</strong>技术标识 ${escapeHtml(task.objective.objectiveId)} · 已替换 ${task.objective.replacementCount}/${OBJECTIVE_FUSE_REPLACEMENT_LIMIT} 次 · 累计执行 ${escapeHtml(compactChineseDuration(task.objective.cumulativeExecutionMs / 1000))}${task.objective.fuseOpen ? ` · 已熔断：${task.objective.reasons.map(renderRecordedText).join('；')}` : ''}</div>` : '';
     const closeout = task.closeout ? `<div class="review"><strong>事故收口：</strong>${renderRecordedText(task.closeout.userVisibleSummary)} · 通知状态：${escapeHtml(({ sent: '已发送', pending: '待发送', failed: '发送失败' })[task.closeout.notificationStatus] ?? `未识别（${task.closeout.notificationStatus}）`)} · 报告状态：${escapeHtml(({ synced: '已同步', pending: '待同步', failed: '同步失败' })[task.closeout.reportStatus] ?? `未识别（${task.closeout.reportStatus}）`)}</div>` : '';
@@ -3571,7 +3737,7 @@ function renderDeliveryReport(data) {
       : '';
     const timeDiagnostic = task.timeDiagnostic.status === 'observed' ? `<div class="diagnostic"><strong>时间证据：</strong>任务外空档 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.taskOutsideScopeSeconds))}（不计入任务） · 活跃执行 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.activeTurnUnionSeconds))} · 活跃执行内无法归因 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.unknownSeconds))}（${Math.round(task.timeDiagnostic.unknownRatio * 100)}%） · 工具调用 ${escapeHtml(compactChineseDuration(task.timeDiagnostic.toolUnionSeconds))} · 上下文峰值占比 ${task.timeDiagnostic.contextPeakRatio === null ? '不可用' : `${Math.round(task.timeDiagnostic.contextPeakRatio * 100)}%`} · 上下文压缩 ${task.timeDiagnostic.compactions} 次</div>` : '';
     const routeSummary = `${reportEnumLabel(REPORT_TASK_MODE_LABELS, task.taskMode, '未识别任务模式')} · ${reportEnumLabel(REPORT_MODEL_LABELS, task.model, '未识别模型')} · ${reportEnumLabel(REPORT_THINKING_LABELS, task.thinking, '未识别推理强度')} · 第 ${task.attemptCount} 次尝试`;
-    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${renderRecordedText(task.title)}</h2><p>${escapeHtml(routeSummary)}</p><small>模型技术标识：${escapeHtml(task.model)}</small></div><span class="badge ${taskStatusClass(task)}">${escapeHtml(taskStatusLabel(task))}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${renderRecordedText(task.blocker)}</div>` : ''}${closeout}${integrationEvidence}${timeDiagnostic}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${renderRecordedText(task.nextGate)}</div></section>`;
+    return `<section><div class="task-head"><div><h2>${escapeHtml(task.displayKey)} · ${renderRecordedText(task.title)}</h2><p>${escapeHtml(routeSummary)}</p><small>模型技术标识：${escapeHtml(task.model)} · 范围策略：${escapeHtml(task.scopePolicy === 'bounded_incidental' ? '允许有界同域小修' : task.scopePolicy === 'strict_scope' ? '严格范围' : '不适用')}</small></div><span class="badge ${taskStatusClass(task)}">${escapeHtml(taskStatusLabel(task))}</span></div>${objective}${task.blocker ? `<div class="warning"><strong>当前阻塞：</strong>${renderRecordedText(task.blocker)}</div>` : ''}${closeout}${integrationEvidence}${timeDiagnostic}${recovery}${repairs}${failures}${diagnostics}${packages}${legacy}${stageRefs}<div class="next"><strong>下一门禁：</strong>${renderRecordedText(task.nextGate)}</div></section>`;
   }).join('');
   const integrated = data.tasks.filter((task) => task.status === 'integrated' && (!implementationTask(task) || task.integrationProof !== null)).length;
   const unverifiedIntegrated = data.tasks.filter((task) => task.status === 'integrated' && implementationTask(task) && task.integrationProof === null).length;
@@ -3912,6 +4078,7 @@ async function readArtifact(filePath, expectedType) {
   if (expectedType === 'task_completed' && value.resultManifest !== undefined && !isObject(value.resultManifest)) fail(code, 'completion event resultManifest 无效');
   if (expectedType === 'task_progress' && value.stageId !== undefined && value.stageId !== null && !nonEmpty(value.stageId)) fail(code, 'progress event stageId 无效');
   if (expectedType === 'task_progress' && value.evidence !== undefined && !Array.isArray(value.evidence)) fail(code, 'progress event evidence 无效');
+  if (expectedType === 'incidental_repair' && (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !isSafeThreadId(value.repairId))) fail(code, '附带修复 event attemptCount 或 repairId 无效');
   if (FAILURE_EVENT_TYPES.includes(expectedType)) {
     if (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !nonEmpty(value.attemptedStage) || !has(value.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(value.failureDomain, FAILURE_DOMAINS) || !nonEmpty(value.commandSummary) || !Array.isArray(value.evidence) || value.evidence.length === 0 || typeof value.mechanicalRetryEligible !== 'boolean' || !has(value.authority ?? 'contract_evidence', FAILURE_AUTHORITIES) || (value.failureMode !== undefined && !has(value.failureMode, EVIDENCE_FAILURE_MODES)) || (value.recoveryExhausted !== undefined && typeof value.recoveryExhausted !== 'boolean')) fail(code, 'failure event 字段无效');
   }
@@ -3973,6 +4140,22 @@ export async function controllerIngestProgress(input) {
   }});
 }
 
+export async function controllerIngestIncidentalRepair(input) {
+  const home = resolveTaskControlHome(input);
+  const paths = pathsFor(home, input.projectRoot);
+  const event = await readArtifact(input.eventPath, 'incidental_repair');
+  if (event.projectKey !== paths.projectKey) fail('PROJECT_MISMATCH', '附带修复 event projectKey 不匹配');
+  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: event.threadId, heartbeatReason: 'progress', mutate: async (task) => {
+    if (task.status !== 'executing' || !currentAttemptDispatched(task) || event.attemptCount !== task.attemptCount) fail('EVENT_STALE', '附带修复 event 不属于当前执行轮次');
+    if ((task.incidentalRepairs ?? []).some((repair) => repair.repairId === event.repairId)) fail('EVENT_STALE', `附带修复 ${event.repairId} 已入账`);
+    const latestRepairAt = (task.incidentalRepairs ?? []).filter((repair) => repair.attemptCount === task.attemptCount).map((repair) => repair.createdAt).sort().at(-1);
+    if (latestRepairAt && Date.parse(event.createdAt) <= Date.parse(latestRepairAt)) fail('EVENT_STALE', '附带修复 event 过期或顺序无效');
+    await assertImplementationContractCurrent(task, input.projectRoot);
+    const repair = validateIncidentalRepairReceipt(event, task);
+    return appendObservabilityReceipt({ ...task, incidentalRepairs: [...task.incidentalRepairs, repair], incidentalRepairEventCreatedAt: event.createdAt, updatedAt: new Date().toISOString() }, 'incidental_repair_ingested', event.createdAt);
+  }});
+}
+
 export async function controllerIngestCompletion(input) {
   const home = resolveTaskControlHome(input);
   const paths = pathsFor(home, input.projectRoot);
@@ -3995,17 +4178,24 @@ export async function controllerIngestCompletion(input) {
       const completedStages = completedStageIds(task);
       if (!Array.isArray(event.completedStages) || !Array.isArray(event.missingStages) || event.missingStages.length > 0 || JSON.stringify(event.completedStages) !== JSON.stringify(completedStages)) fail('EVENT_CONTRACT_MISMATCH', 'completion event 阶段摘要与台账不一致');
     }
+    const pendingRepairs = await pendingIncidentalRepairs(paths, task, event.createdAt);
+    if (pendingRepairs.length > 0) fail('INCIDENTAL_REPAIR_INGEST_REQUIRED', `完成入账前必须先按时间顺序入账附带修复: ${pendingRepairs.map((repair) => repair.repairId).join(', ')}`);
     let deliverableHistory = task.deliverableHistory;
+    let controlPlaneRecovery = task.controlPlaneRecovery ?? null;
     if (task.resultProtocolVersion === RESULT_PROTOCOL_VERSION) {
       if (!isObject(event.resultManifest) || !nonEmpty(event.resultManifest.resultManifestPath)) fail('RESULT_MANIFEST_REQUIRED', 'result protocol completion event 缺少成果包快照');
       const currentResult = await loadResultManifest(input.projectRoot, event.resultManifest.resultManifestPath, task, event.candidateCommit);
       if (currentResult.resultManifestDigest !== event.resultManifest.resultManifestDigest || JSON.stringify(currentResult) !== JSON.stringify(event.resultManifest)) fail('RESULT_MANIFEST_DRIFT', 'completion event 的成果包快照与当前文件不一致');
+      if (controlPlaneRecovery?.status === 'completion_only') {
+        if (event.candidateCommit !== controlPlaneRecovery.candidateCommit || currentResult.resultManifestPath.toLowerCase() !== controlPlaneRecovery.resultManifestPath.toLowerCase() || currentResult.resultManifestDigest !== controlPlaneRecovery.resultManifestDigest) fail('CONTROL_PLANE_RECOVERY_CANDIDATE_DRIFT', 'completion event 不再匹配冻结的控制面恢复候选');
+        controlPlaneRecovery = { ...controlPlaneRecovery, status: 'completed', completedAt: event.createdAt };
+      }
       if (deliverableHistory.some((entry) => entry.attempt === task.attemptCount || entry.resultManifestDigest === currentResult.resultManifestDigest)) fail('RESULT_MANIFEST_REPLAY', '当前 attempt 或 result manifest 已入账');
       deliverableHistory = [...deliverableHistory, { ...currentResult, recordedAt: event.createdAt, reviewStatus: 'pending', reviewReason: null, selectedArtifactIds: [], reviewedAt: null, deliveryStatus: 'candidate' }];
     } else if (event.resultManifest !== undefined) {
       fail('RESULT_MANIFEST_NOT_APPLICABLE', 'legacy completion event 不得伪造 result manifest');
     }
-    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() }, 'completion_ingested', event.createdAt);
+    return appendObservabilityReceipt({ ...task, controlPlaneRecovery, deliverableHistory, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() }, 'completion_ingested', event.createdAt);
   }});
 }
 
@@ -4040,7 +4230,7 @@ async function listTaskEventFiles(paths, task) {
     fail('EVENT_SCAN_FAILED', `无法扫描 ${taskEventDir}: ${error instanceof Error ? error.message : String(error)}`);
   }
   return entries
-    .filter((entry) => entry.isFile() && (entry.name.startsWith('completion-') || entry.name.startsWith('progress-') || entry.name.startsWith('task-failed-') || entry.name.startsWith('task-blocked-') || entry.name.startsWith('notification-failed-')) && entry.name.endsWith('.json'))
+    .filter((entry) => entry.isFile() && (entry.name.startsWith('completion-') || entry.name.startsWith('progress-') || entry.name.startsWith('incidental-repair-') || entry.name.startsWith('task-failed-') || entry.name.startsWith('task-blocked-') || entry.name.startsWith('notification-failed-')) && entry.name.endsWith('.json'))
     .map((entry) => join(taskEventDir, entry.name));
 }
 
@@ -4048,6 +4238,7 @@ function artifactTypeForPath(eventPath) {
   const name = basename(eventPath);
   if (name.startsWith('completion-')) return 'task_completed';
   if (name.startsWith('progress-')) return 'task_progress';
+  if (name.startsWith('incidental-repair-')) return 'incidental_repair';
   if (name.startsWith('task-failed-')) return 'task_failed';
   if (name.startsWith('task-blocked-')) return 'task_blocked';
   if (name.startsWith('notification-failed-')) return 'notification_failed';
@@ -4057,6 +4248,7 @@ function artifactTypeForPath(eventPath) {
 function eventFreshnessAnchor(task, type) {
   if (type === 'notification_failed') return task.completionEventCreatedAt ?? task.updatedAt;
   if (type === 'task_progress') return latestTimestamp(task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
+  if (type === 'incidental_repair') return latestTimestamp(task.incidentalRepairEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
   if (FAILURE_EVENT_TYPES.includes(type)) return latestTimestamp(task.failureEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
   return latestTimestamp(task.completionEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt) ?? task.updatedAt;
 }
@@ -4070,7 +4262,7 @@ function heartbeatRruleCount(value) {
 function controllerBusinessFingerprint(registry, controllerThreadId, pendingEvents, parallel) {
   const tasks = registry.tasks
     .filter((task) => task.directControllerThreadId === controllerThreadId)
-    .map((task) => ({ threadId: task.threadId, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, updatedAt: task.updatedAt, lastDispatchedAt: task.lastDispatchedAt ?? null, progressEventCreatedAt: task.progressEventCreatedAt ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, candidateCommit: task.candidateCommit ?? null, notificationStatus: task.notificationStatus }))
+    .map((task) => ({ threadId: task.threadId, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, updatedAt: task.updatedAt, lastDispatchedAt: task.lastDispatchedAt ?? null, progressEventCreatedAt: task.progressEventCreatedAt ?? null, incidentalRepairEventCreatedAt: task.incidentalRepairEventCreatedAt ?? null, controlPlaneRecoveryStatus: task.controlPlaneRecovery?.status ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, candidateCommit: task.candidateCommit ?? null, notificationStatus: task.notificationStatus }))
     .sort((left, right) => left.threadId.localeCompare(right.threadId));
   const events = pendingEvents.map((event) => ({ type: event.type, threadId: event.threadId, createdAt: event.createdAt, eventPath: event.eventPath })).sort((left, right) => left.eventPath.localeCompare(right.eventPath));
   const messages = registry.controllerMessages
@@ -4178,7 +4370,7 @@ function staleHeartbeatResult(registry, state, input, reason, extra = {}) {
 }
 
 function stalledActiveTask(task, now = Date.now()) {
-  const lastObservedAt = latestTimestamp(task.progressEventCreatedAt, task.lastDispatchedAt);
+  const lastObservedAt = latestTimestamp(task.controlPlaneRecovery?.status === 'completion_only' ? task.controlPlaneRecovery.preparedAt : null, task.incidentalRepairEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt);
   if (!isTimestamp(lastObservedAt)) return null;
   const intervalMs = heartbeatIntervalForTask(task);
   const stallAfterMs = Math.max(intervalMs * 2, 10 * 60 * 1000);
@@ -4187,9 +4379,10 @@ function stalledActiveTask(task, now = Date.now()) {
   const missingStages = missingRequiredStageIds(task);
   const reasons = ['lease_expired'];
   if (missingStages.length > 0) reasons.push('required_stage_not_advancing');
-  if (!nonEmpty(task.candidateCommit) && !isTimestamp(task.completionEventCreatedAt)) reasons.push('no_candidate_or_completion');
+  const candidateCommit = task.candidateCommit ?? task.controlPlaneRecovery?.candidateCommit ?? null;
+  if (!nonEmpty(candidateCommit) && !isTimestamp(task.completionEventCreatedAt)) reasons.push('no_candidate_or_completion');
   if (task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION && ageMs >= task.objectiveBudgetMinutes * 60 * 1000) reasons.push('attempt_budget_exceeded');
-  return { threadId: task.threadId, displayKey: task.displayKey, objectiveId: task.objectiveId, attemptCount: task.attemptCount, lastObservedAt, ageMs, stallAfterMs, missingStages, candidateCommit: task.candidateCommit, completionEventCreatedAt: task.completionEventCreatedAt ?? null, reasons };
+  return { threadId: task.threadId, displayKey: task.displayKey, objectiveId: task.objectiveId, attemptCount: task.attemptCount, lastObservedAt, ageMs, stallAfterMs, missingStages, candidateCommit, completionEventCreatedAt: task.completionEventCreatedAt ?? null, reasons };
 }
 
 function incidentSummary(task) {
@@ -4259,9 +4452,10 @@ export async function controllerScanPendingEvents(input) {
       if (type === 'task_completed' && task.status !== 'executing') continue;
       if (type === 'task_completed' && artifact.attemptCount !== undefined && artifact.attemptCount !== task.attemptCount) continue;
       if (type === 'task_progress' && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
+      if (type === 'incidental_repair' && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
       if (FAILURE_EVENT_TYPES.includes(type) && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
       if (type === 'notification_failed' && task.notificationStatus !== 'pending') continue;
-      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...contractSummary(task), ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : type === 'task_progress' ? { attemptCount: artifact.attemptCount, summary: artifact.summary, stageId: artifact.stageId ?? null, evidence: artifact.evidence ?? [] } : FAILURE_EVENT_TYPES.includes(type) ? { attemptCount: artifact.attemptCount, attemptedStage: artifact.attemptedStage, failureClass: artifact.failureClass, failureDomain: artifact.failureDomain, commandSummary: artifact.commandSummary, evidenceCommandId: artifact.evidenceCommandId ?? null, authority: artifact.authority ?? 'contract_evidence', evidence: artifact.evidence, mechanicalRetryEligible: artifact.mechanicalRetryEligible } : { reason: artifact.reason }) });
+      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...contractSummary(task), ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : type === 'task_progress' ? { attemptCount: artifact.attemptCount, summary: artifact.summary, stageId: artifact.stageId ?? null, evidence: artifact.evidence ?? [] } : type === 'incidental_repair' ? { attemptCount: artifact.attemptCount, repairId: artifact.repairId, originalBlocker: artifact.originalBlocker, sameObjectiveReason: artifact.sameObjectiveReason, functionalDomain: artifact.functionalDomain, affectedFiles: artifact.affectedFiles, conflictDomains: artifact.conflictDomains, riskAssessment: artifact.riskAssessment, redEvidence: artifact.redEvidence, greenEvidence: artifact.greenEvidence } : FAILURE_EVENT_TYPES.includes(type) ? { attemptCount: artifact.attemptCount, attemptedStage: artifact.attemptedStage, failureClass: artifact.failureClass, failureDomain: artifact.failureDomain, commandSummary: artifact.commandSummary, evidenceCommandId: artifact.evidenceCommandId ?? null, authority: artifact.authority ?? 'contract_evidence', evidence: artifact.evidence, mechanicalRetryEligible: artifact.mechanicalRetryEligible } : { reason: artifact.reason }) });
     }
   }
   pendingEvents.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.eventPath.localeCompare(right.eventPath));
@@ -4269,7 +4463,7 @@ export async function controllerScanPendingEvents(input) {
   const activeTaskRecords = directTasks.filter((task) => task.status === 'executing' && currentAttemptDispatched(task));
   const activeTasks = activeTaskRecords.map((task) => {
     const intervalMs = heartbeatIntervalForTask(task);
-    const lastObservedAt = latestTimestamp(task.progressEventCreatedAt, task.lastDispatchedAt);
+    const lastObservedAt = latestTimestamp(task.controlPlaneRecovery?.status === 'completion_only' ? task.controlPlaneRecovery.preparedAt : null, task.incidentalRepairEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt);
     return { threadId: task.threadId, displayKey: task.displayKey, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, notificationStatus: task.notificationStatus, lastObservedAt, heartbeatIntervalMs: intervalMs, heartbeatDueAt: new Date(Date.parse(lastObservedAt) + intervalMs).toISOString() };
   });
   const overdueTasks = activeTasks.filter((task) => Date.parse(task.heartbeatDueAt) <= now);
@@ -4463,6 +4657,21 @@ export async function controllerRecoverUndispatchedAttempt(input) {
   }});
 }
 
+export async function controllerRecoverControlPlaneCandidate(input) {
+  if (!has(input.controlPlaneComponent, CONTROL_PLANE_RECOVERY_COMPONENTS) || input.skillVersion !== TASK_CONTROL_VERSION || !nonEmpty(input.reason) || input.reason.trim().length < 20 || !nonEmpty(input.hostReceipt) || !nonEmpty(input.candidateCommit) || !nonEmpty(input.resultManifestPath)) fail('CLI_INVALID_ARGUMENTS', `控制面候选恢复必须记录 component、当前版本 ${TASK_CONTROL_VERSION}、候选、manifest、不少于 20 字符的原因和真实 host receipt`);
+  return mutateController({ ...input, heartbeatReason: 'dispatch', mutate: async (task) => {
+    if (task.status !== 'changes_requested' || task.executionStatus !== 'stopped' || !currentAttemptDispatched(task) || !implementationTask(task) || !isObject(task.parallelWorktreeIdentity)) fail('CONTROL_PLANE_RECOVERY_NOT_ELIGIBLE', '只允许恢复已有真实派发、登记候选 worktree 且已因控制面停止的 implementation 任务');
+    if (task.pendingRework !== null || (task.controlPlaneRecovery !== null && task.controlPlaneRecovery !== undefined)) fail('CONTROL_PLANE_RECOVERY_ALREADY_EXISTS', '任务已有返工或控制面候选恢复记录');
+    const failure = [...task.failureHistory].reverse().find((entry) => entry.attemptCount === task.attemptCount && entry.createdAt === task.failureEventCreatedAt);
+    if (!failure || !['tooling', 'contract'].includes(failure.failureDomain) || failureValueClassForDomain(failure.failureDomain) !== 'control_plane') fail('CONTROL_PLANE_RECOVERY_FAILURE_INELIGIBLE', '只有 tooling/contract 的 task-control 控制面失败可以恢复同一候选');
+    const resultManifest = await loadResultManifest(input.projectRoot, input.resultManifestPath, task, input.candidateCommit);
+    if (resultManifest.sourceWorkspace.workspaceRole !== 'candidate_worktree') fail('CONTROL_PLANE_RECOVERY_WORKTREE_REQUIRED', '控制面恢复必须绑定已验证的 candidate worktree 成果');
+    const now = new Date().toISOString();
+    const controlPlaneRecovery = { schemaVersion: CONTROL_PLANE_RECOVERY_PROTOCOL_VERSION, recoveryId: `control-recovery-${randomUUID()}`, status: 'completion_only', component: input.controlPlaneComponent, attemptCount: task.attemptCount, candidateCommit: resultManifest.candidateCommit, resultManifestPath: resultManifest.resultManifestPath, resultManifestDigest: resultManifest.resultManifestDigest, sourceWorkspace: resultManifest.sourceWorkspace, skillVersion: input.skillVersion, reason: input.reason.trim(), hostReceipt: input.hostReceipt.trim(), preparedAt: now, completedAt: null, cancelledAt: null };
+    return appendObservabilityReceipt({ ...task, controlPlaneRecovery, status: 'executing', executionStatus: 'running', nextOwner: 'worker', failureClass: null, changesRequestedReason: null, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'control_plane_candidate_recovered', now);
+  }});
+}
+
 function newCloseout(input, now) {
   if (!nonEmpty(input.userSummary)) fail('CLOSEOUT_SUMMARY_REQUIRED', 'reclaim/blocked 必须提供用户可见 incident summary');
   return { status: 'pending', userVisibleSummary: input.userSummary.trim(), notificationStatus: 'pending', notificationSentAt: null, reportStatus: 'pending', reportSyncedAt: null, createdAt: now };
@@ -4471,10 +4680,11 @@ function newCloseout(input, now) {
 export async function controllerReclaimTask(input) {
   if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'reclaim reason 不能为空');
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
-    if (task.status !== 'changes_requested' && task.status !== 'awaiting_review') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 由主控收回`);
+    if (task.status !== 'changes_requested' && task.status !== 'awaiting_review' && !(task.status === 'executing' && task.controlPlaneRecovery?.status === 'completion_only')) fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 由主控收回`);
     const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
     const now = new Date().toISOString();
-    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'reclaimed', executionStatus: 'terminal', nextOwner: 'controller', reclaimedReason: input.reason.trim(), closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now }, 'reclaimed', now);
+    const controlPlaneRecovery = task.controlPlaneRecovery?.status === 'completion_only' ? { ...task.controlPlaneRecovery, status: 'cancelled', cancelledAt: now } : (task.controlPlaneRecovery ?? null);
+    return appendObservabilityReceipt({ ...task, controlPlaneRecovery, deliverableHistory, status: 'reclaimed', executionStatus: 'terminal', nextOwner: 'controller', reclaimedReason: input.reason.trim(), closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now }, 'reclaimed', now);
   }});
 }
 
@@ -4489,7 +4699,8 @@ export async function controllerMarkBlocked(input) {
     }
     const deliverableHistory = task.status === 'awaiting_review' ? reviewCurrentDeliverable(task, 'rejected', input.reason) : task.deliverableHistory;
     const now = new Date().toISOString();
-    return appendObservabilityReceipt({ ...task, deliverableHistory, status: 'blocked', executionStatus: 'terminal', nextOwner: 'none', blockedReason: input.reason.trim(), blockerSource: input.blockerSource, blockedDiagnosticId: input.diagnosticId ?? null, closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now }, 'blocked', now);
+    const controlPlaneRecovery = task.controlPlaneRecovery?.status === 'completion_only' ? { ...task.controlPlaneRecovery, status: 'cancelled', cancelledAt: now } : (task.controlPlaneRecovery ?? null);
+    return appendObservabilityReceipt({ ...task, controlPlaneRecovery, deliverableHistory, status: 'blocked', executionStatus: 'terminal', nextOwner: 'none', blockedReason: input.reason.trim(), blockerSource: input.blockerSource, blockedDiagnosticId: input.diagnosticId ?? null, closeout: newCloseout(input, now), executionEndedAt: task.executionEndedAt ?? now, updatedAt: now }, 'blocked', now);
   }});
 }
 
@@ -4674,8 +4885,52 @@ export function buildFailureNotification(task, eventType, attemptedStage) {
   return `任务已停止并提交 ${eventType}。任务：${identity}。失败阶段：${attemptedStage}。请主控立即读取台账事件并裁决。`;
 }
 
+function assertWorkerActionAllowedDuringRecovery(task, action) {
+  if (task.controlPlaneRecovery?.status === 'completion_only' && action !== 'complete') fail('CONTROL_PLANE_RECOVERY_COMPLETION_ONLY', '该任务仅恢复原候选 completion；禁止重跑、改业务、提交 progress/repair/failure');
+}
+
+export async function createIncidentalRepairEvent(input) {
+  const result = await querySelf(input);
+  assertWorkerActionAllowedDuringRecovery(result.task, 'incidental_repair');
+  if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能登记附带修复');
+  if (!adaptiveBriefTask(result.task) || result.task.scopePolicy !== 'bounded_incidental') fail('INCIDENTAL_REPAIR_NOT_ALLOWED', '当前任务使用 strict scope 或 hard contract；发现缺陷后必须交回直接主控');
+  await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
+  const repairId = nonEmpty(input.repairId) ? input.repairId.trim() : `repair-${randomUUID()}`;
+  if (!Array.isArray(input.riskFlags) || input.riskFlags.some((flag) => !INCIDENTAL_REPAIR_RISK_FLAGS.includes(flag))) fail('INCIDENTAL_REPAIR_RISK_INVALID', 'riskFlags 必须是已知受保护风险标志数组');
+  const riskFlags = Object.fromEntries(INCIDENTAL_REPAIR_RISK_FLAGS.map((flag) => [flag, input.riskFlags?.includes(flag) ? true : false]));
+  const receipt = {
+    schemaVersion: INCIDENTAL_REPAIR_PROTOCOL_VERSION,
+    type: 'incidental_repair',
+    projectKey: result.registry.projectKey,
+    threadId: result.task.threadId,
+    parentThreadId: result.task.parentThreadId,
+    controllerThreadId: result.task.directControllerThreadId,
+    displayKey: result.task.displayKey,
+    title: result.task.title,
+    attemptCount: result.task.attemptCount,
+    repairId,
+    originalBlocker: input.originalBlocker,
+    sameObjectiveReason: input.sameObjectiveReason,
+    functionalDomain: input.functionalDomain,
+    affectedFiles: input.affectedFiles,
+    conflictDomains: input.conflictDomains ?? [],
+    localOnly: input.localOnly,
+    reversible: input.reversible,
+    ...riskFlags,
+    riskAssessment: input.riskAssessment,
+    redEvidence: input.redEvidence ?? [],
+    greenEvidence: input.greenEvidence ?? [],
+    contractVersion: contractVersion(result.task),
+    contractDigest: result.task.contractDigest,
+    createdAt: new Date().toISOString(),
+  };
+  const normalized = validateIncidentalRepairReceipt(receipt, result.task);
+  return writeChildArtifact(result.paths, result.task.threadId, 'incidental-repair', normalized);
+}
+
 export async function createFailureEvent(input) {
   const result = await querySelf(input);
+  assertWorkerActionAllowedDuringRecovery(result.task, 'failure');
   if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交失败事件');
   if (!FAILURE_EVENT_TYPES.includes(input.eventType) || !nonEmpty(input.attemptedStage) || !has(input.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(input.failureDomain, FAILURE_DOMAINS) || !nonEmpty(input.commandSummary) || typeof input.mechanicalRetryEligible !== 'boolean') fail('CLI_INVALID_ARGUMENTS', 'report-failure 参数不完整');
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
@@ -4706,6 +4961,7 @@ export async function createFailureEvent(input) {
 
 export async function createProgressEvent(input) {
   const result = await querySelf(input);
+  assertWorkerActionAllowedDuringRecovery(result.task, 'progress');
   if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交进度');
   if (!nonEmpty(input.summary)) fail('CLI_INVALID_ARGUMENTS', 'progress summary 不能为空');
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
@@ -4716,15 +4972,20 @@ export async function createProgressEvent(input) {
 
 export async function createCompletionEvent(input) {
   const result = await querySelf(input);
+  assertWorkerActionAllowedDuringRecovery(result.task, 'complete');
   if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，任务不得提交 completion');
   if (input.status !== undefined && input.status !== 'awaiting_review') fail('CHILD_STATUS_FORBIDDEN', '子任务只能提交 awaiting_review');
   if (!nonEmpty(input.candidateCommit)) fail('CLI_INVALID_ARGUMENTS', 'candidateCommit 不能为空');
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
   const summary = contractSummary(result.task);
   if (summary.missingStages.length > 0) fail('REQUIRED_STAGE_INCOMPLETE', `完成前仍缺少 required stage: ${summary.missingStages.join(', ')}`);
+  const pendingRepairs = await pendingIncidentalRepairs(result.paths, result.task);
+  const manifestTask = pendingRepairs.length === 0 ? result.task : { ...result.task, incidentalRepairs: [...result.task.incidentalRepairs, ...pendingRepairs] };
   const resultManifest = result.task.resultProtocolVersion === RESULT_PROTOCOL_VERSION
-    ? await loadResultManifest(result.registry.projectRoot, input.resultManifestPath, result.task, input.candidateCommit)
+    ? await loadResultManifest(result.registry.projectRoot, input.resultManifestPath, manifestTask, input.candidateCommit)
     : null;
+  const recovery = result.task.controlPlaneRecovery;
+  if (recovery?.status === 'completion_only' && (input.candidateCommit !== recovery.candidateCommit || resultManifest === null || resultManifest.resultManifestPath.toLowerCase() !== recovery.resultManifestPath.toLowerCase() || resultManifest.resultManifestDigest !== recovery.resultManifestDigest)) fail('CONTROL_PLANE_RECOVERY_CANDIDATE_DRIFT', '控制面恢复只允许重新提交已冻结的同一 candidate commit 和 result manifest');
   return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, attemptCount: result.task.attemptCount, status: 'awaiting_review', candidateCommit: input.candidateCommit, ...summary, ...(resultManifest === null ? {} : { resultManifest }), createdAt: new Date().toISOString() });
 }
 
@@ -4778,6 +5039,20 @@ function parseEvidenceReferences(values) {
   });
 }
 
+function parseAffectedFiles(values) {
+  return values.map((value) => {
+    const parts = value.split('|');
+    if (parts.length !== 3 || !parts.every(nonEmpty)) fail('CLI_INVALID_ARGUMENTS', '--affected-file 必须使用 path|added|modified|deleted|generated|reason');
+    return { path: parts[0], changeType: parts[1], reason: parts[2] };
+  });
+}
+
+function parseRiskFlags(values) {
+  const unknown = values.filter((value) => !INCIDENTAL_REPAIR_RISK_FLAGS.includes(value));
+  if (unknown.length > 0) fail('CLI_INVALID_ARGUMENTS', `未知 --risk-flag: ${unknown.join(', ')}`);
+  return [...new Set(values)];
+}
+
 function requiredBoolean(args, name) {
   const value = required(args, name);
   if (!['true', 'false'].includes(value)) fail('CLI_INVALID_ARGUMENTS', `${name} 必须是 true 或 false`);
@@ -4793,17 +5068,20 @@ function optionalBoolean(args, name, defaultValue = false) {
 
 function helpText() {
   return [
-    'codex-task-control v0.18.0',
+    'codex-task-control v0.19.0',
     '',
     '实施简报与风险合同命令：',
     '  audit-implementation-contract --project-root <root> --contract <project-relative-json> --task-mode implementation|visual_implementation',
-    '  register ... --task-mode control_only|implementation|visual_implementation [--execution-policy adaptive_brief|hard_contract] [--implementation-brief <project-relative-json>] [--implementation-contract <project-relative-json> --hard-contract-trigger <high_risk_irreversible|shared_conflict|parallel_coordination|user_explicit> --hard-contract-reason <reason>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
+    '  register ... --task-mode control_only|implementation|visual_implementation [--execution-policy adaptive_brief|hard_contract] [--scope-policy bounded_incidental|strict_scope] [--implementation-brief <project-relative-json>] [--implementation-contract <project-relative-json> --hard-contract-trigger <high_risk_irreversible|shared_conflict|parallel_coordination|user_explicit> --hard-contract-reason <reason>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
     '  controller-plan-parallel-batch --project-root <root> --controller <id> --manifest <project-relative-json>',
     '  controller-evaluate-fanout --project-root <root> --controller <id> --batch-id <id>',
     '  controller-prepare-parallel-dispatch --project-root <root> --controller <id> --batch-id <id>',
     '  controller-close-parallel-batch --project-root <root> --controller <id> --batch-id <id>',
     '  audit-parallel-routing [--codex-home <CODEX_HOME>]',
     '  progress --self <thread> --summary <text> [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
+    '  incidental-repair --self <thread> --repair-id <id> --original-blocker <text> --same-objective-reason <text> --functional-domain <id> --affected-file <path|changeType|reason> --local-only true --reversible true --risk-assessment <text> --red-evidence-ref <id=reference> --green-evidence-ref <id=reference> [--conflict-domain <id> ...] [--risk-flag <flag> ...]',
+    '  controller-ingest-incidental-repair --project-root <root> --controller <id> --event <event.json>',
+    '  controller-recover-control-plane-candidate --project-root <root> --controller <id> --thread <id> --control-plane-component task_control_protocol --candidate-commit <sha> --result-manifest <path> --skill-version 0.19.0 --reason <reason> --host-receipt <receipt>',
     '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--evidence-command-id <contract-id>] [--evidence-ref <id=reference> ...]',
     '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json>',
     '  controller-query-deliverables --project-root <root> --controller <id>',
@@ -4831,7 +5109,7 @@ function helpText() {
     '  controller-recover-undispatched-attempt ... --reason <text>',
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
-    'implementation 默认使用 adaptive_brief：先探索真实链路，自主选择实现和验证；只有明确风险触发才允许 hard_contract。成果包必须报告实际影响文件、理由和验证依据。',
+    'implementation 默认使用 adaptive_brief + bounded_incidental：同目标、同功能域、本地可逆的小缺陷可登记附带修复并继续；strict_scope/hard_contract 仍 fail closed。成果包必须报告实际影响文件、理由和验证依据。',
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
     'heartbeat 使用单次 watchdog；连续两轮无业务变化自动熔断，删除只自动补偿一次，清理失败后必须人工确认并显式 resume。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
@@ -4885,6 +5163,12 @@ export async function runCli(args = process.argv.slice(2)) {
     const task = (await querySelf({ ...storage, selfThreadId })).task;
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildProgressNotification(task, summary), notificationRequired: true, ...contractSummary(task) };
   }
+  else if (command === 'incidental-repair') {
+    const selfThreadId = required(args, '--self');
+    const eventPath = await createIncidentalRepairEvent({ ...storage, selfThreadId, repairId: required(args, '--repair-id'), originalBlocker: required(args, '--original-blocker'), sameObjectiveReason: required(args, '--same-objective-reason'), functionalDomain: required(args, '--functional-domain'), affectedFiles: parseAffectedFiles(options(args, '--affected-file')), conflictDomains: options(args, '--conflict-domain'), localOnly: requiredBoolean(args, '--local-only'), reversible: requiredBoolean(args, '--reversible'), riskFlags: parseRiskFlags(options(args, '--risk-flag')), riskAssessment: required(args, '--risk-assessment'), redEvidence: parseEvidenceReferences(options(args, '--red-evidence-ref')), greenEvidence: parseEvidenceReferences(options(args, '--green-evidence-ref')) });
+    const task = (await querySelf({ ...storage, selfThreadId })).task;
+    result = { eventPath, parentThreadId: task.parentThreadId, notificationRequired: false, workerMayContinue: true, ...contractSummary(task) };
+  }
   else if (command === 'report-failure') {
     const selfThreadId = required(args, '--self');
     const eventType = required(args, '--event-type');
@@ -4894,12 +5178,13 @@ export async function runCli(args = process.argv.slice(2)) {
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildFailureNotification(task, eventType, attemptedStage), notificationRequired: true, ...contractSummary(task) };
   }
   else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason') });
-  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions'), taskMode: option(args, '--task-mode'), implementationPolicy: option(args, '--execution-policy'), implementationBriefPath: option(args, '--implementation-brief'), implementationContractPath: option(args, '--implementation-contract'), hardContractTrigger: option(args, '--hard-contract-trigger'), hardContractReason: option(args, '--hard-contract-reason'), replacementOfThreadId: option(args, '--replacement-of'), objectiveId: option(args, '--objective-id'), objectiveBudgetMinutes: option(args, '--objective-budget-minutes'), parallelPolicy: option(args, '--parallel-policy'), parallelBatchId: option(args, '--batch-id'), parallelCandidateId: option(args, '--candidate-id') });
+  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions'), taskMode: option(args, '--task-mode'), implementationPolicy: option(args, '--execution-policy'), scopePolicy: option(args, '--scope-policy'), implementationBriefPath: option(args, '--implementation-brief'), implementationContractPath: option(args, '--implementation-contract'), hardContractTrigger: option(args, '--hard-contract-trigger'), hardContractReason: option(args, '--hard-contract-reason'), replacementOfThreadId: option(args, '--replacement-of'), objectiveId: option(args, '--objective-id'), objectiveBudgetMinutes: option(args, '--objective-budget-minutes'), parallelPolicy: option(args, '--parallel-policy'), parallelBatchId: option(args, '--batch-id'), parallelCandidateId: option(args, '--candidate-id') });
   else if (command === 'controller-plan-parallel-batch') result = await controllerPlanParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), manifestPath: required(args, '--manifest') });
   else if (command === 'controller-evaluate-fanout') result = await controllerEvaluateParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
   else if (command === 'controller-prepare-parallel-dispatch') result = await controllerPrepareParallelDispatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
   else if (command === 'controller-close-parallel-batch') result = await controllerCloseParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
   else if (command === 'controller-ingest-progress') result = await controllerIngestProgress({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
+  else if (command === 'controller-ingest-incidental-repair') result = await controllerIngestIncidentalRepair({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-completion') result = await controllerIngestCompletion({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event') });
   else if (command === 'controller-ingest-failure') result = await controllerIngestFailure({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), eventPath: required(args, '--event'), eventType: required(args, '--event-type') });
   else if (command === 'controller-amend-implementation-contract') result = await controllerAmendImplementationContract({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), implementationContractPath: required(args, '--contract'), reason: required(args, '--reason'), hostReceipt: required(args, '--host-receipt') });
@@ -4930,6 +5215,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-confirm-rework-dispatched') result = await controllerConfirmReworkDispatched({ ...controllerInput(args), actionId: required(args, '--action-id'), hostReceipt: required(args, '--host-receipt') });
   else if (command === 'controller-cancel-prepared-rework') result = await controllerCancelPreparedRework({ ...controllerInput(args), reason: required(args, '--reason') });
   else if (command === 'controller-recover-undispatched-attempt') result = await controllerRecoverUndispatchedAttempt({ ...controllerInput(args), reason: required(args, '--reason') });
+  else if (command === 'controller-recover-control-plane-candidate') result = await controllerRecoverControlPlaneCandidate({ ...controllerInput(args), controlPlaneComponent: required(args, '--control-plane-component'), candidateCommit: required(args, '--candidate-commit'), resultManifestPath: required(args, '--result-manifest'), skillVersion: required(args, '--skill-version'), reason: required(args, '--reason'), hostReceipt: required(args, '--host-receipt') });
   else if (command === 'controller-reclaim') result = await controllerReclaimTask({ ...controllerInput(args), reason: required(args, '--reason'), userSummary: required(args, '--user-summary') });
   else if (command === 'mark-blocked') result = await controllerMarkBlocked({ ...controllerInput(args), reason: required(args, '--reason'), userSummary: required(args, '--user-summary'), blockerSource: required(args, '--blocker-source'), diagnosticId: option(args, '--diagnostic-id') });
   else if (command === 'controller-record-diagnostic') result = await controllerRecordDiagnostic({ ...controllerInput(args), diagnosticId: required(args, '--diagnostic-id'), classification: required(args, '--classification'), summary: required(args, '--summary'), playerImpact: option(args, '--player-impact'), normalLifecycleReproduction: option(args, '--normal-lifecycle-reproduction'), growthTrend: option(args, '--growth-trend'), whyBlocking: option(args, '--why-blocking'), evidenceRefs: parseEvidenceReferences(options(args, '--evidence-ref')) });

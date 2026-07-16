@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Visible-task control with adaptive implementation briefs"
-  default_prompt: "Use $codex-task-control to route visible tasks with an adaptive brief by default, escalate only real risks to hard contracts, and preserve reviewable evidence and safe handoff."
+  short_description: "Visible-task control with bounded same-task repairs"
+  default_prompt: "Use $codex-task-control to route visible tasks with bounded same-objective repairs, keep parallel results in their registered worktrees, recover task-control-only completion blockers without new tasks, escalate real risk, and preserve reviewable evidence."

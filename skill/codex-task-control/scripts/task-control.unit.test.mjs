@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -17,6 +17,7 @@ import {
   controllerConfirmReworkDispatched,
   controllerCancelPreparedRework,
   controllerRecoverUndispatchedAttempt,
+  controllerRecoverControlPlaneCandidate,
   controllerIngestCompletion,
   controllerIngestContextHealth,
   controllerSealCheckpoint,
@@ -25,6 +26,7 @@ import {
   controllerAcceptHandoff,
   controllerCancelHandoff,
   controllerIngestFailure,
+  controllerIngestIncidentalRepair,
   controllerIngestProgress,
   controllerIngestNotificationFailed,
   controllerMarkChangesRequested,
@@ -57,6 +59,7 @@ import {
   controllerScanPendingEvents,
   createCompletionEvent,
   createFailureEvent,
+  createIncidentalRepairEvent,
   createProgressEvent,
   createNotificationFailureReceipt,
   loadProjectAdapter,
@@ -168,6 +171,16 @@ async function createGitCandidate(projectRoot, label = 'candidate') {
   return execFileSync('git', ['-C', projectRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
 }
 
+async function createGitWorktreeFixture(projectRoot, worktreeRoot, branch = 'task/result-worktree') {
+  const baseCommit = await createGitCandidate(projectRoot, 'base');
+  execFileSync('git', ['-C', projectRoot, 'worktree', 'add', '-b', branch, worktreeRoot, baseCommit], { stdio: 'ignore' });
+  await writeFile(join(worktreeRoot, 'business-result.txt'), 'candidate business result\n', 'utf8');
+  execFileSync('git', ['-C', worktreeRoot, 'add', 'business-result.txt'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', worktreeRoot, 'commit', '-m', 'candidate business result'], { stdio: 'ignore' });
+  const candidateCommit = execFileSync('git', ['-C', worktreeRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  return { baseCommit, candidateCommit, branch };
+}
+
 async function assertForgedPredecessorCannotCreateVerification({ name, forge, expectedCode }) {
   const taskControlHome = await mkdtemp(join(tmpdir(), `codex-task-control-forged-${name}-home-`));
   const projectRoot = await mkdtemp(join(tmpdir(), `codex-task-control-forged-${name}-project-`));
@@ -253,9 +266,9 @@ function parallelRegistration(taskControlHome, projectRoot, candidate, threadId,
   };
 }
 
-async function writeResultManifest(taskControlHome, projectRoot, threadId, candidateCommit, { visual = false, mutate = null } = {}) {
+async function writeResultManifest(taskControlHome, projectRoot, threadId, candidateCommit, { visual = false, mutate = null, workspaceRoot = projectRoot, manifestRelativePath = null } = {}) {
   const task = (await querySelf({ taskControlHome, selfThreadId: threadId })).task;
-  const artifactDir = join(projectRoot, 'artifacts');
+  const artifactDir = join(workspaceRoot, 'artifacts');
   await mkdir(artifactDir, { recursive: true });
   const artifacts = [];
   if (visual) {
@@ -285,7 +298,8 @@ async function writeResultManifest(taskControlHome, projectRoot, threadId, candi
     artifacts,
   };
   if (mutate) manifest = mutate(manifest) ?? manifest;
-  const manifestPath = join(projectRoot, `result-${threadId}-${task.attemptCount}.json`);
+  const manifestPath = manifestRelativePath === null ? join(workspaceRoot, `result-${threadId}-${task.attemptCount}.json`) : join(workspaceRoot, manifestRelativePath);
+  await mkdir(dirname(manifestPath), { recursive: true });
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
   return manifestPath;
 }
@@ -686,6 +700,8 @@ test('implementation defaults to an adaptive brief and hard contract requires ex
     const input = implementationInput(taskControlHome, projectRoot);
     const adaptive = await controllerRegisterTask(input);
     assert.equal(adaptive.implementationPolicy, 'adaptive_brief');
+    assert.equal(adaptive.scopePolicy, 'bounded_incidental');
+    assert.deepEqual(adaptive.incidentalRepairs, []);
     assert.deepEqual(adaptive.allowedWritePaths, []);
     assert.deepEqual(adaptive.stageGates, []);
     assert.deepEqual(adaptive.evidenceCommands, []);
@@ -730,6 +746,193 @@ test('adaptive implementation explores freely and completes with actual files pl
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('adaptive visual acceptance keeps a same-domain reversible GUI repair in the same task', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-incidental-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-incidental-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { threadId: 'gui-acceptance-worker', taskMode: 'visual_implementation' });
+  try {
+    const registered = await controllerRegisterTask(input);
+    assert.equal(registered.scopePolicy, 'bounded_incidental');
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    const eventPath = await createIncidentalRepairEvent({
+      taskControlHome,
+      selfThreadId: input.threadId,
+      repairId: 'battle-result-input-route',
+      originalBlocker: 'The full-screen result layer consumes the next-button click.',
+      sameObjectiveReason: 'The repair restores the same battle-result acceptance flow already under test.',
+      functionalDomain: 'battle-result-ui',
+      affectedFiles: [{ path: 'ui/BattleResultOverlay.gd', changeType: 'modified', reason: 'This is the real owner of the input routing defect discovered during acceptance.' }],
+      conflictDomains: [],
+      localOnly: true,
+      reversible: true,
+      riskFlags: [],
+      riskAssessment: 'One local input-routing property changes; no product rule, save data, dependency, or external effect is involved.',
+      redEvidence: [{ id: 'gui-red', reference: 'artifacts/button-click-blocked.png' }],
+      greenEvidence: [{ id: 'gui-green', reference: 'artifacts/button-click-advances.png' }],
+    });
+    const hiddenManifest = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'gui-candidate-hidden', { visual: true });
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'gui-candidate-hidden', resultManifestPath: hiddenManifest }), (error) => error instanceof TaskControlError && error.code === 'INCIDENTAL_REPAIR_RESULT_MISMATCH');
+    const resultManifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'gui-candidate', { visual: true, mutate: (manifest) => ({ ...manifest, affectedFiles: [...manifest.affectedFiles, { path: 'ui/BattleResultOverlay.gd', changeType: 'modified', reason: 'Same-domain incidental repair restored the acceptance flow.' }] }) });
+    const completionPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'gui-candidate', resultManifestPath });
+    await assert.rejects(controllerIngestCompletion({ ...input, eventPath: completionPath }), (error) => error instanceof TaskControlError && error.code === 'INCIDENTAL_REPAIR_INGEST_REQUIRED');
+    const ingested = await controllerIngestIncidentalRepair({ ...input, eventPath });
+    assert.equal(ingested.status, 'executing');
+    assert.equal(ingested.attemptCount, 1);
+    assert.equal(ingested.failureHistory.length, 0);
+    assert.equal(ingested.incidentalRepairs.length, 1);
+    assert.equal(ingested.objectiveId, `objective-${input.threadId}`);
+    const completed = await controllerIngestCompletion({ ...input, eventPath: completionPath });
+    assert.equal(completed.status, 'awaiting_review');
+    assert.equal(completed.failureHistory.length, 0);
+    assert.equal(completed.replacementOrdinal, 0);
+    const deliverables = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(deliverables.tasks[0].objective.failedReplacementCount, 0);
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'lean' });
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /同任务有界附带修复/);
+    assert.match(html, /BattleResultOverlay\.gd/);
+    assert.match(html, /不计入失败、替换或熔断/);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('incidental repair escalates risk and cross-domain work while strict and hard contracts stay closed', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-incidental-gates-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-incidental-gates-project-'));
+  const baseRepair = { taskControlHome, repairId: 'gate-check', originalBlocker: 'A local acceptance defect was observed.', sameObjectiveReason: 'The proposed change claims to serve the original acceptance.', functionalDomain: 'local-ui', affectedFiles: [{ path: 'ui/Owner.gd', changeType: 'modified', reason: 'Observed owner.' }], conflictDomains: [], localOnly: true, reversible: true, riskFlags: [], riskAssessment: 'Bounded risk assessment.', redEvidence: [{ id: 'red', reference: 'red.txt' }], greenEvidence: [{ id: 'green', reference: 'green.txt' }] };
+  try {
+    const adaptiveInput = implementationInput(taskControlHome, projectRoot, { threadId: 'adaptive-gate-worker' });
+    const adaptive = await controllerRegisterTask(adaptiveInput);
+    await controllerRecordTitleSynced({ ...adaptiveInput, title: adaptive.desiredThreadTitle });
+    await controllerRecordDispatched(adaptiveInput);
+    await assert.rejects(createIncidentalRepairEvent({ ...baseRepair, selfThreadId: adaptiveInput.threadId, riskFlags: ['economyDecision'] }), (error) => error instanceof TaskControlError && error.code === 'INCIDENTAL_REPAIR_ESCALATION_REQUIRED');
+    await assert.rejects(createIncidentalRepairEvent({ ...baseRepair, selfThreadId: adaptiveInput.threadId, conflictDomains: ['other-domain'] }), (error) => error instanceof TaskControlError && error.code === 'INCIDENTAL_REPAIR_CROSS_CONFLICT_DOMAIN');
+
+    const strictInput = implementationInput(taskControlHome, projectRoot, { threadId: 'strict-gate-worker' });
+    const strict = await controllerRegisterTask({ ...strictInput, scopePolicy: 'strict_scope' });
+    await controllerRecordTitleSynced({ ...strictInput, title: strict.desiredThreadTitle });
+    await controllerRecordDispatched(strictInput);
+    await assert.rejects(createIncidentalRepairEvent({ ...baseRepair, selfThreadId: strictInput.threadId }), (error) => error instanceof TaskControlError && error.code === 'INCIDENTAL_REPAIR_NOT_ALLOWED');
+
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    const hardInput = implementationInput(taskControlHome, projectRoot, { threadId: 'hard-gate-worker', implementationContractPath: 'implementation-contract.json' });
+    await assert.rejects(controllerRegisterTask({ ...hardInput, scopePolicy: 'bounded_incidental' }), (error) => error instanceof TaskControlError && error.code === 'HARD_CONTRACT_SCOPE_POLICY_INVALID');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('parallel candidate completion resolves manifests and artifacts from the registered Windows worktree', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-worktree-result-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-worktree-result-main-'));
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-worktree-result-candidate-'));
+  const adjacentRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-worktree-result-adjacent-'));
+  try {
+    await rm(worktreeRoot, { recursive: true, force: true });
+    const git = await createGitWorktreeFixture(projectRoot, worktreeRoot);
+    const candidate = parallelCandidate({ candidateId: 'visual-result', title: 'Validate candidate worktree result', lane: 'implementation', workClass: 'bounded_reasoning', taskMode: 'visual_implementation', projectRoot, conflictDomains: ['battle-result-ui'] });
+    candidate.worktreeIdentity = { baseCommit: git.baseCommit, worktreePath: worktreeRoot.replaceAll('\\', '/').toUpperCase(), branch: git.branch, lastMainSyncCommit: git.baseCommit, cleanupOwner: 'parallel-controller' };
+    const batch = parallelManifest(projectRoot, [candidate], { degradationReceipt: { reason: 'insufficient_independent_candidates', summary: 'Only the completed candidate result needs protocol verification.', evidence: ['candidate-worktree-result'] } });
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(batch, null, 2)}\n`, 'utf8');
+    await controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' });
+    const input = parallelRegistration(taskControlHome, projectRoot, candidate, 'worktree-result-worker');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerPrepareParallelDispatch({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, batchId: 'batch-1' });
+    await controllerRecordDispatched(input);
+    const manifestRelativePath = 'docs/test-reports/result-manifest-v2.json';
+    const manifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, git.candidateCommit, { visual: true, workspaceRoot: worktreeRoot, manifestRelativePath });
+    await writeFile(join(adjacentRoot, 'result-manifest-v2.json'), await readFile(manifestPath), 'utf8');
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: git.candidateCommit, resultManifestPath: join(adjacentRoot, 'result-manifest-v2.json') }), (error) => error instanceof TaskControlError && error.code === 'RESULT_MANIFEST_OUTSIDE_WORKTREE');
+    execFileSync('git', ['-C', worktreeRoot, 'checkout', '-b', 'unexpected-result-branch'], { stdio: 'ignore' });
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath }), (error) => error instanceof TaskControlError && error.code === 'RESULT_WORKTREE_BRANCH_MISMATCH');
+    execFileSync('git', ['-C', worktreeRoot, 'checkout', git.branch], { stdio: 'ignore' });
+    await writeFile(join(projectRoot, 'main-later.txt'), 'not an ancestor of the candidate\n', 'utf8');
+    execFileSync('git', ['-C', projectRoot, 'add', 'main-later.txt'], { stdio: 'ignore' });
+    execFileSync('git', ['-C', projectRoot, 'commit', '-m', 'main later'], { stdio: 'ignore' });
+    const unrelatedBase = execFileSync('git', ['-C', projectRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    registry.tasks.find((task) => task.threadId === input.threadId).parallelWorktreeIdentity.baseCommit = unrelatedBase;
+    registry.parallelBatches[0].candidates.find((entry) => entry.candidateId === candidate.candidateId).worktreeIdentity.baseCommit = unrelatedBase;
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+    await assert.rejects(createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath }), (error) => error instanceof TaskControlError && error.code === 'RESULT_WORKTREE_BASE_MISMATCH');
+    registry.tasks.find((task) => task.threadId === input.threadId).parallelWorktreeIdentity.baseCommit = git.baseCommit;
+    registry.parallelBatches[0].candidates.find((entry) => entry.candidateId === candidate.candidateId).worktreeIdentity.baseCommit = git.baseCommit;
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+    const eventPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath.replaceAll('/', '\\') });
+    const event = JSON.parse(await readFile(eventPath, 'utf8'));
+    assert.equal(event.resultManifest.sourceWorkspace.workspaceRole, 'candidate_worktree');
+    assert.equal(event.resultManifest.sourceWorkspace.branch, git.branch);
+    assert.equal(event.resultManifest.sourceWorkspace.candidateCommit, git.candidateCommit);
+    assert.ok(event.resultManifest.artifacts.every((artifact) => artifact.workspaceRole === 'candidate_worktree' && artifact.path.toLowerCase().startsWith(worktreeRoot.toLowerCase())));
+    const completed = await controllerIngestCompletion({ ...input, eventPath });
+    assert.equal(completed.status, 'awaiting_review');
+    assert.equal(completed.deliverableHistory.at(-1).sourceWorkspace.workspaceRole, 'candidate_worktree');
+  } finally {
+    try { execFileSync('git', ['-C', projectRoot, 'worktree', 'remove', '--force', worktreeRoot], { stdio: 'ignore' }); } catch {}
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+    await rm(worktreeRoot, { recursive: true, force: true });
+    await rm(adjacentRoot, { recursive: true, force: true });
+  }
+});
+
+test('task-control protocol failure recovers the same candidate for completion only without a new task or fuse cost', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-candidate-recovery-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-candidate-recovery-main-'));
+  const worktreeRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-candidate-recovery-worktree-'));
+  try {
+    await rm(worktreeRoot, { recursive: true, force: true });
+    const git = await createGitWorktreeFixture(projectRoot, worktreeRoot, 'task/recover-result');
+    const candidate = parallelCandidate({ candidateId: 'recover-result', title: 'Recover completed candidate result', lane: 'implementation', workClass: 'bounded_reasoning', taskMode: 'visual_implementation', projectRoot, conflictDomains: ['battle-result-ui'] });
+    candidate.worktreeIdentity = { baseCommit: git.baseCommit, worktreePath: worktreeRoot, branch: git.branch, lastMainSyncCommit: git.baseCommit, cleanupOwner: 'parallel-controller' };
+    const batch = parallelManifest(projectRoot, [candidate], { degradationReceipt: { reason: 'insufficient_independent_candidates', summary: 'Only the already-completed candidate needs result closeout recovery.', evidence: ['task-control-protocol-recovery'] } });
+    await writeFile(join(projectRoot, 'parallel-batch.json'), `${JSON.stringify(batch, null, 2)}\n`, 'utf8');
+    await controllerPlanParallelBatch({ taskControlHome, projectRoot, controllerThreadId: 'parallel-controller', manifestPath: 'parallel-batch.json' });
+    const input = parallelRegistration(taskControlHome, projectRoot, candidate, 'candidate-recovery-worker');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerPrepareParallelDispatch({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, batchId: 'batch-1' });
+    await controllerRecordDispatched(input);
+    const manifestRelativePath = 'docs/test-reports/result-manifest-v2.json';
+    await writeResultManifest(taskControlHome, projectRoot, input.threadId, git.candidateCommit, { visual: true, workspaceRoot: worktreeRoot, manifestRelativePath });
+    const failurePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_blocked', attemptedStage: 'completion', failureClass: 'spec_missing', failureDomain: 'contract', commandSummary: 'task-control rejected the registered candidate worktree manifest with RESULT_MANIFEST_OUTSIDE_PROJECT.', mechanicalRetryEligible: false, evidence: [{ id: 'protocol-error', reference: 'RESULT_MANIFEST_OUTSIDE_PROJECT.txt' }] });
+    const failed = await controllerIngestFailure({ ...input, eventPath: failurePath, eventType: 'task_blocked' });
+    assert.equal(failed.status, 'changes_requested');
+    assert.equal(failed.failureHistory.length, 1);
+    const originalFailure = structuredClone(failed.failureHistory[0]);
+    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.19.0', reason: 'v0.19.0 fixes registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
+    assert.equal(recovered.status, 'executing');
+    assert.equal(recovered.attemptCount, 1);
+    assert.equal(recovered.controlPlaneRecovery.status, 'completion_only');
+    assert.deepEqual(recovered.failureHistory, [originalFailure]);
+    await assert.rejects(createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'must not rerun business' }), (error) => error instanceof TaskControlError && error.code === 'CONTROL_PLANE_RECOVERY_COMPLETION_ONLY');
+    const completionPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath });
+    const completed = await controllerIngestCompletion({ ...input, eventPath: completionPath });
+    assert.equal(completed.status, 'awaiting_review');
+    assert.equal(completed.controlPlaneRecovery.status, 'completed');
+    assert.deepEqual(completed.failureHistory, [originalFailure]);
+    const reportData = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(reportData.taskCount, 1);
+    assert.equal(reportData.tasks[0].objective.replacementCount, 0);
+    assert.equal(reportData.tasks[0].objective.failedReplacementCount, 0);
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'lean' });
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /控制面候选恢复/);
+    assert.match(html, /历史失败保留/);
+  } finally {
+    try { execFileSync('git', ['-C', projectRoot, 'worktree', 'remove', '--force', worktreeRoot], { stdio: 'ignore' }); } catch {}
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+    await rm(worktreeRoot, { recursive: true, force: true });
   }
 });
 
@@ -1685,7 +1888,7 @@ test('legacy tasks without result fields remain readable and report historical e
     const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const legacy = registry.tasks[0];
-    for (const key of ['taskMode', 'implementationPolicy', 'implementationBriefPath', 'briefSchemaVersion', 'implementationBrief', 'briefDigest', 'hardContractTrigger', 'hardContractReason', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'observabilityProtocolVersion', 'observabilityReceipts']) delete legacy[key];
+    for (const key of ['taskMode', 'implementationPolicy', 'scopePolicy', 'implementationBriefPath', 'briefSchemaVersion', 'implementationBrief', 'briefDigest', 'hardContractTrigger', 'hardContractReason', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'incidentalRepairs', 'controlPlaneRecovery', 'observabilityProtocolVersion', 'observabilityReceipts']) delete legacy[key];
     await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
     const before = await readFile(registryPath, 'utf8');
     const query = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });

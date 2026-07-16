@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.18.0 preview. Implementation now defaults to adaptive briefs and worker-chosen evidence; hard contracts are risk-gated. Checkpoints, safe handoff, and the stability-first watchdog remain. The tool makes zero model-provider calls.
+> Windows-first v0.19.0 preview. Adaptive briefs now allow audited same-objective incidental repairs while strict scope and hard contracts remain fail-closed. Checkpoints, safe handoff, and the stability-first watchdog remain. The tool makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,7 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.18.0 does
+## What v0.19.0 does
 
 - Seals 1-12 concise, authority-tagged facts into immutable files under `$CODEX_HOME/task-control/checkpoints/` without copying prompts, responses, tool output, or project content.
 - Preloads only confirmed `always` facts by default. Candidate, failure, dispute, and superseded evidence remains available through explicit point/full queries.
@@ -78,6 +78,10 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Requires explicit delegation to an economical model with at least medium reasoning; low reasoning fails closed.
 - Rejects delegation until decisions, scope, acceptance evidence, and forbidden decision boundaries are explicit.
 - Requires every new task to be classified as `control_only`, `implementation`, or `visual_implementation`; implementation work defaults to an adaptive brief and schema-v2 outcome evidence.
+- Defaults adaptive work to `bounded_incidental`: a local, reversible, same-objective and same-functional-domain defect discovered during acceptance can be fixed in the same task after a structured RED/GREEN repair receipt. It does not count as failure, retry, replacement, or fuse input. Unlisted owner files are allowed only when reported with reasons in the receipt and final result manifest.
+- Rejects incidental repair for strict scope, hard contracts, cross-conflict-domain work, forbidden decisions, product rules, architecture/trust, safety, economy, save data, external effects, irreversible migration, dependency decisions, or an unprovable boundary.
+- Uses the registered candidate worktree as result authority for parallel implementation/visual tasks. Manifest and artifact paths are checked against its real path, repository, branch, base/last-sync ancestry, and candidate HEAD; neighboring directories and identity drift are rejected. Main-workspace tasks still use `projectRoot`.
+- Provides a completion-only recovery for an already-finished candidate stopped solely by an older task-control tooling/contract bug. The original failure stays in history; the exact candidate and manifest are frozen, no business rerun is allowed, and the recovery does not consume mechanical retry, replacement, or objective fuse.
 - Snapshots the contract and SHA-256 digest, then rejects dispatch, progress, or completion if the worker changes reuse rules, forbidden paths, stages, evidence commands, error policy, or visual oracle.
 - Requires named, ordered stage checkpoints with evidence references and rejects completion until every required stage is ingested for the current attempt.
 - Returns contract version/digest plus completed and missing stages in completion and review surfaces; old registries remain readable as `legacy_unclassified` without read-only scans rewriting them.
@@ -109,14 +113,14 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.18.0 does not do
+## What v0.19.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.18.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.19.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
-- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.18.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
+- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.19.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
@@ -138,7 +142,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.18.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.19.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -204,6 +208,7 @@ $Registration = node $TaskControl register `
   --forbidden-decisions "Do not change authentication contracts or error policy." `
   --task-mode "implementation" `
   --execution-policy "adaptive_brief" `
+  --scope-policy "bounded_incidental" `
   --parallel-policy "batch_v1" `
   --batch-id "auth-batch" `
   --candidate-id "auth-code"
@@ -235,6 +240,19 @@ node $TaskControl controller-record-dispatched `
 
 node $TaskControl query-self --self "worker-1"
 node $TaskControl query-parent --self "worker-1"
+```
+
+If acceptance exposes a small same-domain defect, the worker records it and continues without a new task. Any protected risk flag makes the command fail closed:
+
+```powershell
+node $TaskControl incidental-repair --self "worker-1" --repair-id "result-button-route" --original-blocker "The result overlay consumes the button click." --same-objective-reason "Restores the same result-flow acceptance." --functional-domain "result-ui" --affected-file "ui/ResultOverlay.gd|modified|Real input-routing owner found during exploration." --local-only true --reversible true --risk-assessment "Local input fix; no product, save, economy, dependency, or external decision." --red-evidence-ref "red=artifacts/click-blocked.png" --green-evidence-ref "green=artifacts/click-advances.png"
+node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\example" --controller "controller-1" --event "<returned event path>"
+```
+
+If an older task-control protocol already stopped a valid registered-worktree candidate, the direct controller may reopen only its frozen completion after installing the fixed version:
+
+```powershell
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.19.0" --reason "v0.19.0 fixes registered worktree result authority; business scope and evidence are unchanged." --host-receipt "<real controller approval receipt>"
 ```
 
 Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.
@@ -293,7 +311,7 @@ node $TaskControl controller-cancel-handoff --project-root "C:\work\example" --c
 
 The default `lean` report writes `index.html` and performs no rollout/OTel scan. `diagnostic` writes `diagnostic.html` beside it and runs only on explicit request. It separates task-external idle, task-window time outside paired turns, active-turn time, and active-turn unassigned time; only the last ratio can trigger an unassigned-time diagnostic. Reports use Chinese explanations, `万`/`亿` compact values with exact counts, and task-relative comparison bars. Completed-response tokens are task-correlated only when same-conversation OTel receipts exist and describe already-observed cumulative processing, not OTel overhead or a quota bill. Rate-limit snapshots remain an account envelope. Unknown intervals remain unassigned.
 
-Use [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json) for non-visual work, [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json) for visual work, and [`assets/observability-receipt.example.json`](skill/codex-task-control/assets/observability-receipt.example.json) for the receipt shape. Old tasks remain readable and show “historical evidence unavailable” when no trustworthy artifacts exist.
+Use [`assets/result-manifest.example.json`](skill/codex-task-control/assets/result-manifest.example.json) for non-visual work, [`assets/visual-result-manifest.example.json`](skill/codex-task-control/assets/visual-result-manifest.example.json) for visual work, [`assets/incidental-repair.example.json`](skill/codex-task-control/assets/incidental-repair.example.json) for bounded same-task repair receipts, and [`assets/observability-receipt.example.json`](skill/codex-task-control/assets/observability-receipt.example.json) for the timing receipt shape. Old tasks remain readable and show “historical evidence unavailable” when no trustworthy artifacts exist.
 
 If a sidebar title/archive tool call fails, record the failure once. It becomes non-actionable audit debt and the heartbeat stops when no other work remains. The registered direct controller can deliberately requeue it later:
 
