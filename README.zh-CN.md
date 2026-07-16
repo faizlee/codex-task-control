@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.17.0 在稳定优先 watchdog 之上加入不可变对话检查点、渐进式预加载和可取消的安全主控交接。默认只加载已确认摘要，历史证据按需展开；交接前必须完全收口，且全程不调用模型 provider。
+> v0.18.0 将 implementation 默认改为自适应任务简报和执行者自选证据；硬合同只允许真实风险升级。不可变检查点、安全交接和稳定优先 watchdog 继续保留，全程不调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,7 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.17.0 已经解决什么
+## v0.18.0 已经解决什么
 
 - 对话检查点独立保存到 `$CODEX_HOME/task-control/checkpoints/`，每次只保留 1-12 条带 authority 和来源索引的摘要，不复制原始 prompt、response、工具输出或项目内容。
 - 默认 preload 只返回用户确认、项目事实、主控决策和已接受成果；候选、失败、争议与已废弃路径必须按 fact ID 或 full 模式显式查询。
@@ -26,7 +26,7 @@
 
 - `controller-dispatch-rework` 现在只准备宿主消息，不增加 attempt、不把任务标成运行中。只有 `controller-confirm-rework-dispatched` 收到真实宿主回执后才原子进入下一轮；发送失败可以取消准备动作。
 - 扫描会直接列出 `zombieAttempts` 与 `preparedReworks`。历史上 attempt 已增加但没有真实派发回执的任务，可以用 `controller-recover-undispatched-attempt` 恢复，不受 heartbeat 故障阻塞。
-- implementation 的权威失败必须绑定合同中的 `evidenceCommandId`。临时 `--check-only`、探索命令或其他合同外命令失败只保存为 `non_authoritative_diagnostic`，不能停止任务、触发返工或改变验收。
+- implementation 默认使用轻量简报：worker 先探索真实链路，自主选择实现位置和验证方法；失败时报告实际阶段、命令摘要和证据，不伪装成预先批准的唯一 validator。
 - heartbeat 待确认、超时或删除失败仍会返回明确清理动作，但不再阻塞失败入账、收回、恢复或无关任务登记。只有并发 dispatch wave 部分发送这一种真实业务原子性缺口继续 fail closed。
 - progress 在物理 one-shot 尚未触发时只续台账中的逻辑租约，不再每次都创建、替换、删除 Codex App automation。
 - 并发要求的是“有独立增量价值的候选”，不是凑两个任务。初始单候选仍需退化证据；真实 wave 启动后，QA/只读候选完成造成自然收缩时无需再次补退化回执。
@@ -61,16 +61,16 @@
 - 诊断缺少玩家影响、正常生命周期复现、增长趋势和阻塞价值时，只能登记为非阻塞技术债。
 - reclaim/blocked 后必须完成用户摘要通知和 delivery report 刷新，才能创建 replacement。
 - 可接收新旧上下文健康回执；v2 建议不阻塞，只有历史 v1 `handoff_required` 继续 fail closed。
-- 新 implementation 合同升级为 schema v2，并明确 `allowedWritePaths`；旧 schema-v1 台账保持只读兼容。
+- 新 implementation 默认不需要硬合同、`allowedWritePaths`、固定阶段或固定 validator。只有不可逆高风险、共享冲突、明确并行协调或用户明确授权时，才允许升级 schema-v3 hard contract；旧 schema-v1/v2 台账保持兼容。
 
 - 按项目根目录隔离任务注册表。
 - 记录直接父任务、controller、执行界面、模型等级、reasoning、额度理由和生命周期状态。
 - 拒绝内部 subagent，只接受用户可见的 Codex task/thread。
 - 委派必须显式授权，并使用 economical 模型与至少 medium reasoning；low 直接 fail closed。
 - 架构/合同/错误策略未决、scope 或验收证据不明确时，登记直接 fail closed。
-- 新登记必须显式分类为 `control_only`、`implementation` 或 `visual_implementation`；代码、资源、UI、测试和截图 runner 修改必须绑定项目根目录内的版本化 JSON 实施合同。
-- 台账保存合同快照与 SHA-256 摘要；worker 改动复用要求、禁建路径、阶段、证据命令、错误策略或视觉预言时，派发、进度或完成都会 fail closed。
-- 实施任务必须按顺序提交命名阶段与证据引用；当前轮次所有 required stage 入账前不能 complete。
+- 新登记必须显式分类为 `control_only`、`implementation` 或 `visual_implementation`。实施任务默认由登记信息生成 schema-v1 adaptive brief，也可绑定只含探索/验证提示和安全护栏的简报文件。
+- adaptive brief 不允许文件白名单、固定实现路线、固定阶段或唯一 validator。worker 完成时必须在 schema-v2 成果包里报告实际影响文件、修改理由、所选验证及其适用理由。
+- hard contract 必须记录允许的风险触发与具体理由；单一 validator 不能直接定论，GUI/截图必须由 GUI、MCP 或 interactive 表面证明，headless 只验证逻辑。
 - completion 与 review 输出明确返回合同版本/摘要以及已完成、缺失阶段；旧台账只读时安全识别为 `legacy_unclassified`，不会因扫描被重写。
 - 将 `repeatable` 硬绑定到 `gpt-5.6-luna`，将 `bounded_reasoning` 硬绑定到 `gpt-5.6-terra`；旧模型或错配模型在登记时直接 fail closed。
 - 将 `repeatable` 的 reasoning 固定为 medium，允许 `bounded_reasoning` 使用 medium 或 high。
@@ -85,7 +85,7 @@
 - 已超时的 pending heartbeat action 会返回有界补偿动作，但不再阻塞失败入账、收回、恢复或无关登记；宿主清理债务与业务生命周期分开审计。
 - automation 强制 `COUNT=1`；第一次 stale、错误 ID、过期、重复触发或 RRULE 错配返回空队列的 `delete_stale_automation`，第二次异常转为人工清理，不再自动循环。
 - 持久记录最后成功 generation、automation ID、pending action、触发/stale/删除失败/无进展次数、业务指纹、熔断证据、人工恢复原因与一次性通知状态。
-- 新登记的 implementation 必须提交带 schema 版本的成果包，记录 candidate commit、用户可见摘要、实际改变、未完成项、测试/前后数值和带类型的 artifact 引用。
+- 新登记的 implementation 必须提交 schema-v2 成果包，记录 candidate commit、实际影响文件和原因、验证选择理由、未完成项、测试/前后数值和带类型的 artifact 引用。
 - 视觉任务完成前校验 presentation stage、必需 artifact 类型/里程碑、任务归属、合同允许根目录、文件存在、非零尺寸、SHA-256 去重以及 PNG/JPEG/GIF 可解码尺寸。
 - 每个 attempt 的成果历史只追加不覆盖；reclaimed、blocked、changes_requested 证据明确显示为失败，并严格区分候选、已接受未集成、已集成。
 - 直接主控可确定性生成手机/桌面自适应 HTML：`$CODEX_HOME/task-control/reports/<project-key>/<controller-thread-id>/index.html`，不写项目仓库。
@@ -100,15 +100,15 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.17.0 不做什么
+## v0.18.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.17.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.18.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.17.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
-- 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.18.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
+- 不替项目判断截图“好不好看”；adaptive 视觉任务由 worker 选择真实交互证据并交直接主控审查，hard contract 才可绑定固定 visual oracle。
 - 当前只对 Windows 项目路径做了完整验证。
 
 ## 安装
@@ -137,7 +137,7 @@ Sol 主控默认使用 high；medium 只用于边界明确的短控制工作。x
 
 ## 快速开始
 
-先把 [`parallel-batch.example.json`](skill/codex-task-control/assets/parallel-batch.example.json) 复制到项目内，替换候选、冲突域、依赖、容量和 worktree 身份。实施任务还要复制 [`implementation-contract.example.json`](skill/codex-task-control/assets/implementation-contract.example.json)，替换项目路径、阶段、命令和错误策略，并赋予明确 revision 或 commit。视觉任务可以从 [`visual-implementation-contract.example.json`](skill/codex-task-control/assets/visual-implementation-contract.example.json) 开始。
+先准备并发批次。普通实施任务直接使用 adaptive brief；需要补充提示时参考 [`implementation-brief.example.json`](skill/codex-task-control/assets/implementation-brief.example.json)。只有确认存在允许的高风险或共享协调触发时，才使用 hard-contract 示例。
 
 ```powershell
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
@@ -173,7 +173,7 @@ $Registration = node $TaskControl register `
   --acceptance "Run the targeted authentication test successfully." `
   --forbidden-decisions "Do not change authentication contracts or error policy." `
   --task-mode "implementation" `
-  --implementation-contract "docs/codex-task-contract.json" `
+  --execution-policy "adaptive_brief" `
   --parallel-policy "batch_v1" `
   --batch-id "auth-batch" `
   --candidate-id "auth-code"
@@ -232,7 +232,7 @@ node $TaskControl controller-assert-business-ready `
 
 必须先真实执行 finalizer 返回的宿主动作。遇到 `finalize_controller_cycle` 时，按精确 action ID/generation 比较删除被取代的 create，再删除精确的旧 confirmed automation ID，最后用 `--pending-create-cleanup-outcome deleted|not_found` 确认。如果任一步超时就记录失败；在清理确认前不得登记、派发或继续该主控的项目业务。
 
-新 implementation 合同还必须声明 `resultRequirements`。worker 完成时提交项目内成果 manifest，主控审查后生成专题历史页：
+worker 完成时提交 schema-v2 项目内成果 manifest，列出实际影响文件、理由和验证选择；主控审查后生成专题历史页：
 
 ```powershell
 node $TaskControl mark-accepted --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --reason "合同和视觉预言均通过。" --selected-artifact "after"

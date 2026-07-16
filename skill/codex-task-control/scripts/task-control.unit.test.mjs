@@ -71,7 +71,7 @@ const onePixelPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAA
 
 function implementationManifest({ visual = false } = {}) {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     contractRevision: 'contract-r1',
     allowedWritePaths: ['src/existing-parser.js', 'test/existing-parser.test.js'],
     reuseRequirements: ['Reuse the existing parser and test fixture.'],
@@ -82,12 +82,13 @@ function implementationManifest({ visual = false } = {}) {
       { id: 'verification', required: true, description: 'Run the fixed verification command.', requiredEvidence: ['targeted-test'] },
     ],
     evidenceCommands: [
-      { id: 'inspection', command: 'git diff --check' },
-      { id: 'targeted-test', command: 'npm test -- contract' },
+      { id: 'inspection', command: 'git diff --check', failureMode: 'recoverable', evidenceClass: 'business', environment: 'any' },
+      { id: 'targeted-test', command: 'npm test -- contract', failureMode: 'recoverable', evidenceClass: 'business', environment: visual ? 'interactive' : 'any' },
     ],
     errorPolicy: { mode: 'stop_on_error', rules: ['Stop on any ERROR output.', 'Do not weaken acceptance criteria.'] },
+    validationPolicy: { executorMayChooseAdditionalEvidence: true, alternativeEvidenceAllowed: true, singleValidatorConclusive: false, guiEvidenceRequiresInteractiveSurface: true },
     resultRequirements: {
-      manifestSchemaVersion: 1,
+      manifestSchemaVersion: 2,
       allowedArtifactRoots: ['artifacts'],
       requiredArtifactTypes: visual ? ['screenshot'] : [],
       requiredMilestones: visual ? ['after'] : [],
@@ -98,6 +99,8 @@ function implementationManifest({ visual = false } = {}) {
 }
 
 function implementationInput(taskControlHome, projectRoot, overrides = {}) {
+  const implementationContractPath = overrides.implementationContractPath;
+  const hardContract = typeof implementationContractPath === 'string' && implementationContractPath.length > 0;
   return {
     taskControlHome,
     projectRoot,
@@ -117,7 +120,11 @@ function implementationInput(taskControlHome, projectRoot, overrides = {}) {
     acceptance: 'Complete every required stage with the named evidence.',
     forbiddenDecisions: 'Do not change the contract, error policy, or acceptance oracle.',
     taskMode: overrides.taskMode ?? 'implementation',
-    implementationContractPath: overrides.implementationContractPath,
+    implementationPolicy: overrides.implementationPolicy ?? (hardContract ? 'hard_contract' : 'adaptive_brief'),
+    implementationBriefPath: overrides.implementationBriefPath,
+    implementationContractPath,
+    hardContractTrigger: overrides.hardContractTrigger ?? (hardContract ? 'high_risk_irreversible' : undefined),
+    hardContractReason: overrides.hardContractReason ?? (hardContract ? 'The test fixture explicitly exercises risk-classified hard contract behavior.' : undefined),
   };
 }
 
@@ -236,7 +243,10 @@ function parallelRegistration(taskControlHome, projectRoot, candidate, threadId,
     acceptance: 'Return the candidate evidence required by the batch contract.',
     forbiddenDecisions: 'Do not change contracts, conflict domains, dependencies, or review capacity.',
     taskMode: candidate.taskMode,
+    implementationPolicy: overrides.implementationContractPath ? 'hard_contract' : (['implementation', 'visual_implementation'].includes(candidate.taskMode) ? 'adaptive_brief' : undefined),
     implementationContractPath: overrides.implementationContractPath,
+    hardContractTrigger: overrides.implementationContractPath ? 'parallel_coordination' : undefined,
+    hardContractReason: overrides.implementationContractPath ? 'The parallel fixture coordinates shared candidate paths across an explicit batch.' : undefined,
     parallelPolicy: 'batch_v1',
     parallelBatchId: overrides.batchId ?? 'batch-1',
     parallelCandidateId: candidate.candidateId,
@@ -251,21 +261,24 @@ async function writeResultManifest(taskControlHome, projectRoot, threadId, candi
   if (visual) {
     const screenshotPath = join(artifactDir, `after-${task.attemptCount}.png`);
     await writeFile(screenshotPath, onePixelPng);
-    artifacts.push({ id: `after-${task.attemptCount}`, type: 'screenshot', milestone: 'after', label: 'Current result', description: 'Decoded visual result for controller review.', createdAt: new Date().toISOString(), sourceStageId: 'verification', sourceTaskThreadId: task.threadId, workspaceRole: 'candidate_worktree', path: screenshotPath });
+    artifacts.push({ id: `after-${task.attemptCount}`, type: 'screenshot', milestone: 'after', label: 'Current result', description: 'Decoded visual result for controller review.', createdAt: new Date().toISOString(), sourceStageId: task.implementationPolicy === 'adaptive_brief' ? 'presentation' : 'verification', sourceTaskThreadId: task.threadId, workspaceRole: 'candidate_worktree', path: screenshotPath });
   }
   let manifest = {
-    schemaVersion: 1,
+    schemaVersion: task.resultProtocolVersion,
     projectKey: projectKeyForRoot(projectRoot),
     controllerThreadId: task.directControllerThreadId,
     threadId: task.threadId,
     displayKey: task.displayKey,
     attempt: task.attemptCount,
-    contractVersion: task.contractRevision ?? task.contractCommit,
+    implementationPolicy: task.implementationPolicy,
+    contractVersion: task.implementationPolicy === 'adaptive_brief' ? `brief-v${task.briefSchemaVersion}` : (task.contractRevision ?? task.contractCommit),
     contractDigest: task.contractDigest,
     candidateCommit,
     integrationStatus: 'candidate',
     userVisibleSummary: visual ? 'A visible result is ready for review.' : 'The bounded implementation and targeted verification are complete.',
     actualChanges: ['Updated only the contract-bound implementation path.'],
+    affectedFiles: [{ path: 'src/existing-parser.js', changeType: 'modified', reason: 'This is the existing implementation selected after tracing the real call path.' }],
+    validationRationale: 'The selected targeted test exercises the changed logic; visual fixtures also use an interactive screenshot surface.',
     incompleteItems: [],
     testSummary: { status: 'passed', summary: 'Targeted verification passed.', commands: ['npm test -- contract'], metrics: [{ label: 'failed tests', before: 1, after: 0, unit: 'tests' }] },
     noScreenshotReason: visual ? null : 'This implementation changes contract behavior without a player-visible surface.',
@@ -666,19 +679,73 @@ test('legacy registrations remain readable but the parallel audit labels their m
   }
 });
 
-test('implementation registration fails closed without a complete bound contract', async () => {
+test('implementation defaults to an adaptive brief and hard contract requires explicit risk evidence', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-contract-home-'));
   const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-contract-project-'));
   try {
     const input = implementationInput(taskControlHome, projectRoot);
-    await assert.rejects(controllerRegisterTask(input), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_CONTRACT_REQUIRED');
-    await assert.rejects(controllerRegisterTask({ ...input, taskMode: undefined }), (error) => error instanceof TaskControlError && error.code === 'TASK_MODE_REQUIRED');
+    const adaptive = await controllerRegisterTask(input);
+    assert.equal(adaptive.implementationPolicy, 'adaptive_brief');
+    assert.deepEqual(adaptive.allowedWritePaths, []);
+    assert.deepEqual(adaptive.stageGates, []);
+    assert.deepEqual(adaptive.evidenceCommands, []);
+    assert.equal(adaptive.implementationBrief.executorExploresBeforeEditing, true);
+    await writeFile(join(projectRoot, 'rigid-brief.json'), `${JSON.stringify({ schemaVersion: 1, objective: 'Do the work.', allowedWritePaths: ['src/fixed.ts'] }, null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerRegisterTask({ ...implementationInput(taskControlHome, projectRoot, { threadId: 'rigid-brief-worker', implementationBriefPath: 'rigid-brief.json' }) }), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_BRIEF_INVALID');
+    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'missing-task-mode', taskMode: undefined }), (error) => error instanceof TaskControlError && error.code === 'TASK_MODE_REQUIRED');
+    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'missing-hard-contract', implementationPolicy: 'hard_contract', hardContractTrigger: 'high_risk_irreversible', hardContractReason: 'This irreversible operation requires a bounded controller-owned safety contract.' }), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_CONTRACT_REQUIRED');
     const legacyContract = implementationManifest();
     delete legacyContract.resultRequirements;
     await writeFile(join(projectRoot, 'legacy-contract.json'), `${JSON.stringify(legacyContract, null, 2)}\n`, 'utf8');
-    await assert.rejects(controllerRegisterTask({ ...input, implementationContractPath: 'legacy-contract.json' }), (error) => error instanceof TaskControlError && error.code === 'RESULT_REQUIREMENTS_REQUIRED');
+    await assert.rejects(controllerRegisterTask(implementationInput(taskControlHome, projectRoot, { threadId: 'missing-result-requirements', implementationContractPath: 'legacy-contract.json' })), (error) => error instanceof TaskControlError && error.code === 'RESULT_REQUIREMENTS_REQUIRED');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('adaptive implementation explores freely and completes with actual files plus worker-chosen evidence', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-adaptive-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-adaptive-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { threadId: 'adaptive-worker' });
+  try {
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Traced the real owner and selected focused logic evidence.', evidence: [{ id: 'headless-logic', reference: 'logs/focused-test.txt' }] });
+    const progressed = await controllerIngestProgress({ ...input, eventPath: progressPath });
+    assert.equal(progressed.implementationPolicy, 'adaptive_brief');
+    assert.deepEqual(progressed.missingStages, []);
+    const resultManifestPath = await writeResultManifest(taskControlHome, projectRoot, input.threadId, 'adaptive-candidate');
+    const eventPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'adaptive-candidate', resultManifestPath });
+    const completed = await controllerIngestCompletion({ ...input, eventPath });
+    assert.equal(completed.status, 'awaiting_review');
+    assert.equal(completed.deliverableHistory.at(-1).affectedFiles[0].path, 'src/existing-parser.js');
+    assert.match(completed.deliverableHistory.at(-1).validationRationale, /selected targeted test/i);
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'lean' });
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /实际影响文件与理由/);
+    assert.match(html, /src\/existing-parser\.js/);
+    assert.match(html, /为什么选择这些验证/);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('hard contract rejects a sole blocking validator and headless GUI proof', async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-hard-contract-safety-'));
+  try {
+    const blocking = implementationManifest();
+    blocking.evidenceCommands[0].failureMode = 'blocking';
+    await writeFile(join(projectRoot, 'blocking.json'), `${JSON.stringify(blocking, null, 2)}\n`, 'utf8');
+    await assert.rejects(auditImplementationContract({ projectRoot, implementationContractPath: 'blocking.json', taskMode: 'implementation' }), (error) => error instanceof TaskControlError && error.code === 'HARD_CONTRACT_SINGLE_VALIDATOR_FORBIDDEN');
+
+    const headlessVisual = implementationManifest({ visual: true });
+    headlessVisual.evidenceCommands.find((entry) => entry.id === 'targeted-test').environment = 'headless';
+    await writeFile(join(projectRoot, 'headless-visual.json'), `${JSON.stringify(headlessVisual, null, 2)}\n`, 'utf8');
+    await assert.rejects(auditImplementationContract({ projectRoot, implementationContractPath: 'headless-visual.json', taskMode: 'visual_implementation' }), (error) => error instanceof TaskControlError && error.code === 'HEADLESS_GUI_EVIDENCE_FORBIDDEN');
+  } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
@@ -811,7 +878,7 @@ test('worker failure is first-class before required stages complete and wakes th
     const registered = await controllerRegisterTask(input);
     await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
     await controllerRecordDispatched(input);
-    const eventPath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The fixed test runner exited before collecting results.', evidenceCommandId: 'inspection', mechanicalRetryEligible: true, evidence: [{ id: 'inspection', reference: 'logs/runner-failure.txt' }] });
+    const eventPath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The fixed test runner exited before collecting results.', evidenceCommandId: 'inspection', recoveryExhausted: true, mechanicalRetryEligible: true, evidence: [{ id: 'inspection', reference: 'logs/runner-failure.txt' }] });
     const scan = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
     assert.equal(scan.pendingEvents[0].type, 'task_failed');
     assert.equal(scan.needsControllerAttention, true);
@@ -840,7 +907,7 @@ test('contract-external failure stays diagnostic and cannot stop or rework an im
     assert.equal(diagnostic.failureHistory.at(-1).authority, 'non_authoritative_diagnostic');
     await assert.rejects(controllerDispatchRework(input), (error) => error instanceof TaskControlError && error.code === 'TASK_TRANSITION_INVALID');
     await delay();
-    const authoritativePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The contract-bound inspection command failed.', evidenceCommandId: 'inspection', mechanicalRetryEligible: true, evidence: [{ id: 'inspection', reference: 'logs/inspection.txt' }] });
+    const authoritativePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'reuse-check', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The contract-bound inspection command failed.', evidenceCommandId: 'inspection', recoveryExhausted: true, mechanicalRetryEligible: true, evidence: [{ id: 'inspection', reference: 'logs/inspection.txt' }] });
     const authoritative = await controllerIngestFailure({ ...input, eventPath: authoritativePath, eventType: 'task_failed' });
     assert.equal(authoritative.status, 'changes_requested');
     assert.equal(authoritative.failureHistory.at(-1).authority, 'contract_evidence');
@@ -857,8 +924,8 @@ test('contract audit rejects Python cache self-conflicts before registration and
   try {
     const unsafe = implementationManifest();
     unsafe.evidenceCommands = [
-      { id: 'inspection', command: 'git status --porcelain' },
-      { id: 'targeted-test', command: 'python tests/tool_test.py' },
+      { id: 'inspection', command: 'git status --porcelain', failureMode: 'recoverable', evidenceClass: 'business', environment: 'any' },
+      { id: 'targeted-test', command: 'python tests/tool_test.py', failureMode: 'recoverable', evidenceClass: 'business', environment: 'any' },
     ];
     await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(unsafe, null, 2)}\n`, 'utf8');
     const audit = await auditImplementationContract({ projectRoot, implementationContractPath: 'implementation-contract.json', taskMode: 'implementation' });
@@ -930,7 +997,7 @@ test('mechanical contract amendment binds only an audited direct-controller cont
     const reuse = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Reuse completed.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'reuse.txt' }] });
     await controllerIngestProgress({ ...input, eventPath: reuse });
     await delay();
-    const failure = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'The bounded command was malformed.', evidenceCommandId: 'targeted-test', mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'failure.txt' }] });
+    const failure = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'The bounded command was malformed.', evidenceCommandId: 'targeted-test', recoveryExhausted: true, mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'failure.txt' }] });
     await controllerIngestFailure({ ...input, eventPath: failure, eventType: 'task_failed' });
     const unsafeBoundary = structuredClone(original);
     unsafeBoundary.contractRevision = 'contract-unsafe';
@@ -994,7 +1061,7 @@ test('mechanical rework carries valid predecessors and accepts worker artifacts 
     const reusePath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Existing implementation was reused.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'logs/reuse.txt' }] });
     await controllerIngestProgress({ ...input, eventPath: reusePath });
     await delay();
-    const failurePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'The verification command had a mechanical defect.', evidenceCommandId: 'targeted-test', mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'logs/failure.txt' }] });
+    const failurePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'The verification command had a mechanical defect.', evidenceCommandId: 'targeted-test', recoveryExhausted: true, mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'logs/failure.txt' }] });
     await controllerIngestFailure({ ...input, eventPath: failurePath, eventType: 'task_failed' });
     const prepared = await controllerDispatchRework(input);
     const retried = await controllerConfirmReworkDispatched({ ...input, actionId: prepared.hostAction.actionId, hostReceipt: 'host-delivered-attempt-2' });
@@ -1272,7 +1339,7 @@ test('safe controller handoff fails closed while a child task or heartbeat debt 
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-block-home-'));
   const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-block-project-'));
   try {
-    const input = { ...implementationInput(taskControlHome, projectRoot), controllerThreadId: 'busy-controller', parentThreadId: 'busy-controller', threadId: 'busy-worker', title: 'Busy control task', taskMode: 'control_only', implementationContractPath: undefined, model: 'gpt-5.6-luna', workClass: 'repeatable', quotaReason: 'A visible bounded check saves controller quota.' };
+    const input = { ...implementationInput(taskControlHome, projectRoot), controllerThreadId: 'busy-controller', parentThreadId: 'busy-controller', threadId: 'busy-worker', title: 'Busy control task', taskMode: 'control_only', implementationPolicy: undefined, implementationBriefPath: undefined, implementationContractPath: undefined, hardContractTrigger: undefined, hardContractReason: undefined, model: 'gpt-5.6-luna', workClass: 'repeatable', quotaReason: 'A visible bounded check saves controller quota.' };
     await controllerRegisterTask(input);
     const projectKey = projectKeyForRoot(projectRoot);
     const manifestPath = join(projectRoot, 'busy-checkpoint.json');
@@ -1618,7 +1685,7 @@ test('legacy tasks without result fields remain readable and report historical e
     const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const legacy = registry.tasks[0];
-    for (const key of ['taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'observabilityProtocolVersion', 'observabilityReceipts']) delete legacy[key];
+    for (const key of ['taskMode', 'implementationPolicy', 'implementationBriefPath', 'briefSchemaVersion', 'implementationBrief', 'briefDigest', 'hardContractTrigger', 'hardContractReason', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'observabilityProtocolVersion', 'observabilityReceipts']) delete legacy[key];
     await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
     const before = await readFile(registryPath, 'utf8');
     const query = await controllerQueryDeliverables({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
@@ -2327,7 +2394,7 @@ test('v0.3 changes-requested titles migrate safely to a stopped pending decision
     const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
     const registry = JSON.parse(await readFile(registryPath, 'utf8'));
     const task = registry.tasks[0];
-    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason', 'taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'observabilityProtocolVersion', 'observabilityReceipts']) delete task[key];
+    for (const key of ['workClass', 'decisionStatus', 'scope', 'acceptance', 'forbiddenDecisions', 'executionStatus', 'nextOwner', 'attemptCount', 'failureClass', 'changesRequestedReason', 'reclaimedReason', 'taskMode', 'implementationPolicy', 'implementationBriefPath', 'briefSchemaVersion', 'implementationBrief', 'briefDigest', 'hardContractTrigger', 'hardContractReason', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'resultProtocolVersion', 'resultRequirements', 'deliverableHistory', 'stageProgress', 'observabilityProtocolVersion', 'observabilityReceipts']) delete task[key];
     task.status = 'changes_requested';
     task.reviewVerdict = 'changes_requested';
     task.desiredThreadTitle = '返工｜01 审计 Provider 调用';

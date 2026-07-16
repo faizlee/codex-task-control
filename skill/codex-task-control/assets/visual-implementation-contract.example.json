@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "contractRevision": "visual-example-r1",
   "allowedWritePaths": [
     "src/existing-ui/**",
@@ -36,12 +36,16 @@
     {
       "id": "diff-check",
       "command": "git diff --check",
-      "failureMode": "blocking"
+      "failureMode": "recoverable",
+      "evidenceClass": "business",
+      "environment": "any"
     },
     {
       "id": "screenshot",
       "command": "replace-with-project-screenshot-command",
-      "failureMode": "recoverable"
+      "failureMode": "recoverable",
+      "evidenceClass": "business",
+      "environment": "interactive"
     }
   ],
   "errorPolicy": {
@@ -50,6 +54,12 @@
       "Stop when the runner emits ERROR or omits the required screenshot.",
       "Do not change the visual oracle or acceptance criteria."
     ]
+  },
+  "validationPolicy": {
+    "executorMayChooseAdditionalEvidence": true,
+    "alternativeEvidenceAllowed": true,
+    "singleValidatorConclusive": false,
+    "guiEvidenceRequiresInteractiveSurface": true
   },
   "visualOracle": {
     "stageId": "visual-verification",
@@ -60,7 +70,7 @@
     ]
   },
   "resultRequirements": {
-    "manifestSchemaVersion": 1,
+    "manifestSchemaVersion": 2,
     "allowedArtifactRoots": [
       "docs/test-reports",
       "_scratch/task-results"

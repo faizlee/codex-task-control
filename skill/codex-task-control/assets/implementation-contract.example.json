@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "contractRevision": "example-r1",
   "allowedWritePaths": [
     "src/existing/**",
@@ -36,12 +36,16 @@
     {
       "id": "diff-check",
       "command": "git diff --check",
-      "failureMode": "blocking"
+      "failureMode": "recoverable",
+      "evidenceClass": "business",
+      "environment": "any"
     },
     {
       "id": "targeted-test",
       "command": "replace-with-project-command",
-      "failureMode": "recoverable"
+      "failureMode": "recoverable",
+      "evidenceClass": "business",
+      "environment": "any"
     }
   ],
   "errorPolicy": {
@@ -51,8 +55,14 @@
       "Do not weaken the acceptance criteria or change this policy."
     ]
   },
+  "validationPolicy": {
+    "executorMayChooseAdditionalEvidence": true,
+    "alternativeEvidenceAllowed": true,
+    "singleValidatorConclusive": false,
+    "guiEvidenceRequiresInteractiveSurface": true
+  },
   "resultRequirements": {
-    "manifestSchemaVersion": 1,
+    "manifestSchemaVersion": 2,
     "allowedArtifactRoots": [
       "docs/test-reports",
       "_scratch/task-results"

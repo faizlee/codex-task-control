@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.17.0 preview. Immutable conversation checkpoints, progressive preload, and cancellable quiescent controller handoff now sit on top of the stability-first watchdog. The tool makes zero model-provider calls.
+> Windows-first v0.18.0 preview. Implementation now defaults to adaptive briefs and worker-chosen evidence; hard contracts are risk-gated. Checkpoints, safe handoff, and the stability-first watchdog remain. The tool makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,7 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.17.0 does
+## What v0.18.0 does
 
 - Seals 1-12 concise, authority-tagged facts into immutable files under `$CODEX_HOME/task-control/checkpoints/` without copying prompts, responses, tool output, or project content.
 - Preloads only confirmed `always` facts by default. Candidate, failure, dispute, and superseded evidence remains available through explicit point/full queries.
@@ -69,14 +69,15 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Requires product-value evidence before a diagnostic may block a milestone; otherwise it remains non-blocking technical debt.
 - Requires reclaim/block closeout with a user notification and refreshed delivery report before replacement.
 - Ingests schema-v2 advisory context receipts without blocking; only legacy schema-v1 `handoff_required` keeps its fail-closed behavior.
-- Requires schema-v2 implementation contracts with explicit controller-owned `allowedWritePaths`; legacy schema-v1 tasks remain read-compatible.
+- Defaults implementation work to a schema-v1 adaptive brief: inspect the real path first, let the worker choose implementation and validation, and report actual affected files plus evidence.
+- Allows schema-v3 hard contracts only for irreversible risk, shared conflicts, explicit parallel coordination, or explicit user authority. Hard contracts cannot make one validator conclusive or use headless execution as GUI/screenshot proof.
 
 - Keeps task registries isolated by normalized project root.
 - Records direct parent, controller, execution surface, model class, reasoning level, quota justification, and lifecycle state.
 - Rejects internal subagent execution and requires a user-visible Codex task/thread.
 - Requires explicit delegation to an economical model with at least medium reasoning; low reasoning fails closed.
 - Rejects delegation until decisions, scope, acceptance evidence, and forbidden decision boundaries are explicit.
-- Requires every new task to be classified as `control_only`, `implementation`, or `visual_implementation`; implementation work binds a versioned JSON contract inside the project root.
+- Requires every new task to be classified as `control_only`, `implementation`, or `visual_implementation`; implementation work defaults to an adaptive brief and schema-v2 outcome evidence.
 - Snapshots the contract and SHA-256 digest, then rejects dispatch, progress, or completion if the worker changes reuse rules, forbidden paths, stages, evidence commands, error policy, or visual oracle.
 - Requires named, ordered stage checkpoints with evidence references and rejects completion until every required stage is ingested for the current attempt.
 - Returns contract version/digest plus completed and missing stages in completion and review surfaces; old registries remain readable as `legacy_unclassified` without read-only scans rewriting them.
@@ -94,7 +95,7 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Uses adaptive `COUNT=1` cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval.
 - Turns the first stale, wrong-ID, expired, repeated, or misconfigured heartbeat invocation into an empty-queue `delete_stale_automation` path; a repeated failure becomes manual-only instead of another automatic loop.
 - Persists last successful generation, automation ID, pending action, trigger/stale/delete-failure/no-progress counts, business fingerprint, fuse evidence, manual-resume reason, and one-time notification state.
-- Requires schema-versioned result manifests for newly registered implementation tasks. They capture the candidate commit, user-visible outcome, actual changes, incomplete items, readable tests/metrics, and typed artifact references.
+- Requires schema-v2 result manifests for new implementation tasks. They capture the candidate commit, actual affected files and reasons, worker-selected validation rationale, incomplete items, tests/metrics, and typed artifact references.
 - Validates visual presentation artifacts before completion: required stage/type/milestone, ownership, allowlisted roots, file existence, non-zero size, SHA-256 uniqueness, and decodable PNG/JPEG/GIF dimensions.
 - Appends every attempt to immutable deliverable history, keeps rejected/reclaimed/blocked evidence visibly failed, and distinguishes candidate, accepted-not-integrated, and integrated outcomes.
 - Builds a deterministic, mobile-friendly disk report at `$CODEX_HOME/task-control/reports/<project-key>/<controller-thread-id>/index.html` without writing into the project repository.
@@ -108,14 +109,14 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.17.0 does not do
+## What v0.18.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.17.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.18.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
-- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.17.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
+- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.18.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
@@ -137,7 +138,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.17.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.18.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
@@ -155,7 +156,7 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 - Register every selected candidate, sync all titles, then prepare and complete one dispatch wave. Do not silently send only the first candidate.
 - Register the visible task with a semantic title, synchronize the returned title action, send its work prompt, and record the successful dispatch to start the heartbeat.
 - Route later controller messages through `controller-prepare-message`. While a target turn is running or unknown, do not call the host send tool; release only after a real idle observation. Reserve interrupt for authorized stop/cancel.
-- Classify the task explicitly; code/resource/UI/test changes require a project-owned implementation contract, and visual work also requires a visual oracle.
+- Classify the task explicitly; code/resource/UI/test changes default to an adaptive brief. Add a hard contract only with an allowed risk trigger and reason.
 - Apply lifecycle title and archive actions returned by the controller heartbeat.
 - Let a child notify only the direct parent stored in its record.
 - Let only the controller accept, request changes, or integrate.
@@ -166,7 +167,7 @@ Copy the relevant rules from [`examples/AGENTS.md`](examples/AGENTS.md) into you
 
 Set a project root and the controller/child task IDs supplied by your Codex workflow:
 
-First copy [`parallel-batch.example.json`](skill/codex-task-control/assets/parallel-batch.example.json) into the project and replace its candidates, conflict domains, dependencies, capacity, and worktree identities. For implementation work, also copy [`implementation-contract.example.json`](skill/codex-task-control/assets/implementation-contract.example.json), replace its project-specific paths/stages/commands/error policy, and commit or revision it. Visual work can start from [`visual-implementation-contract.example.json`](skill/codex-task-control/assets/visual-implementation-contract.example.json).
+Prepare the parallel batch first. Ordinary implementation work uses the adaptive brief built from registration; use [`implementation-brief.example.json`](skill/codex-task-control/assets/implementation-brief.example.json) only when extra non-binding exploration or validation hints help. Use hard-contract examples only after recording an allowed risk trigger.
 
 ```powershell
 $CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
@@ -202,7 +203,7 @@ $Registration = node $TaskControl register `
   --acceptance "Run the targeted authentication test successfully." `
   --forbidden-decisions "Do not change authentication contracts or error policy." `
   --task-mode "implementation" `
-  --implementation-contract "docs/codex-task-contract.json" `
+  --execution-policy "adaptive_brief" `
   --parallel-policy "batch_v1" `
   --batch-id "auth-batch" `
   --candidate-id "auth-code"
@@ -261,7 +262,7 @@ node $TaskControl controller-assert-business-ready `
 
 Apply the finalizer's host action before continuing. For `finalize_controller_cycle`, compare-delete the superseded create by its exact action ID and generation, delete the exact previously confirmed automation ID, then confirm with `--pending-create-cleanup-outcome deleted|not_found`. If either host operation times out, record failure; do not register, dispatch, or resume project business under that controller.
 
-New implementation contracts must also include `resultRequirements`. At completion the worker supplies a project-owned result manifest; the controller then reviews and builds the historical report:
+At completion the worker supplies a project-owned schema-v2 result manifest; the controller then reviews actual files, reasons, validation choices, and historical evidence:
 
 ```powershell
 node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" --result-manifest "docs/test-reports/task-result.json"

@@ -30,7 +30,7 @@ export const NEXT_OWNERS = Object.freeze(['worker', 'controller', 'undecided', '
 export const FAILURE_CLASSES = Object.freeze(['mechanical', 'comprehension', 'judgment', 'spec_missing', 'unclassified']);
 export const FAILURE_DOMAINS = Object.freeze(['tooling', 'environment', 'contract', 'test', 'implementation']);
 export const FAILURE_EVENT_TYPES = Object.freeze(['task_failed', 'task_blocked']);
-export const FAILURE_AUTHORITIES = Object.freeze(['contract_evidence', 'non_authoritative_diagnostic']);
+export const FAILURE_AUTHORITIES = Object.freeze(['contract_evidence', 'worker_evidence', 'non_authoritative_diagnostic']);
 export const EVIDENCE_FAILURE_MODES = Object.freeze(['blocking', 'recoverable', 'advisory']);
 export const EVIDENCE_CLASSES = Object.freeze(['business', 'execution', 'observability']);
 export const OBJECTIVE_FUSE_REPLACEMENT_LIMIT = 2;
@@ -77,10 +77,17 @@ export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_threa
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
 export const REGISTER_TASK_MODES = Object.freeze(['control_only', 'implementation', 'visual_implementation']);
-export const IMPLEMENTATION_CONTRACT_SCHEMA_VERSION = 2;
-export const IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS = Object.freeze([1, 2]);
-export const RESULT_MANIFEST_SCHEMA_VERSION = 1;
-export const RESULT_PROTOCOL_VERSION = 1;
+export const IMPLEMENTATION_POLICIES = Object.freeze(['adaptive_brief', 'hard_contract']);
+export const HARD_CONTRACT_TRIGGERS = Object.freeze(['high_risk_irreversible', 'shared_conflict', 'parallel_coordination', 'user_explicit']);
+export const IMPLEMENTATION_BRIEF_SCHEMA_VERSION = 1;
+export const IMPLEMENTATION_CONTRACT_SCHEMA_VERSION = 3;
+export const IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS = Object.freeze([1, 2, 3]);
+export const VALIDATION_ENVIRONMENTS = Object.freeze(['any', 'headless', 'gui', 'mcp', 'interactive']);
+export const RESULT_MANIFEST_SCHEMA_VERSION = 2;
+export const RESULT_MANIFEST_SCHEMA_VERSIONS = Object.freeze([1, 2]);
+export const RESULT_PROTOCOL_VERSION = 2;
+export const RESULT_PROTOCOL_VERSIONS = Object.freeze([0, 1, 2]);
+export const RESULT_FILE_CHANGE_TYPES = Object.freeze(['added', 'modified', 'deleted', 'generated']);
 export const RESULT_ARTIFACT_TYPES = Object.freeze(['screenshot', 'reference', 'contact_sheet', 'log', 'test_summary', 'report']);
 export const RESULT_ARTIFACT_MILESTONES = Object.freeze(['reference', 'before', 'intermediate', 'after', 'current', 'failure', 'other']);
 export const RESULT_WORKSPACE_ROLES = Object.freeze(['candidate_worktree', 'project_main', 'external_reference', 'task_control']);
@@ -177,8 +184,73 @@ function stringArray(value, field, { allowEmpty = true } = {}) {
   return value.map((entry) => entry.trim());
 }
 
+const BASE_IMPLEMENTATION_GUARDRAILS = Object.freeze([
+  '不得伪造、猜测或把缺失证据表述为已经验证。',
+  '不得越过仍未解决的产品、安全、架构或数据边界决策。',
+  '不得执行未经授权的发布、推送、外部消息、生产变更或其他外部影响。',
+]);
+
+function validateImplementationBriefManifest(value) {
+  const allowed = new Set(['schemaVersion', 'objective', 'explorationHints', 'validationHints', 'safetyGuardrails', 'executorExploresBeforeEditing', 'executorChoosesImplementationPath', 'executorChoosesValidationMethods']);
+  if (!isObject(value) || value.schemaVersion !== IMPLEMENTATION_BRIEF_SCHEMA_VERSION || Object.keys(value).some((key) => !allowed.has(key)) || !nonEmpty(value.objective)) {
+    fail('IMPLEMENTATION_BRIEF_INVALID', `implementation brief 必须使用 schemaVersion=${IMPLEMENTATION_BRIEF_SCHEMA_VERSION}，包含 objective，且不得包含路径白名单、固定实现或唯一验证器字段`);
+  }
+  const explorationHints = stringArray(value.explorationHints ?? [], 'explorationHints');
+  const validationHints = stringArray(value.validationHints ?? [], 'validationHints');
+  const suppliedGuardrails = stringArray(value.safetyGuardrails ?? [], 'safetyGuardrails');
+  return {
+    schemaVersion: IMPLEMENTATION_BRIEF_SCHEMA_VERSION,
+    objective: value.objective.trim(),
+    explorationHints,
+    validationHints,
+    safetyGuardrails: [...new Set([...BASE_IMPLEMENTATION_GUARDRAILS, ...suppliedGuardrails])],
+    executorExploresBeforeEditing: true,
+    executorChoosesImplementationPath: true,
+    executorChoosesValidationMethods: true,
+  };
+}
+
+async function loadImplementationBrief(projectRoot, reference, input) {
+  let implementationBriefPath = null;
+  let brief;
+  if (nonEmpty(reference)) {
+    const root = win32.resolve(projectRoot.replaceAll('/', '\\'));
+    implementationBriefPath = win32.resolve(root, reference.replaceAll('/', '\\'));
+    const normalizedRoot = root.toLowerCase();
+    const normalizedBrief = implementationBriefPath.toLowerCase();
+    if (normalizedBrief !== normalizedRoot && !normalizedBrief.startsWith(`${normalizedRoot}\\`)) fail('IMPLEMENTATION_BRIEF_OUTSIDE_PROJECT', 'implementation brief 必须位于项目根目录内');
+    brief = validateImplementationBriefManifest(await readJson(implementationBriefPath, 'IMPLEMENTATION_BRIEF_INVALID'));
+  } else {
+    brief = validateImplementationBriefManifest({
+      schemaVersion: IMPLEMENTATION_BRIEF_SCHEMA_VERSION,
+      objective: input.scope,
+      explorationHints: ['先检查真实调用链、既有实现、项目规则和运行环境，再决定修改位置。'],
+      validationHints: [input.acceptance],
+      safetyGuardrails: [input.forbiddenDecisions],
+    });
+  }
+  const normalized = JSON.stringify(brief);
+  return {
+    implementationBriefPath,
+    briefSchemaVersion: IMPLEMENTATION_BRIEF_SCHEMA_VERSION,
+    implementationBrief: brief,
+    briefDigest: createHash('sha256').update(normalized, 'utf8').digest('hex'),
+  };
+}
+
+function adaptiveResultRequirements(taskMode) {
+  const visual = taskMode === 'visual_implementation';
+  return {
+    manifestSchemaVersion: RESULT_MANIFEST_SCHEMA_VERSION,
+    allowedArtifactRoots: ['.'],
+    requiredArtifactTypes: visual ? ['screenshot'] : [],
+    requiredMilestones: visual ? ['after'] : [],
+    presentationStageId: visual ? 'presentation' : null,
+  };
+}
+
 function resolveImplementationContractPath(projectRoot, reference) {
-  if (!nonEmpty(reference)) fail('IMPLEMENTATION_CONTRACT_REQUIRED', 'implementation/visual_implementation 任务必须提供 implementationContractPath');
+  if (!nonEmpty(reference)) fail('IMPLEMENTATION_CONTRACT_REQUIRED', 'hard_contract 任务必须提供 implementationContractPath');
   const root = win32.resolve(projectRoot.replaceAll('/', '\\'));
   const resolved = win32.resolve(root, reference.replaceAll('/', '\\'));
   const normalizedRoot = root.toLowerCase();
@@ -190,20 +262,24 @@ function resolveImplementationContractPath(projectRoot, reference) {
 function validateImplementationContractManifest(value, taskMode, { requireResultRequirements = false, requireCurrentSchema = false } = {}) {
   if (!isObject(value) || !IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.includes(value.schemaVersion)) fail('IMPLEMENTATION_CONTRACT_INVALID', `实施合同 schemaVersion 必须为 ${IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.join(' 或 ')}`);
   if (requireCurrentSchema && value.schemaVersion !== IMPLEMENTATION_CONTRACT_SCHEMA_VERSION) fail('IMPLEMENTATION_CONTRACT_UPGRADE_REQUIRED', `新登记实施任务必须使用 schemaVersion=${IMPLEMENTATION_CONTRACT_SCHEMA_VERSION}`);
-  const allowed = new Set(['schemaVersion', 'contractRevision', 'contractCommit', 'allowedWritePaths', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'resultRequirements']);
+  const allowed = new Set(['schemaVersion', 'contractRevision', 'contractCommit', 'allowedWritePaths', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'resultRequirements']);
   if (Object.keys(value).some((key) => !allowed.has(key))) fail('IMPLEMENTATION_CONTRACT_INVALID', '实施合同包含未知字段');
   const contractRevision = nonEmpty(value.contractRevision) ? value.contractRevision.trim() : null;
   const contractCommit = nonEmpty(value.contractCommit) ? value.contractCommit.trim() : null;
   if (contractRevision === null && contractCommit === null) fail('IMPLEMENTATION_CONTRACT_VERSION_REQUIRED', '实施合同必须提供 contractRevision 或 contractCommit');
   const reuseRequirements = stringArray(value.reuseRequirements, 'reuseRequirements', { allowEmpty: false });
-  const allowedWritePaths = value.schemaVersion >= 2 ? stringArray(value.allowedWritePaths, 'allowedWritePaths', { allowEmpty: false }) : [];
+  const allowedWritePaths = value.schemaVersion === 2
+    ? stringArray(value.allowedWritePaths, 'allowedWritePaths', { allowEmpty: false })
+    : value.schemaVersion >= 3
+      ? stringArray(value.allowedWritePaths ?? [], 'allowedWritePaths')
+      : [];
   if (allowedWritePaths.some((path) => path.replaceAll('/', '\\').split('\\').includes('..'))) fail('IMPLEMENTATION_CONTRACT_INVALID', 'allowedWritePaths 不得包含 .. 路径段');
   const forbiddenNewPaths = stringArray(value.forbiddenNewPaths, 'forbiddenNewPaths');
   const forbiddenReimplementations = stringArray(value.forbiddenReimplementations, 'forbiddenReimplementations');
   if (!Array.isArray(value.evidenceCommands) || value.evidenceCommands.length === 0) fail('IMPLEMENTATION_CONTRACT_INVALID', 'evidenceCommands 必须是非空数组');
   const evidenceIds = new Set();
   const evidenceCommands = value.evidenceCommands.map((entry) => {
-    if (!isObject(entry) || Object.keys(entry).some((key) => !['id', 'command', 'failureMode', 'evidenceClass', 'cwd', 'timeoutMs', 'retryLimit'].includes(key)) || !nonEmpty(entry.id) || !nonEmpty(entry.command)) fail('IMPLEMENTATION_CONTRACT_INVALID', 'evidenceCommands 项只能包含非空 id、command 和可选分类/运行元数据');
+    if (!isObject(entry) || Object.keys(entry).some((key) => !['id', 'command', 'failureMode', 'evidenceClass', 'environment', 'cwd', 'timeoutMs', 'retryLimit'].includes(key)) || !nonEmpty(entry.id) || !nonEmpty(entry.command)) fail('IMPLEMENTATION_CONTRACT_INVALID', 'evidenceCommands 项只能包含非空 id、command 和可选分类/运行元数据');
     const id = entry.id.trim();
     if (!isSafeThreadId(id) || evidenceIds.has(id)) fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command id 无效或重复: ${id}`);
     const evidenceClass = entry.evidenceClass ?? null;
@@ -212,11 +288,14 @@ function validateImplementationContractManifest(value, taskMode, { requireResult
     if (!has(failureMode, EVIDENCE_FAILURE_MODES)) fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command ${id} failureMode 必须为 ${EVIDENCE_FAILURE_MODES.join('、')}`);
     if (evidenceClass === 'execution' && failureMode !== 'recoverable') fail('IMPLEMENTATION_CONTRACT_INVALID', `execution evidence ${id} 必须使用 recoverable`);
     if (evidenceClass === 'observability' && failureMode !== 'advisory') fail('IMPLEMENTATION_CONTRACT_INVALID', `observability evidence ${id} 必须使用 advisory`);
+    if (value.schemaVersion >= 3 && failureMode === 'blocking') fail('HARD_CONTRACT_SINGLE_VALIDATOR_FORBIDDEN', `hard contract evidence ${id} 不得单独 blocking；应使用 recoverable 并在替代证据路线穷尽后由主控裁决`);
+    const environment = entry.environment ?? 'any';
+    if (!has(environment, VALIDATION_ENVIRONMENTS)) fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command ${id} environment 无效`);
     const cwd = entry.cwd === undefined || entry.cwd === null ? null : (nonEmpty(entry.cwd) ? entry.cwd.trim() : fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command ${id} cwd 无效`));
     const timeoutMs = entry.timeoutMs === undefined || entry.timeoutMs === null ? null : (Number.isInteger(entry.timeoutMs) && entry.timeoutMs > 0 ? entry.timeoutMs : fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command ${id} timeoutMs 无效`));
     const retryLimit = entry.retryLimit === undefined || entry.retryLimit === null ? null : (Number.isInteger(entry.retryLimit) && entry.retryLimit >= 0 ? entry.retryLimit : fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command ${id} retryLimit 无效`));
     evidenceIds.add(id);
-    return { id, command: entry.command.trim(), failureMode, evidenceClass, cwd, timeoutMs, retryLimit };
+    return { id, command: entry.command.trim(), failureMode, evidenceClass, environment, cwd, timeoutMs, retryLimit };
   });
   const evidenceModes = new Map(evidenceCommands.map((entry) => [entry.id, entry.failureMode]));
   if (!Array.isArray(value.stageGates) || value.stageGates.length === 0) fail('IMPLEMENTATION_CONTRACT_INVALID', 'stageGates 必须是非空数组');
@@ -234,12 +313,24 @@ function validateImplementationContractManifest(value, taskMode, { requireResult
   if (!stageGates.some((entry) => entry.required)) fail('IMPLEMENTATION_CONTRACT_INVALID', 'stageGates 至少需要一个 required 阶段');
   if (!isObject(value.errorPolicy) || Object.keys(value.errorPolicy).some((key) => !['mode', 'rules'].includes(key)) || !nonEmpty(value.errorPolicy.mode)) fail('IMPLEMENTATION_CONTRACT_INVALID', 'errorPolicy 只能包含非空 mode 和 rules');
   const errorPolicy = { mode: value.errorPolicy.mode.trim(), rules: stringArray(value.errorPolicy.rules, 'errorPolicy.rules', { allowEmpty: false }) };
+  let validationPolicy = null;
+  if (value.schemaVersion >= 3) {
+    const expected = ['executorMayChooseAdditionalEvidence', 'alternativeEvidenceAllowed', 'singleValidatorConclusive', 'guiEvidenceRequiresInteractiveSurface'];
+    if (!isObject(value.validationPolicy) || Object.keys(value.validationPolicy).some((key) => !expected.includes(key)) || expected.some((key) => typeof value.validationPolicy[key] !== 'boolean')) fail('HARD_CONTRACT_VALIDATION_POLICY_REQUIRED', 'schema-v3 hard contract 必须提供完整 validationPolicy');
+    validationPolicy = { ...value.validationPolicy };
+    if (!validationPolicy.executorMayChooseAdditionalEvidence || !validationPolicy.alternativeEvidenceAllowed || validationPolicy.singleValidatorConclusive || !validationPolicy.guiEvidenceRequiresInteractiveSurface) fail('HARD_CONTRACT_VALIDATION_POLICY_INVALID', 'hard contract 必须允许执行者补充证据和替代证据，禁止单一 validator 定论，并要求 GUI 证据来自交互表面');
+  }
   let visualOracle = null;
   if (taskMode === 'visual_implementation') {
     if (!isObject(value.visualOracle) || Object.keys(value.visualOracle).some((key) => !['stageId', 'reference', 'criteria'].includes(key)) || !nonEmpty(value.visualOracle.stageId) || !nonEmpty(value.visualOracle.reference)) fail('VISUAL_ORACLE_REQUIRED', 'visual_implementation 任务必须只提供 visualOracle.stageId、reference 和 criteria');
     const stageId = value.visualOracle.stageId.trim();
     if (!stageIds.has(stageId) || !stageGates.find((entry) => entry.id === stageId)?.required) fail('VISUAL_ORACLE_INVALID', 'visualOracle.stageId 必须指向 required stage gate');
     visualOracle = { stageId, reference: value.visualOracle.reference.trim(), criteria: stringArray(value.visualOracle.criteria, 'visualOracle.criteria', { allowEmpty: false }) };
+    if (value.schemaVersion >= 3) {
+      const visualGate = stageGates.find((entry) => entry.id === stageId);
+      const visualEvidence = visualGate.requiredEvidence.map((id) => evidenceCommands.find((entry) => entry.id === id));
+      if (visualEvidence.some((entry) => entry?.environment === 'headless') || !visualEvidence.some((entry) => ['gui', 'mcp', 'interactive'].includes(entry?.environment))) fail('HEADLESS_GUI_EVIDENCE_FORBIDDEN', '视觉 hard contract 的 presentation/截图证据必须来自 GUI、MCP 或 interactive 表面，headless 只能验证逻辑');
+    }
   } else if (value.visualOracle !== undefined && value.visualOracle !== null) {
     if (!isObject(value.visualOracle) || Object.keys(value.visualOracle).some((key) => !['stageId', 'reference', 'criteria'].includes(key)) || !nonEmpty(value.visualOracle.stageId) || !nonEmpty(value.visualOracle.reference)) fail('VISUAL_ORACLE_INVALID', 'visualOracle 结构无效');
     const stageId = value.visualOracle.stageId.trim();
@@ -249,7 +340,8 @@ function validateImplementationContractManifest(value, taskMode, { requireResult
   let resultRequirements = null;
   if (value.resultRequirements !== undefined && value.resultRequirements !== null) {
     const resultAllowed = new Set(['manifestSchemaVersion', 'allowedArtifactRoots', 'requiredArtifactTypes', 'requiredMilestones', 'presentationStageId']);
-    if (!isObject(value.resultRequirements) || Object.keys(value.resultRequirements).some((key) => !resultAllowed.has(key)) || value.resultRequirements.manifestSchemaVersion !== RESULT_MANIFEST_SCHEMA_VERSION) fail('RESULT_REQUIREMENTS_INVALID', `resultRequirements 必须使用 manifestSchemaVersion=${RESULT_MANIFEST_SCHEMA_VERSION}`);
+    const expectedManifestSchemaVersion = value.schemaVersion >= 3 ? RESULT_MANIFEST_SCHEMA_VERSION : 1;
+    if (!isObject(value.resultRequirements) || Object.keys(value.resultRequirements).some((key) => !resultAllowed.has(key)) || value.resultRequirements.manifestSchemaVersion !== expectedManifestSchemaVersion) fail('RESULT_REQUIREMENTS_INVALID', `resultRequirements 必须使用 manifestSchemaVersion=${expectedManifestSchemaVersion}`);
     const allowedArtifactRoots = stringArray(value.resultRequirements.allowedArtifactRoots, 'resultRequirements.allowedArtifactRoots', { allowEmpty: false });
     if (allowedArtifactRoots.some((root) => root.replaceAll('/', '\\').split('\\').includes('..'))) fail('RESULT_REQUIREMENTS_INVALID', 'allowedArtifactRoots 不得包含 .. 路径段');
     const requiredArtifactTypes = stringArray(value.resultRequirements.requiredArtifactTypes, 'resultRequirements.requiredArtifactTypes');
@@ -263,11 +355,11 @@ function validateImplementationContractManifest(value, taskMode, { requireResult
       if (!requiredArtifactTypes.some((type) => ['screenshot', 'contact_sheet'].includes(type))) fail('RESULT_VISUAL_ARTIFACT_REQUIRED', 'visual_implementation 必须要求 screenshot 或 contact_sheet');
       if (!requiredMilestones.some((milestone) => ['after', 'current'].includes(milestone))) fail('RESULT_VISUAL_MILESTONE_REQUIRED', 'visual_implementation 必须要求 after 或 current 里程碑');
     }
-    resultRequirements = { manifestSchemaVersion: RESULT_MANIFEST_SCHEMA_VERSION, allowedArtifactRoots, requiredArtifactTypes, requiredMilestones, presentationStageId };
+    resultRequirements = { manifestSchemaVersion: expectedManifestSchemaVersion, allowedArtifactRoots, requiredArtifactTypes, requiredMilestones, presentationStageId };
   } else if (requireResultRequirements) {
     fail('RESULT_REQUIREMENTS_REQUIRED', '新登记 implementation/visual_implementation 必须在合同中提供 resultRequirements');
   }
-  return { contractSchemaVersion: value.schemaVersion, contractRevision, contractCommit, allowedWritePaths, reuseRequirements, forbiddenNewPaths, forbiddenReimplementations, stageGates, evidenceCommands, errorPolicy, visualOracle, resultRequirements };
+  return { contractSchemaVersion: value.schemaVersion, contractRevision, contractCommit, allowedWritePaths, reuseRequirements, forbiddenNewPaths, forbiddenReimplementations, stageGates, evidenceCommands, errorPolicy, validationPolicy, visualOracle, resultRequirements };
 }
 
 export async function loadImplementationContract(projectRoot, reference, taskMode, options = {}) {
@@ -529,14 +621,29 @@ async function loadResultManifest(projectRoot, reference, task, candidateCommit)
   } catch (error) {
     fail('RESULT_MANIFEST_INVALID', `result manifest JSON 无效: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const allowed = new Set(['schemaVersion', 'projectKey', 'controllerThreadId', 'threadId', 'displayKey', 'attempt', 'contractVersion', 'contractDigest', 'candidateCommit', 'integrationStatus', 'userVisibleSummary', 'actualChanges', 'incompleteItems', 'testSummary', 'noScreenshotReason', 'artifacts', 'createdAt']);
-  if (!isObject(value) || value.schemaVersion !== RESULT_MANIFEST_SCHEMA_VERSION || Object.keys(value).some((key) => !allowed.has(key))) fail('RESULT_MANIFEST_INVALID', `result manifest 必须使用 schemaVersion=${RESULT_MANIFEST_SCHEMA_VERSION} 且不得包含未知字段`);
+  const allowed = new Set(['schemaVersion', 'projectKey', 'controllerThreadId', 'threadId', 'displayKey', 'attempt', 'implementationPolicy', 'contractVersion', 'contractDigest', 'candidateCommit', 'integrationStatus', 'userVisibleSummary', 'actualChanges', 'affectedFiles', 'validationRationale', 'incompleteItems', 'testSummary', 'noScreenshotReason', 'artifacts', 'createdAt']);
+  const expectedManifestSchemaVersion = task.resultProtocolVersion;
+  if (!isObject(value) || value.schemaVersion !== expectedManifestSchemaVersion || value.schemaVersion !== task.resultRequirements.manifestSchemaVersion || Object.keys(value).some((key) => !allowed.has(key))) fail('RESULT_MANIFEST_INVALID', `result manifest 必须使用 schemaVersion=${expectedManifestSchemaVersion} 且不得包含未知字段`);
   if (value.projectKey !== projectKeyForRoot(projectRoot) || value.controllerThreadId !== task.directControllerThreadId || value.threadId !== task.threadId || value.displayKey !== task.displayKey || value.attempt !== task.attemptCount) fail('RESULT_MANIFEST_OWNERSHIP_MISMATCH', 'result manifest 的项目、主控、任务、displayKey 或 attempt 与台账不一致');
   if (value.contractVersion !== contractVersion(task) || value.contractDigest !== task.contractDigest || value.candidateCommit !== candidateCommit) fail('RESULT_MANIFEST_CONTRACT_MISMATCH', 'result manifest 的合同或 candidateCommit 与 completion 不一致');
   if (value.integrationStatus !== 'candidate') fail('RESULT_MANIFEST_STATUS_INVALID', 'worker 成果包只能声明 integrationStatus=candidate');
   if (value.createdAt !== undefined && !isTimestamp(value.createdAt)) fail('RESULT_MANIFEST_INVALID', 'createdAt 必须为 ISO 时间');
   if (!nonEmpty(value.userVisibleSummary)) fail('RESULT_MANIFEST_INVALID', 'userVisibleSummary 不能为空');
   const actualChanges = stringArray(value.actualChanges, 'actualChanges', { allowEmpty: false });
+  let affectedFiles = [];
+  let validationRationale = null;
+  if (value.schemaVersion >= 2) {
+    if (value.implementationPolicy !== task.implementationPolicy || !Array.isArray(value.affectedFiles) || value.affectedFiles.length === 0 || !nonEmpty(value.validationRationale)) fail('RESULT_EXECUTION_REPORT_REQUIRED', 'schema-v2 成果包必须记录 implementationPolicy、affectedFiles 和 validationRationale');
+    const seenPaths = new Set();
+    affectedFiles = value.affectedFiles.map((entry) => {
+      if (!isObject(entry) || Object.keys(entry).some((key) => !['path', 'changeType', 'reason'].includes(key)) || !nonEmpty(entry.path) || !has(entry.changeType, RESULT_FILE_CHANGE_TYPES) || !nonEmpty(entry.reason) || win32.isAbsolute(entry.path) || entry.path.replaceAll('/', '\\').split('\\').includes('..')) fail('RESULT_AFFECTED_FILE_INVALID', 'affectedFiles 必须记录项目相对 path、changeType 和 reason');
+      const path = entry.path.trim().replaceAll('\\', '/');
+      if (seenPaths.has(path.toLowerCase())) fail('RESULT_AFFECTED_FILE_INVALID', `affectedFiles path 重复: ${path}`);
+      seenPaths.add(path.toLowerCase());
+      return { path, changeType: entry.changeType, reason: entry.reason.trim() };
+    });
+    validationRationale = value.validationRationale.trim();
+  }
   const incompleteItems = stringArray(value.incompleteItems, 'incompleteItems');
   const testSummary = normalizeResultTestSummary(value.testSummary);
   if (!Array.isArray(value.artifacts)) fail('RESULT_MANIFEST_INVALID', 'artifacts 必须是数组');
@@ -546,7 +653,8 @@ async function loadResultManifest(projectRoot, reference, task, candidateCommit)
   const artifacts = [];
   for (const artifact of value.artifacts) {
     const artifactAllowed = new Set(['id', 'type', 'milestone', 'label', 'description', 'createdAt', 'sourceStageId', 'sourceTaskThreadId', 'workspaceRole', 'path', 'uri', 'sha256', 'dimensions']);
-    if (!isObject(artifact) || Object.keys(artifact).some((key) => !artifactAllowed.has(key)) || !isSafeThreadId(artifact.id) || artifactIds.has(artifact.id) || !RESULT_ARTIFACT_TYPES.includes(artifact.type) || !RESULT_ARTIFACT_MILESTONES.includes(artifact.milestone) || !nonEmpty(artifact.label) || !nonEmpty(artifact.description) || !isTimestamp(artifact.createdAt) || !nonEmpty(artifact.sourceStageId) || !stageIds.has(artifact.sourceStageId) || artifact.sourceTaskThreadId !== task.threadId || !RESULT_WORKSPACE_ROLES.includes(artifact.workspaceRole)) fail('RESULT_ARTIFACT_INVALID', 'artifact 身份、类型、里程碑、来源阶段或任务无效');
+    const sourceStageValid = adaptiveBriefTask(task) ? isSafeThreadId(artifact.sourceStageId) : stageIds.has(artifact.sourceStageId);
+    if (!isObject(artifact) || Object.keys(artifact).some((key) => !artifactAllowed.has(key)) || !isSafeThreadId(artifact.id) || artifactIds.has(artifact.id) || !RESULT_ARTIFACT_TYPES.includes(artifact.type) || !RESULT_ARTIFACT_MILESTONES.includes(artifact.milestone) || !nonEmpty(artifact.label) || !nonEmpty(artifact.description) || !isTimestamp(artifact.createdAt) || !nonEmpty(artifact.sourceStageId) || !sourceStageValid || artifact.sourceTaskThreadId !== task.threadId || !RESULT_WORKSPACE_ROLES.includes(artifact.workspaceRole)) fail('RESULT_ARTIFACT_INVALID', 'artifact 身份、类型、里程碑、来源阶段或任务无效');
     if (artifact.workspaceRole === 'task_control' || (artifact.workspaceRole === 'project_main' && artifact.type !== 'reference') || (['screenshot', 'contact_sheet'].includes(artifact.type) && artifact.workspaceRole !== 'candidate_worktree')) fail('RESULT_ARTIFACT_WORKSPACE_STATUS_MISMATCH', 'worker candidate artifact 不得冒充 project_main/task_control 成果');
     artifactIds.add(artifact.id);
     const hasPath = nonEmpty(artifact.path);
@@ -578,7 +686,7 @@ async function loadResultManifest(projectRoot, reference, task, candidateCommit)
     fail('RESULT_NO_SCREENSHOT_REASON_REQUIRED', '非视觉 implementation 没有截图时必须说明原因');
   }
   return {
-    resultManifestSchemaVersion: RESULT_MANIFEST_SCHEMA_VERSION,
+    resultManifestSchemaVersion: expectedManifestSchemaVersion,
     resultManifestPath,
     resultManifestDigest: createHash('sha256').update(raw, 'utf8').digest('hex'),
     projectKey: value.projectKey,
@@ -586,12 +694,15 @@ async function loadResultManifest(projectRoot, reference, task, candidateCommit)
     threadId: value.threadId,
     displayKey: value.displayKey,
     attempt: value.attempt,
+    implementationPolicy: value.schemaVersion >= 2 ? value.implementationPolicy : (task.implementationPolicy ?? 'hard_contract'),
     contractVersion: value.contractVersion,
     contractDigest: value.contractDigest,
     candidateCommit: value.candidateCommit,
     manifestIntegrationStatus: value.integrationStatus,
     userVisibleSummary: value.userVisibleSummary.trim(),
     actualChanges,
+    affectedFiles,
+    validationRationale,
     incompleteItems,
     testSummary,
     noScreenshotReason: nonEmpty(value.noScreenshotReason) ? value.noScreenshotReason.trim() : null,
@@ -830,7 +941,11 @@ const TITLE_STATUS_LABELS = Object.freeze({
 
 const hasThreadControl = (task) => 'displayKey' in task;
 const isTerminalTask = (task) => TERMINAL_STATUSES.has(task.status);
-const contractReady = (task) => !implementationTask(task) || (IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.includes(task.contractSchemaVersion) && nonEmpty(task.implementationContractPath) && nonEmpty(task.contractDigest));
+const hardContractTask = (task) => implementationTask(task) && task.implementationPolicy === 'hard_contract';
+const adaptiveBriefTask = (task) => implementationTask(task) && task.implementationPolicy === 'adaptive_brief';
+const contractReady = (task) => !implementationTask(task)
+  || (adaptiveBriefTask(task) && task.briefSchemaVersion === IMPLEMENTATION_BRIEF_SCHEMA_VERSION && isObject(task.implementationBrief) && /^[0-9a-f]{64}$/.test(task.briefDigest ?? ''))
+  || (hardContractTask(task) && IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.includes(task.contractSchemaVersion) && nonEmpty(task.implementationContractPath) && nonEmpty(task.contractDigest));
 const dispatchAllowed = (task) => task.status === 'executing' && (!hasThreadControl(task) || task.titleSyncStatus === 'synced') && contractReady(task);
 const currentAttemptDispatched = (task) => Number.isInteger(task.lastDispatchedAttempt) && task.lastDispatchedAttempt === (task.attemptCount ?? 1) && isTimestamp(task.lastDispatchedAt);
 const childArtifactAllowed = (task) => task.status === 'executing' && contractReady(task) && currentAttemptDispatched(task);
@@ -867,6 +982,13 @@ function ensureExecutionControl(tasks) {
 function emptyContractControl(taskMode = 'legacy_unclassified') {
   return {
     taskMode,
+    implementationPolicy: null,
+    implementationBriefPath: null,
+    briefSchemaVersion: null,
+    implementationBrief: null,
+    briefDigest: null,
+    hardContractTrigger: null,
+    hardContractReason: null,
     contractSchemaVersion: null,
     implementationContractPath: null,
     contractDigest: null,
@@ -879,6 +1001,7 @@ function emptyContractControl(taskMode = 'legacy_unclassified') {
     stageGates: [],
     evidenceCommands: [],
     errorPolicy: null,
+    validationPolicy: null,
     visualOracle: null,
     resultProtocolVersion: 0,
     resultRequirements: null,
@@ -890,8 +1013,28 @@ function emptyContractControl(taskMode = 'legacy_unclassified') {
 function ensureImplementationControl(tasks) {
   return tasks.map((task) => {
     if (!('taskMode' in task)) return { ...task, ...emptyContractControl('legacy_unclassified') };
+    const isImplementation = task.taskMode === 'implementation' || task.taskMode === 'visual_implementation';
+    const implementationPolicy = task.implementationPolicy ?? (isImplementation ? (nonEmpty(task.implementationContractPath) ? 'hard_contract' : 'adaptive_brief') : null);
+    const legacyBrief = isImplementation ? validateImplementationBriefManifest({
+      schemaVersion: IMPLEMENTATION_BRIEF_SCHEMA_VERSION,
+      objective: task.scope ?? task.title,
+      explorationHints: ['先探索真实调用链和既有实现，再决定修改位置。'],
+      validationHints: [task.acceptance ?? '选择与实际修改相匹配的验证方法。'],
+      safetyGuardrails: [task.forbiddenDecisions ?? '不得越过未解决决策。'],
+    }) : null;
+    const implementationBrief = task.implementationBrief ?? legacyBrief;
+    const briefDigest = task.briefDigest ?? (implementationBrief === null ? null : createHash('sha256').update(JSON.stringify(implementationBrief), 'utf8').digest('hex'));
     return {
       ...task,
+      implementationPolicy,
+      implementationBriefPath: task.implementationBriefPath ?? null,
+      briefSchemaVersion: implementationBrief === null ? null : (task.briefSchemaVersion ?? IMPLEMENTATION_BRIEF_SCHEMA_VERSION),
+      implementationBrief,
+      briefDigest,
+      contractDigest: implementationPolicy === 'adaptive_brief' ? briefDigest : task.contractDigest,
+      hardContractTrigger: task.hardContractTrigger ?? (implementationPolicy === 'hard_contract' ? 'user_explicit' : null),
+      hardContractReason: task.hardContractReason ?? (implementationPolicy === 'hard_contract' ? 'Legacy hard contract registered before risk-classified execution policies.' : null),
+      validationPolicy: task.validationPolicy ?? null,
       resultProtocolVersion: Number.isInteger(task.resultProtocolVersion) ? task.resultProtocolVersion : 0,
       resultRequirements: task.resultRequirements ?? null,
       deliverableHistory: Array.isArray(task.deliverableHistory) ? task.deliverableHistory : [],
@@ -1013,7 +1156,7 @@ function objectiveRuntime(tasks, objectiveId, now = Date.now()) {
   }, 0);
   const failedReplacementCount = members.filter((task) => {
     if (task.replacementOrdinal <= 0 || !['changes_requested', 'reclaimed', 'blocked'].includes(task.status) || task.candidateCommit !== null) return false;
-    const failure = [...(task.failureHistory ?? [])].reverse().find((entry) => (entry.authority ?? 'contract_evidence') === 'contract_evidence' && entry.attemptCount === task.attemptCount);
+    const failure = [...(task.failureHistory ?? [])].reverse().find((entry) => ['contract_evidence', 'worker_evidence'].includes(entry.authority ?? 'contract_evidence') && entry.attemptCount === task.attemptCount);
     return failure !== undefined && failureValueClassForDomain(failure.failureDomain) === 'product';
   }).length;
   const budgetMinutes = members.find((task) => Number.isInteger(task.objectiveBudgetMinutes))?.objectiveBudgetMinutes ?? DEFAULT_OBJECTIVE_BUDGET_MINUTES;
@@ -1033,6 +1176,7 @@ function implementationTask(task) {
 
 function contractVersion(task) {
   if (!implementationTask(task)) return null;
+  if (adaptiveBriefTask(task)) return `brief-v${task.briefSchemaVersion}`;
   return task.contractRevision ?? task.contractCommit;
 }
 
@@ -1066,11 +1210,11 @@ function missingRequiredStageIds(task) {
 }
 
 function contractSummary(task) {
-  return { taskMode: task.taskMode ?? 'legacy_unclassified', contractVersion: contractVersion(task), contractDigest: task.contractDigest ?? null, resultProtocolVersion: task.resultProtocolVersion ?? 0, completedStages: completedStageIds(task), missingStages: missingRequiredStageIds(task), deliverableCount: task.deliverableHistory?.length ?? 0 };
+  return { taskMode: task.taskMode ?? 'legacy_unclassified', implementationPolicy: task.implementationPolicy ?? null, contractVersion: contractVersion(task), contractDigest: adaptiveBriefTask(task) ? task.briefDigest : (task.contractDigest ?? null), resultProtocolVersion: task.resultProtocolVersion ?? 0, completedStages: completedStageIds(task), missingStages: missingRequiredStageIds(task), deliverableCount: task.deliverableHistory?.length ?? 0 };
 }
 
 async function assertImplementationContractCurrent(task, projectRoot) {
-  if (!implementationTask(task)) return;
+  if (!implementationTask(task) || adaptiveBriefTask(task)) return;
   const current = await loadImplementationContract(projectRoot ?? dirname(task.implementationContractPath), task.implementationContractPath, task.taskMode, { requireResultRequirements: task.resultProtocolVersion === RESULT_PROTOCOL_VERSION });
   if (current.contractDigest !== task.contractDigest || current.contractSchemaVersion !== task.contractSchemaVersion) fail('IMPLEMENTATION_CONTRACT_DRIFT', '实施合同内容或 schema 已变化；主控必须收回任务并绑定新 revision，worker 不得自行改变合同或 errorPolicy');
 }
@@ -1092,7 +1236,13 @@ function validateStageCheckpoint(task, stageId, evidence, { pendingStages = new 
     if (stageId !== undefined || (Array.isArray(evidence) && evidence.length > 0)) fail('STAGE_NOT_APPLICABLE', 'control_only/legacy 任务不得提交实施阶段证据');
     return { stageId: null, evidence: [] };
   }
-  if (!nonEmpty(stageId)) fail('STAGE_REQUIRED', '实施任务 progress 必须提供已登记的 stage');
+  if (adaptiveBriefTask(task)) {
+    const normalizedStageId = nonEmpty(stageId) ? stageId.trim() : null;
+    if (normalizedStageId === null) return { stageId: null, evidence: normalizeEvidenceReferences(evidence) };
+    if (!isSafeThreadId(normalizedStageId)) fail('STAGE_UNKNOWN', `stage id 无效: ${normalizedStageId}`);
+    return { stageId: normalizedStageId, evidence: normalizeEvidenceReferences(evidence) };
+  }
+  if (!nonEmpty(stageId)) fail('STAGE_REQUIRED', 'hard contract implementation progress 必须提供已登记的 stage');
   const normalizedStageId = stageId.trim();
   const gateIndex = task.stageGates.findIndex((gate) => gate.id === normalizedStageId);
   if (gateIndex < 0) fail('STAGE_UNKNOWN', `未登记的 stage: ${normalizedStageId}`);
@@ -1779,9 +1929,17 @@ function validateControllerHeartbeat(value, knownControllers) {
 }
 
 function validateDeliverablePackage(value, task, projectRoot) {
-  if (!isObject(value) || value.resultManifestSchemaVersion !== RESULT_MANIFEST_SCHEMA_VERSION || !nonEmpty(value.resultManifestPath) || !win32.isAbsolute(value.resultManifestPath) || !windowsPathInside(value.resultManifestPath, projectRoot) || !/^[0-9a-f]{64}$/.test(value.resultManifestDigest ?? '')) fail('REGISTRY_INVALID', 'deliverable result manifest 元数据无效');
+  if (!isObject(value) || !RESULT_MANIFEST_SCHEMA_VERSIONS.includes(value.resultManifestSchemaVersion) || value.resultManifestSchemaVersion !== task.resultProtocolVersion || !nonEmpty(value.resultManifestPath) || !win32.isAbsolute(value.resultManifestPath) || !windowsPathInside(value.resultManifestPath, projectRoot) || !/^[0-9a-f]{64}$/.test(value.resultManifestDigest ?? '')) fail('REGISTRY_INVALID', 'deliverable result manifest 元数据无效');
   if (value.projectKey !== projectKeyForRoot(projectRoot) || value.controllerThreadId !== task.directControllerThreadId || value.threadId !== task.threadId || value.displayKey !== task.displayKey || !Number.isInteger(value.attempt) || value.attempt < 1 || value.contractVersion !== contractVersion(task) || value.contractDigest !== task.contractDigest || !nonEmpty(value.candidateCommit) || value.manifestIntegrationStatus !== 'candidate' || !nonEmpty(value.userVisibleSummary)) fail('REGISTRY_INVALID', 'deliverable 身份、合同或候选状态无效');
   if (!Array.isArray(value.actualChanges) || value.actualChanges.length === 0 || !value.actualChanges.every(nonEmpty) || !Array.isArray(value.incompleteItems) || !value.incompleteItems.every(nonEmpty)) fail('REGISTRY_INVALID', 'deliverable changes/incompleteItems 无效');
+  if (value.resultManifestSchemaVersion >= 2) {
+    if (value.implementationPolicy !== task.implementationPolicy || !Array.isArray(value.affectedFiles) || value.affectedFiles.length === 0 || !nonEmpty(value.validationRationale)) fail('REGISTRY_INVALID', 'schema-v2 deliverable policy、affectedFiles 或 validationRationale 无效');
+    const paths = new Set();
+    for (const entry of value.affectedFiles) {
+      if (!isObject(entry) || !nonEmpty(entry.path) || win32.isAbsolute(entry.path) || entry.path.replaceAll('/', '\\').split('\\').includes('..') || !has(entry.changeType, RESULT_FILE_CHANGE_TYPES) || !nonEmpty(entry.reason) || paths.has(entry.path.toLowerCase())) fail('REGISTRY_INVALID', 'deliverable affectedFiles 无效');
+      paths.add(entry.path.toLowerCase());
+    }
+  }
   const testSummary = normalizeResultTestSummary(value.testSummary);
   if (value.noScreenshotReason !== null && !nonEmpty(value.noScreenshotReason)) fail('REGISTRY_INVALID', 'deliverable noScreenshotReason 无效');
   if (!Array.isArray(value.artifacts)) fail('REGISTRY_INVALID', 'deliverable artifacts 必须是数组');
@@ -1790,7 +1948,8 @@ function validateDeliverablePackage(value, task, projectRoot) {
   const stageIds = new Set(task.stageGates.map((gate) => gate.id));
   const allowedRoots = (task.resultRequirements?.allowedArtifactRoots ?? []).map((root) => win32.isAbsolute(root) ? win32.resolve(root) : win32.resolve(projectRoot, root.replaceAll('/', '\\')));
   const artifacts = value.artifacts.map((artifact) => {
-    if (!isObject(artifact) || !isSafeThreadId(artifact.id) || artifactIds.has(artifact.id) || !RESULT_ARTIFACT_TYPES.includes(artifact.type) || !RESULT_ARTIFACT_MILESTONES.includes(artifact.milestone) || !nonEmpty(artifact.label) || !nonEmpty(artifact.description) || !isTimestamp(artifact.createdAt) || !nonEmpty(artifact.sourceStageId) || !stageIds.has(artifact.sourceStageId) || artifact.sourceTaskThreadId !== task.threadId || !RESULT_WORKSPACE_ROLES.includes(artifact.workspaceRole)) fail('REGISTRY_INVALID', 'deliverable artifact 结构无效');
+    const sourceStageValid = adaptiveBriefTask(task) ? isSafeThreadId(artifact.sourceStageId) : stageIds.has(artifact.sourceStageId);
+    if (!isObject(artifact) || !isSafeThreadId(artifact.id) || artifactIds.has(artifact.id) || !RESULT_ARTIFACT_TYPES.includes(artifact.type) || !RESULT_ARTIFACT_MILESTONES.includes(artifact.milestone) || !nonEmpty(artifact.label) || !nonEmpty(artifact.description) || !isTimestamp(artifact.createdAt) || !nonEmpty(artifact.sourceStageId) || !sourceStageValid || artifact.sourceTaskThreadId !== task.threadId || !RESULT_WORKSPACE_ROLES.includes(artifact.workspaceRole)) fail('REGISTRY_INVALID', 'deliverable artifact 结构无效');
     if (artifact.workspaceRole === 'task_control' || (artifact.workspaceRole === 'project_main' && artifact.type !== 'reference') || (['screenshot', 'contact_sheet'].includes(artifact.type) && artifact.workspaceRole !== 'candidate_worktree')) fail('REGISTRY_INVALID', 'deliverable artifact workspaceRole 与 candidate 状态冲突');
     artifactIds.add(artifact.id);
     const local = nonEmpty(artifact.path);
@@ -1860,7 +2019,8 @@ function validateTask(value, projectRoot) {
     if (!has(value.decisionStatus, DECISION_STATUSES)) fail('REGISTRY_INVALID', `decisionStatus 无效: ${value.decisionStatus}`);
     for (const key of ['scope', 'acceptance', 'forbiddenDecisions']) if (!nonEmpty(value[key])) fail('REGISTRY_INVALID', `${key} 无效`);
   }
-  const contractFields = ['taskMode', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'visualOracle', 'stageProgress'];
+  value = ensureImplementationControl([value])[0];
+  const contractFields = ['taskMode', 'implementationPolicy', 'implementationBriefPath', 'briefSchemaVersion', 'implementationBrief', 'briefDigest', 'hardContractTrigger', 'hardContractReason', 'contractSchemaVersion', 'implementationContractPath', 'contractDigest', 'contractRevision', 'contractCommit', 'reuseRequirements', 'forbiddenNewPaths', 'forbiddenReimplementations', 'stageGates', 'evidenceCommands', 'errorPolicy', 'validationPolicy', 'visualOracle', 'stageProgress'];
   const resultControlFields = ['resultProtocolVersion', 'resultRequirements', 'deliverableHistory'];
   const presentContractFields = contractFields.filter((key) => key in value);
   const presentResultControlFields = resultControlFields.filter((key) => key in value);
@@ -1874,26 +2034,41 @@ function validateTask(value, projectRoot) {
       value.deliverableHistory = [];
     }
     if (!has(value.taskMode, TASK_MODES)) fail('REGISTRY_INVALID', `taskMode 无效: ${value.taskMode}`);
-    if (!Array.isArray(value.stageProgress) || !Array.isArray(value.deliverableHistory) || ![0, RESULT_PROTOCOL_VERSION].includes(value.resultProtocolVersion)) fail('REGISTRY_INVALID', 'stageProgress/deliverableHistory/resultProtocolVersion 无效');
+    if (!Array.isArray(value.stageProgress) || !Array.isArray(value.deliverableHistory) || !RESULT_PROTOCOL_VERSIONS.includes(value.resultProtocolVersion)) fail('REGISTRY_INVALID', 'stageProgress/deliverableHistory/resultProtocolVersion 无效');
     if (value.taskMode === 'legacy_unclassified' || value.taskMode === 'control_only') {
-      if (value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractDigest !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.visualOracle !== null || value.resultProtocolVersion !== 0 || value.resultRequirements !== null) fail('REGISTRY_INVALID', '非实施任务不得绑定实施合同或成果协议');
+      if (value.implementationPolicy !== null || value.implementationBriefPath !== null || value.briefSchemaVersion !== null || value.implementationBrief !== null || value.briefDigest !== null || value.hardContractTrigger !== null || value.hardContractReason !== null || value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractDigest !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.validationPolicy !== null || value.visualOracle !== null || value.resultProtocolVersion !== 0 || value.resultRequirements !== null) fail('REGISTRY_INVALID', '非实施任务不得绑定实施简报、硬合同或成果协议');
       if (![value.allowedWritePaths ?? [], value.reuseRequirements, value.forbiddenNewPaths, value.forbiddenReimplementations, value.stageGates, value.evidenceCommands, value.stageProgress, value.deliverableHistory].every((entry) => Array.isArray(entry) && entry.length === 0)) fail('REGISTRY_INVALID', '非实施任务不得保留合同、阶段或成果数据');
     } else {
-      if (!IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.includes(value.contractSchemaVersion) || !nonEmpty(value.implementationContractPath) || !win32.isAbsolute(value.implementationContractPath) || !/^[0-9a-f]{64}$/.test(value.contractDigest ?? '')) fail('REGISTRY_INVALID', '实施任务合同 path/schema/digest 无效');
-      const normalizedRoot = win32.resolve(projectRoot).toLowerCase();
-      const normalizedContractPath = win32.resolve(value.implementationContractPath).toLowerCase();
-      if (normalizedContractPath !== normalizedRoot && !normalizedContractPath.startsWith(`${normalizedRoot}\\`)) fail('REGISTRY_INVALID', '实施任务合同 path 不在项目根目录内');
-      validateImplementationContractManifest({ schemaVersion: value.contractSchemaVersion, contractRevision: value.contractRevision, contractCommit: value.contractCommit, ...(value.contractSchemaVersion >= 2 ? { allowedWritePaths: value.allowedWritePaths } : {}), reuseRequirements: value.reuseRequirements, forbiddenNewPaths: value.forbiddenNewPaths, forbiddenReimplementations: value.forbiddenReimplementations, stageGates: value.stageGates, evidenceCommands: value.evidenceCommands, errorPolicy: value.errorPolicy, ...(value.visualOracle === null ? {} : { visualOracle: value.visualOracle }), ...(value.resultRequirements === null ? {} : { resultRequirements: value.resultRequirements }) }, value.taskMode, { requireResultRequirements: value.resultProtocolVersion === RESULT_PROTOCOL_VERSION });
+      if (!has(value.implementationPolicy, IMPLEMENTATION_POLICIES) || value.briefSchemaVersion !== IMPLEMENTATION_BRIEF_SCHEMA_VERSION || !isObject(value.implementationBrief) || !/^[0-9a-f]{64}$/.test(value.briefDigest ?? '')) fail('REGISTRY_INVALID', '实施任务 policy/brief/digest 无效');
+      const normalizedBrief = validateImplementationBriefManifest(value.implementationBrief);
+      if (createHash('sha256').update(JSON.stringify(normalizedBrief), 'utf8').digest('hex') !== value.briefDigest) fail('REGISTRY_INVALID', 'implementation brief digest 不匹配');
+      if (value.implementationBriefPath !== null && (!nonEmpty(value.implementationBriefPath) || !win32.isAbsolute(value.implementationBriefPath) || !windowsPathInside(value.implementationBriefPath, projectRoot))) fail('REGISTRY_INVALID', 'implementation brief path 无效或越界');
+      if (value.implementationPolicy === 'adaptive_brief') {
+        if (value.hardContractTrigger !== null || value.hardContractReason !== null || value.contractSchemaVersion !== null || value.implementationContractPath !== null || value.contractRevision !== null || value.contractCommit !== null || value.errorPolicy !== null || value.validationPolicy !== null || value.visualOracle !== null || value.contractDigest !== value.briefDigest) fail('REGISTRY_INVALID', 'adaptive brief 不得保留硬合同字段，binding digest 必须匹配 brief');
+        if (![value.allowedWritePaths ?? [], value.reuseRequirements, value.forbiddenNewPaths, value.forbiddenReimplementations, value.stageGates, value.evidenceCommands].every((entry) => Array.isArray(entry) && entry.length === 0)) fail('REGISTRY_INVALID', 'adaptive brief 不得强制 write path、stage 或 validator');
+      } else {
+        if (!HARD_CONTRACT_TRIGGERS.includes(value.hardContractTrigger) || !nonEmpty(value.hardContractReason) || !IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.includes(value.contractSchemaVersion) || !nonEmpty(value.implementationContractPath) || !win32.isAbsolute(value.implementationContractPath) || !/^[0-9a-f]{64}$/.test(value.contractDigest ?? '')) fail('REGISTRY_INVALID', 'hard contract trigger/reason/path/schema/digest 无效');
+        const normalizedRoot = win32.resolve(projectRoot).toLowerCase();
+        const normalizedContractPath = win32.resolve(value.implementationContractPath).toLowerCase();
+        if (normalizedContractPath !== normalizedRoot && !normalizedContractPath.startsWith(`${normalizedRoot}\\`)) fail('REGISTRY_INVALID', '实施任务合同 path 不在项目根目录内');
+        validateImplementationContractManifest({ schemaVersion: value.contractSchemaVersion, contractRevision: value.contractRevision, contractCommit: value.contractCommit, ...(value.contractSchemaVersion >= 2 ? { allowedWritePaths: value.allowedWritePaths } : {}), reuseRequirements: value.reuseRequirements, forbiddenNewPaths: value.forbiddenNewPaths, forbiddenReimplementations: value.forbiddenReimplementations, stageGates: value.stageGates, evidenceCommands: value.evidenceCommands, errorPolicy: value.errorPolicy, ...(value.validationPolicy === null ? {} : { validationPolicy: value.validationPolicy }), ...(value.visualOracle === null ? {} : { visualOracle: value.visualOracle }), ...(value.resultRequirements === null ? {} : { resultRequirements: value.resultRequirements }) }, value.taskMode, { requireResultRequirements: value.resultProtocolVersion === RESULT_PROTOCOL_VERSION });
+      }
+      if (value.resultProtocolVersion > 0) {
+        if (!isObject(value.resultRequirements) || value.resultRequirements.manifestSchemaVersion !== value.resultProtocolVersion || !Array.isArray(value.resultRequirements.allowedArtifactRoots) || value.resultRequirements.allowedArtifactRoots.length === 0 || !Array.isArray(value.resultRequirements.requiredArtifactTypes) || !Array.isArray(value.resultRequirements.requiredMilestones)) fail('REGISTRY_INVALID', 'resultRequirements 与 result protocol 不一致');
+        if (value.taskMode === 'visual_implementation' && (!nonEmpty(value.resultRequirements.presentationStageId) || !value.resultRequirements.requiredArtifactTypes.some((type) => ['screenshot', 'contact_sheet'].includes(type)) || !value.resultRequirements.requiredMilestones.some((milestone) => ['after', 'current'].includes(milestone)))) fail('REGISTRY_INVALID', '视觉任务 resultRequirements 缺少 presentation、截图或 after/current');
+      }
       if (value.resultProtocolVersion === 0 && value.resultRequirements !== null) fail('REGISTRY_INVALID', 'legacy implementation 不得声明 resultRequirements');
       const gateIds = new Set(value.stageGates.map((gate) => gate.id));
       const evidenceIds = new Set(value.evidenceCommands.map((entry) => entry.id));
       for (const progress of value.stageProgress) {
         const currentAttempt = progress.attemptCount === value.attemptCount;
-        if (!isObject(progress) || !gateIds.has(progress.stageId) || !nonEmpty(progress.summary) || !Number.isInteger(progress.attemptCount) || progress.attemptCount < 1 || !isTimestamp(progress.createdAt) || !nonEmpty(progress.contractVersion) || !/^[0-9a-f]{64}$/.test(progress.contractDigest ?? '') || (currentAttempt && (progress.contractDigest !== value.contractDigest || progress.contractVersion !== (value.contractRevision ?? value.contractCommit))) || !Array.isArray(progress.evidence)) fail('REGISTRY_INVALID', 'stageProgress 记录无效');
+        const progressStageValid = value.implementationPolicy === 'adaptive_brief' ? (progress.stageId === null || isSafeThreadId(progress.stageId)) : gateIds.has(progress.stageId);
+        const expectedVersion = value.implementationPolicy === 'adaptive_brief' ? `brief-v${value.briefSchemaVersion}` : (value.contractRevision ?? value.contractCommit);
+        if (!isObject(progress) || !progressStageValid || !nonEmpty(progress.summary) || !Number.isInteger(progress.attemptCount) || progress.attemptCount < 1 || !isTimestamp(progress.createdAt) || !nonEmpty(progress.contractVersion) || !/^[0-9a-f]{64}$/.test(progress.contractDigest ?? '') || (currentAttempt && (progress.contractDigest !== value.contractDigest || progress.contractVersion !== expectedVersion)) || !Array.isArray(progress.evidence)) fail('REGISTRY_INVALID', 'stageProgress 记录无效');
         if (progress.carriedFromAttempt !== undefined && (!Number.isInteger(progress.carriedFromAttempt) || progress.carriedFromAttempt < 1 || progress.carriedFromAttempt >= progress.attemptCount || !isTimestamp(progress.carriedAt))) fail('REGISTRY_INVALID', 'stageProgress carry-forward provenance 无效');
         const seenEvidence = new Set();
         for (const evidence of progress.evidence) {
-          if (!isObject(evidence) || (currentAttempt && !evidenceIds.has(evidence.id)) || !nonEmpty(evidence.id) || !nonEmpty(evidence.reference) || seenEvidence.has(evidence.id)) fail('REGISTRY_INVALID', 'stageProgress evidence 无效');
+          if (!isObject(evidence) || (currentAttempt && value.implementationPolicy === 'hard_contract' && !evidenceIds.has(evidence.id)) || !nonEmpty(evidence.id) || !nonEmpty(evidence.reference) || seenEvidence.has(evidence.id)) fail('REGISTRY_INVALID', 'stageProgress evidence 无效');
           seenEvidence.add(evidence.id);
         }
       }
@@ -2720,13 +2895,32 @@ export async function controllerRegisterTask(input) {
   if (parallelPolicy === 'batch_v1' && !hasBatchBinding) fail('PARALLEL_BATCH_BINDING_REQUIRED', 'batch_v1 registration 必须绑定 batch-id 和 candidate-id');
   let contractControl;
   if (input.taskMode === 'control_only') {
-    if (nonEmpty(input.implementationContractPath)) fail('IMPLEMENTATION_CONTRACT_NOT_APPLICABLE', 'control_only 任务不得绑定实施合同');
+    if ([input.implementationContractPath, input.implementationBriefPath, input.implementationPolicy, input.hardContractTrigger, input.hardContractReason].some(nonEmpty)) fail('IMPLEMENTATION_CONTRACT_NOT_APPLICABLE', 'control_only 任务不得绑定 implementation brief/policy/contract');
     contractControl = emptyContractControl('control_only');
   } else {
-    const snapshot = await loadImplementationContract(input.projectRoot, input.implementationContractPath, input.taskMode, { requireResultRequirements: true, requireCurrentSchema: true });
-    const contractAudit = await implementationContractAuditFindings(snapshot, input.projectRoot);
-    if (contractAudit.errors.length > 0) fail('IMPLEMENTATION_CONTRACT_AUDIT_FAILED', contractAudit.errors.map((finding) => `${finding.code}:${finding.evidenceCommandId}`).join(', '));
-    contractControl = { taskMode: input.taskMode, ...snapshot, resultProtocolVersion: RESULT_PROTOCOL_VERSION, deliverableHistory: [], stageProgress: [] };
+    const implementationPolicy = input.implementationPolicy ?? 'adaptive_brief';
+    if (!has(implementationPolicy, IMPLEMENTATION_POLICIES)) fail('IMPLEMENTATION_POLICY_INVALID', `implementation policy 必须是 ${IMPLEMENTATION_POLICIES.join(' 或 ')}`);
+    const brief = await loadImplementationBrief(input.projectRoot, input.implementationBriefPath, input);
+    if (implementationPolicy === 'adaptive_brief') {
+      if (nonEmpty(input.implementationContractPath) || nonEmpty(input.hardContractTrigger) || nonEmpty(input.hardContractReason)) fail('ADAPTIVE_BRIEF_HARD_CONTRACT_FIELDS_FORBIDDEN', 'adaptive_brief 不得携带 implementation contract 或 hard-contract 升级字段');
+      contractControl = {
+        ...emptyContractControl(input.taskMode),
+        taskMode: input.taskMode,
+        implementationPolicy,
+        ...brief,
+        contractDigest: brief.briefDigest,
+        resultProtocolVersion: RESULT_PROTOCOL_VERSION,
+        resultRequirements: adaptiveResultRequirements(input.taskMode),
+      };
+    } else {
+      if (!has(input.hardContractTrigger, HARD_CONTRACT_TRIGGERS)) fail('HARD_CONTRACT_TRIGGER_REQUIRED', `hard_contract 必须记录触发条件: ${HARD_CONTRACT_TRIGGERS.join('、')}`);
+      if (!nonEmpty(input.hardContractReason) || input.hardContractReason.trim().length < 20) fail('HARD_CONTRACT_REASON_REQUIRED', 'hard_contract 必须记录不少于 20 个字符的具体风险或协调理由');
+      const snapshot = await loadImplementationContract(input.projectRoot, input.implementationContractPath, input.taskMode, { requireResultRequirements: true, requireCurrentSchema: true });
+      const contractAudit = await implementationContractAuditFindings(snapshot, input.projectRoot);
+      if (contractAudit.errors.length > 0) fail('IMPLEMENTATION_CONTRACT_AUDIT_FAILED', contractAudit.errors.map((finding) => `${finding.code}:${finding.evidenceCommandId}`).join(', '));
+      if (['shared_conflict', 'parallel_coordination'].includes(input.hardContractTrigger) && snapshot.allowedWritePaths.length === 0) fail('HARD_CONTRACT_COORDINATION_PATHS_REQUIRED', '共享冲突或并行协调 hard contract 必须明确冲突路径；其他高风险合同不默认要求路径白名单');
+      contractControl = { taskMode: input.taskMode, implementationPolicy, ...brief, hardContractTrigger: input.hardContractTrigger, hardContractReason: input.hardContractReason.trim(), ...snapshot, resultProtocolVersion: RESULT_PROTOCOL_VERSION, deliverableHistory: [], stageProgress: [] };
+    }
   }
   const { paths } = await ensureProject(home, input.projectRoot, input.controllerThreadId);
   return withExclusiveLock(paths.registryPath, async () => {
@@ -3360,7 +3554,9 @@ function renderDeliveryReport(data) {
       const artifacts = deliverable.artifacts.length > 0 ? `<div class="artifact-grid">${deliverable.artifacts.map(renderArtifactHtml).join('')}</div>` : `<p class="empty">无截图：${renderRecordedText(deliverable.noScreenshotReason ?? '未说明')}</p>`;
       const metrics = deliverable.testSummary.metrics.map((metric) => `<li>${renderRecordedText(metric.label)}：${renderRecordedText(metric.before)} → ${renderRecordedText(metric.after)}${metric.unit ? ` ${renderRecordedText(metric.unit)}` : ''}</li>`).join('');
       const testStatus = ({ passed: '通过', failed: '失败', partial: '部分通过', blocked: '受阻' })[deliverable.testSummary.status] ?? `未识别状态（${deliverable.testSummary.status}）`;
-      return `<article class="package ${packageClass}"><div class="package-head"><div><h3>第 ${deliverable.attempt} 次尝试 · ${renderRecordedText(deliverable.userVisibleSummary)}</h3><p>${escapeHtml(deliverable.recordedAt)} · 候选提交：${escapeHtml(deliverable.candidateCommit)}</p></div><span class="badge ${packageClass}">${escapeHtml(deliveryStatusLabel(deliverable, task))}</span></div><div class="columns"><div><h4>实际改变</h4><ul>${deliverable.actualChanges.map((item) => `<li>${renderRecordedText(item)}</li>`).join('')}</ul></div><div><h4>测试 / 数值</h4><p>${escapeHtml(testStatus)}：${renderRecordedText(deliverable.testSummary.summary)}</p><ul>${metrics}</ul></div></div>${deliverable.incompleteItems.length > 0 ? `<div class="warning"><strong>未完成：</strong>${deliverable.incompleteItems.map(renderRecordedText).join('；')}</div>` : ''}${deliverable.reviewReason ? `<div class="review"><strong>主控审查：</strong>${renderRecordedText(deliverable.reviewReason)}</div>` : ''}${artifacts}</article>`;
+      const affectedFiles = (deliverable.affectedFiles ?? []).map((file) => `<li><code>${escapeHtml(file.path)}</code> · ${escapeHtml(file.changeType)} · ${renderRecordedText(file.reason)}</li>`).join('');
+      const evidenceChoice = deliverable.validationRationale ? `<div class="review"><strong>为什么选择这些验证：</strong>${renderRecordedText(deliverable.validationRationale)}</div>` : '';
+      return `<article class="package ${packageClass}"><div class="package-head"><div><h3>第 ${deliverable.attempt} 次尝试 · ${renderRecordedText(deliverable.userVisibleSummary)}</h3><p>${escapeHtml(deliverable.recordedAt)} · 执行策略：${escapeHtml(deliverable.implementationPolicy === 'adaptive_brief' ? '自适应简报' : '风险硬合同')} · 候选提交：${escapeHtml(deliverable.candidateCommit)}</p></div><span class="badge ${packageClass}">${escapeHtml(deliveryStatusLabel(deliverable, task))}</span></div><div class="columns"><div><h4>实际改变</h4><ul>${deliverable.actualChanges.map((item) => `<li>${renderRecordedText(item)}</li>`).join('')}</ul>${affectedFiles ? `<h4>实际影响文件与理由</h4><ul>${affectedFiles}</ul>` : ''}</div><div><h4>测试 / 数值</h4><p>${escapeHtml(testStatus)}：${renderRecordedText(deliverable.testSummary.summary)}</p><ul>${metrics}</ul></div></div>${evidenceChoice}${deliverable.incompleteItems.length > 0 ? `<div class="warning"><strong>未完成：</strong>${deliverable.incompleteItems.map(renderRecordedText).join('；')}</div>` : ''}${deliverable.reviewReason ? `<div class="review"><strong>主控审查：</strong>${renderRecordedText(deliverable.reviewReason)}</div>` : ''}${artifacts}</article>`;
     }).join('');
     const legacy = task.deliverables.length === 0 && task.legacyArtifacts.length === 0 ? '<div class="legacy">历史证据不可用；不据此伪造完成状态。</div>' : '';
     const stageRefs = task.legacyArtifacts.length > 0 ? `<details class="legacy"><summary>阶段证据参考（未验证）</summary><ul>${task.legacyArtifacts.map((artifact) => `<li>${escapeHtml(artifact.createdAt)} · ${renderRecordedText(artifact.label)} · 证据路径：${escapeHtml(artifact.reference)}</li>`).join('')}</ul></details>` : '';
@@ -3714,7 +3910,7 @@ async function readArtifact(filePath, expectedType) {
   if (expectedType === 'task_progress' && (!nonEmpty(value.summary) || !Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'progress event summary 或 attemptCount 无效');
   if (expectedType === 'task_completed' && value.attemptCount !== undefined && (!Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'completion event attemptCount 无效');
   if (expectedType === 'task_completed' && value.resultManifest !== undefined && !isObject(value.resultManifest)) fail(code, 'completion event resultManifest 无效');
-  if (expectedType === 'task_progress' && value.stageId !== undefined && !nonEmpty(value.stageId)) fail(code, 'progress event stageId 无效');
+  if (expectedType === 'task_progress' && value.stageId !== undefined && value.stageId !== null && !nonEmpty(value.stageId)) fail(code, 'progress event stageId 无效');
   if (expectedType === 'task_progress' && value.evidence !== undefined && !Array.isArray(value.evidence)) fail(code, 'progress event evidence 无效');
   if (FAILURE_EVENT_TYPES.includes(expectedType)) {
     if (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !nonEmpty(value.attemptedStage) || !has(value.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(value.failureDomain, FAILURE_DOMAINS) || !nonEmpty(value.commandSummary) || !Array.isArray(value.evidence) || value.evidence.length === 0 || typeof value.mechanicalRetryEligible !== 'boolean' || !has(value.authority ?? 'contract_evidence', FAILURE_AUTHORITIES) || (value.failureMode !== undefined && !has(value.failureMode, EVIDENCE_FAILURE_MODES)) || (value.recoveryExhausted !== undefined && typeof value.recoveryExhausted !== 'boolean')) fail(code, 'failure event 字段无效');
@@ -4188,10 +4384,11 @@ export async function controllerMarkChangesRequested(input) {
 
 function assertContractAmendmentSafety(task, snapshot) {
   const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
-  if (!implementationTask(task) || snapshot.contractSchemaVersion !== IMPLEMENTATION_CONTRACT_SCHEMA_VERSION) fail('CONTRACT_AMENDMENT_INVALID', '只能为当前 schema-v2 实施任务绑定 schema-v2 合同');
+  if (!hardContractTask(task) || snapshot.contractSchemaVersion !== IMPLEMENTATION_CONTRACT_SCHEMA_VERSION) fail('CONTRACT_AMENDMENT_INVALID', '只能为当前 schema-v3 hard_contract 实施任务绑定 schema-v3 合同');
   if (!same(task.allowedWritePaths, snapshot.allowedWritePaths)
     || !same(task.forbiddenNewPaths, snapshot.forbiddenNewPaths)
     || !same(task.forbiddenReimplementations, snapshot.forbiddenReimplementations)
+    || !same(task.validationPolicy, snapshot.validationPolicy)
     || !same(task.resultRequirements, snapshot.resultRequirements)
     || !same(task.stageGates.map((gate) => ({ id: gate.id, required: gate.required })), snapshot.stageGates.map((gate) => ({ id: gate.id, required: gate.required })))) {
     fail('CONTRACT_AMENDMENT_SAFETY_INVARIANT_CHANGED', '合同修正不得改变 write/forbidden/result 或 required stage 身份、顺序');
@@ -4217,7 +4414,7 @@ export async function controllerAmendImplementationContract(input) {
       .filter((entry) => predecessorIds.has(entry.stageId) && entry.evidence.every((evidence) => newEvidenceIds.has(evidence.id)))
       .map((entry) => ({ ...entry, attemptCount: nextAttempt, contractDigest: snapshot.contractDigest, contractVersion: snapshot.contractRevision ?? snapshot.contractCommit, carriedFromAttempt: task.attemptCount, carriedAt: now }));
     const amendment = { attemptCount: nextAttempt, beforeContractDigest: task.contractDigest, afterContractDigest: snapshot.contractDigest, reason: input.reason.trim(), hostReceipt: input.hostReceipt.trim(), failedStage: failure?.attemptedStage ?? null, carriedStageIds: carriedProgress.map((entry) => entry.stageId), createdAt: now };
-    return appendObservabilityReceipt({ ...task, implementationContractPath: snapshot.implementationContractPath, contractDigest: snapshot.contractDigest, contractSchemaVersion: snapshot.contractSchemaVersion, contractRevision: snapshot.contractRevision, contractCommit: snapshot.contractCommit, allowedWritePaths: snapshot.allowedWritePaths, reuseRequirements: snapshot.reuseRequirements, forbiddenNewPaths: snapshot.forbiddenNewPaths, forbiddenReimplementations: snapshot.forbiddenReimplementations, stageGates: snapshot.stageGates, evidenceCommands: snapshot.evidenceCommands, errorPolicy: snapshot.errorPolicy, visualOracle: snapshot.visualOracle, resultRequirements: snapshot.resultRequirements, stageProgress: [...task.stageProgress, ...carriedProgress], contractAmendmentHistory: [...task.contractAmendmentHistory, amendment], status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: nextAttempt, lastDispatchedAttempt: nextAttempt, lastDispatchedAt: now, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'contract_amended', now);
+    return appendObservabilityReceipt({ ...task, implementationContractPath: snapshot.implementationContractPath, contractDigest: snapshot.contractDigest, contractSchemaVersion: snapshot.contractSchemaVersion, contractRevision: snapshot.contractRevision, contractCommit: snapshot.contractCommit, allowedWritePaths: snapshot.allowedWritePaths, reuseRequirements: snapshot.reuseRequirements, forbiddenNewPaths: snapshot.forbiddenNewPaths, forbiddenReimplementations: snapshot.forbiddenReimplementations, stageGates: snapshot.stageGates, evidenceCommands: snapshot.evidenceCommands, errorPolicy: snapshot.errorPolicy, validationPolicy: snapshot.validationPolicy, visualOracle: snapshot.visualOracle, resultRequirements: snapshot.resultRequirements, stageProgress: [...task.stageProgress, ...carriedProgress], contractAmendmentHistory: [...task.contractAmendmentHistory, amendment], status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: nextAttempt, lastDispatchedAttempt: nextAttempt, lastDispatchedAt: now, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'contract_amended', now);
   }});
 }
 
@@ -4489,11 +4686,19 @@ export async function createFailureEvent(input) {
   let evidenceClass = null;
   const recoveryExhausted = input.recoveryExhausted === true;
   if (implementationTask(result.task)) {
-    if (!result.task.stageGates.some((gate) => gate.id === input.attemptedStage.trim())) fail('STAGE_UNKNOWN', `未登记的 attemptedStage: ${input.attemptedStage}`);
-    const evidenceCommand = nonEmpty(input.evidenceCommandId) ? result.task.evidenceCommands.find((entry) => entry.id === input.evidenceCommandId.trim()) : null;
-    failureMode = evidenceCommand?.failureMode ?? (evidenceCommand ? 'blocking' : 'advisory');
-    evidenceClass = evidenceCommand?.evidenceClass ?? null;
-    authority = evidenceCommand && failureMode !== 'advisory' && (failureMode !== 'recoverable' || recoveryExhausted) ? 'contract_evidence' : 'non_authoritative_diagnostic';
+    if (adaptiveBriefTask(result.task)) {
+      if (!isSafeThreadId(input.attemptedStage.trim())) fail('STAGE_UNKNOWN', `attemptedStage 无效: ${input.attemptedStage}`);
+      if (nonEmpty(input.evidenceCommandId)) fail('ADAPTIVE_BRIEF_FIXED_VALIDATOR_FORBIDDEN', 'adaptive_brief 不绑定预设 evidenceCommandId；请直接登记实际使用的证据引用');
+      authority = 'worker_evidence';
+      failureMode = 'blocking';
+      evidenceClass = 'business';
+    } else {
+      if (!result.task.stageGates.some((gate) => gate.id === input.attemptedStage.trim())) fail('STAGE_UNKNOWN', `未登记的 attemptedStage: ${input.attemptedStage}`);
+      const evidenceCommand = nonEmpty(input.evidenceCommandId) ? result.task.evidenceCommands.find((entry) => entry.id === input.evidenceCommandId.trim()) : null;
+      failureMode = evidenceCommand?.failureMode ?? (evidenceCommand ? 'blocking' : 'advisory');
+      evidenceClass = evidenceCommand?.evidenceClass ?? null;
+      authority = evidenceCommand && failureMode !== 'advisory' && (failureMode !== 'recoverable' || recoveryExhausted) ? 'contract_evidence' : 'non_authoritative_diagnostic';
+    }
   }
   const prefix = input.eventType === 'task_failed' ? 'task-failed' : 'task-blocked';
   return writeChildArtifact(result.paths, result.task.threadId, prefix, { schemaVersion: 1, type: input.eventType, projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, attemptedStage: input.attemptedStage.trim(), failureClass: input.failureClass, failureDomain: input.failureDomain, commandSummary: input.commandSummary.trim(), evidenceCommandId: nonEmpty(input.evidenceCommandId) ? input.evidenceCommandId.trim() : null, failureMode, evidenceClass, recoveryExhausted, authority, evidence, mechanicalRetryEligible: input.mechanicalRetryEligible, ...contractSummary(result.task), createdAt: new Date().toISOString() });
@@ -4588,11 +4793,11 @@ function optionalBoolean(args, name, defaultValue = false) {
 
 function helpText() {
   return [
-    'codex-task-control v0.17.0',
+    'codex-task-control v0.18.0',
     '',
-    '实施合同命令：',
+    '实施简报与风险合同命令：',
     '  audit-implementation-contract --project-root <root> --contract <project-relative-json> --task-mode implementation|visual_implementation',
-    '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
+    '  register ... --task-mode control_only|implementation|visual_implementation [--execution-policy adaptive_brief|hard_contract] [--implementation-brief <project-relative-json>] [--implementation-contract <project-relative-json> --hard-contract-trigger <high_risk_irreversible|shared_conflict|parallel_coordination|user_explicit> --hard-contract-reason <reason>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
     '  controller-plan-parallel-batch --project-root <root> --controller <id> --manifest <project-relative-json>',
     '  controller-evaluate-fanout --project-root <root> --controller <id> --batch-id <id>',
     '  controller-prepare-parallel-dispatch --project-root <root> --controller <id> --batch-id <id>',
@@ -4626,7 +4831,7 @@ function helpText() {
     '  controller-recover-undispatched-attempt ... --reason <text>',
     '  controller-record-heartbeat-action-failed --project-root <root> --controller <id> --action-id <id> --reason <text> [--automation-id <id>]',
     '',
-    'implementation 成果包按 attempt 追加保存；lean HTML 只读现有台账，diagnostic 才按需读取 rollout 与显式提供的 OTel/Desktop 日志；两者都不维持 heartbeat。',
+    'implementation 默认使用 adaptive_brief：先探索真实链路，自主选择实现和验证；只有明确风险触发才允许 hard_contract。成果包必须报告实际影响文件、理由和验证依据。',
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
     'heartbeat 使用单次 watchdog；连续两轮无业务变化自动熔断，删除只自动补偿一次，清理失败后必须人工确认并显式 resume。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
@@ -4689,7 +4894,7 @@ export async function runCli(args = process.argv.slice(2)) {
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildFailureNotification(task, eventType, attemptedStage), notificationRequired: true, ...contractSummary(task) };
   }
   else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason') });
-  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions'), taskMode: option(args, '--task-mode'), implementationContractPath: option(args, '--implementation-contract'), replacementOfThreadId: option(args, '--replacement-of'), objectiveId: option(args, '--objective-id'), objectiveBudgetMinutes: option(args, '--objective-budget-minutes'), parallelPolicy: option(args, '--parallel-policy'), parallelBatchId: option(args, '--batch-id'), parallelCandidateId: option(args, '--candidate-id') });
+  else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions'), taskMode: option(args, '--task-mode'), implementationPolicy: option(args, '--execution-policy'), implementationBriefPath: option(args, '--implementation-brief'), implementationContractPath: option(args, '--implementation-contract'), hardContractTrigger: option(args, '--hard-contract-trigger'), hardContractReason: option(args, '--hard-contract-reason'), replacementOfThreadId: option(args, '--replacement-of'), objectiveId: option(args, '--objective-id'), objectiveBudgetMinutes: option(args, '--objective-budget-minutes'), parallelPolicy: option(args, '--parallel-policy'), parallelBatchId: option(args, '--batch-id'), parallelCandidateId: option(args, '--candidate-id') });
   else if (command === 'controller-plan-parallel-batch') result = await controllerPlanParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), manifestPath: required(args, '--manifest') });
   else if (command === 'controller-evaluate-fanout') result = await controllerEvaluateParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
   else if (command === 'controller-prepare-parallel-dispatch') result = await controllerPrepareParallelDispatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });

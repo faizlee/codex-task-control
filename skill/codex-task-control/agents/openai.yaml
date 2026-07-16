@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Visible-task control with safe handoff and retries"
-  default_prompt: "Use $codex-task-control to audit contracts, fan out valuable visible tasks, preserve safe retry evidence, keep control-plane debt outside business lifecycle, and perform only checkpointed quiescent controller handoffs."
+  short_description: "Visible-task control with adaptive implementation briefs"
+  default_prompt: "Use $codex-task-control to route visible tasks with an adaptive brief by default, escalate only real risks to hard contracts, and preserve reviewable evidence and safe handoff."

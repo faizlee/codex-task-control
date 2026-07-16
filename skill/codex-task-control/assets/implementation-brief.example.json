@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "objective": "Trace the real runtime path, make the smallest coherent change, and return reviewable evidence.",
+  "explorationHints": [
+    "Read the applicable project rules and inspect existing callers before editing.",
+    "Prefer reuse when it remains coherent, but do not treat these hints as a file whitelist or fixed implementation path."
+  ],
+  "validationHints": [
+    "Choose validation that matches the changed surface: headless for logic, GUI/MCP/interactive evidence for UI.",
+    "Explain why the selected evidence is relevant and preserve contradictory evidence for controller review."
+  ],
+  "safetyGuardrails": [
+    "Do not make unresolved product or safety decisions.",
+    "Do not publish, push, message external systems, or change production without explicit authority."
+  ]
+}

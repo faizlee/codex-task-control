@@ -1,18 +1,27 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "projectKey": "replace-with-project-key",
   "controllerThreadId": "controller-thread-id",
   "threadId": "worker-thread-id",
   "displayKey": "01",
   "attempt": 1,
-  "contractVersion": "visual-example-r1",
-  "contractDigest": "replace-with-64-character-contract-digest",
+  "implementationPolicy": "adaptive_brief",
+  "contractVersion": "brief-v1",
+  "contractDigest": "replace-with-64-character-brief-digest",
   "candidateCommit": "replace-with-candidate-commit",
   "integrationStatus": "candidate",
   "userVisibleSummary": "The required visible state is ready for direct-controller review.",
   "actualChanges": [
     "Updated the existing UI path without replacing the component."
   ],
+  "affectedFiles": [
+    {
+      "path": "src/existing-ui/component.tsx",
+      "changeType": "modified",
+      "reason": "Runtime inspection showed this component renders the affected state."
+    }
+  ],
+  "validationRationale": "Headless checks cover logic only; the current UI state was verified through an interactive screenshot surface.",
   "incompleteItems": [],
   "testSummary": {
     "status": "passed",

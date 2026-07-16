@@ -1,18 +1,27 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "projectKey": "replace-with-project-key",
   "controllerThreadId": "controller-thread-id",
   "threadId": "worker-thread-id",
   "displayKey": "01",
   "attempt": 1,
-  "contractVersion": "example-r1",
-  "contractDigest": "replace-with-64-character-contract-digest",
+  "implementationPolicy": "adaptive_brief",
+  "contractVersion": "brief-v1",
+  "contractDigest": "replace-with-64-character-brief-digest",
   "candidateCommit": "replace-with-candidate-commit",
   "integrationStatus": "candidate",
   "userVisibleSummary": "The bounded behavior and its targeted verification are complete.",
   "actualChanges": [
     "Updated the existing contract-bound implementation path."
   ],
+  "affectedFiles": [
+    {
+      "path": "src/existing/implementation.ts",
+      "changeType": "modified",
+      "reason": "Tracing the real call chain showed this existing module owns the behavior."
+    }
+  ],
+  "validationRationale": "The worker selected the focused logic test because this change has no visual surface; no single validator is treated as the whole truth.",
   "incompleteItems": [],
   "testSummary": {
     "status": "passed",
