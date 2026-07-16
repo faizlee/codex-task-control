@@ -1,0 +1,18 @@
+# Installed codex-task-control baseline sync
+# Source: C:\Users\faizl\.codex\skills\codex-task-control
+# Target: skill/codex-task-control
+# Files: 13; each target SHA-256 matched its installed source before implementation.
+# Controller-bound deterministic combined digest: 3b48bf2c8eb1b19845ed1363dfba16e59555417402236be653a7b100003d7183
+7f2304e27add2e3b96f583e30337061e34d0a8cf6ec4c8c8e1c33469185c5187  SKILL.md
+f7b30bd7955ccd6d1183646f8d31d21bfecb4598f463cd0f40275058d0610091  scripts/task-control.unit.test.mjs
+21834e027525ab89680d21a15cea69d4f25b454794d3fb4148c7ddf2a269ae54  scripts/task-control.mjs
+0a759bf8c7d05763c5bab559b5b8e1c48e55d2b79809a45dbb7752809755a1be  references/lifecycle.md
+5537783936a6124dc8e1f12e1f055ab12fd0508602fbf7551e7ce45415fd665d  assets/visual-result-manifest.example.json
+59081c47e0c3f0d9a00e6649fa8ec8ffdc5ab3785c1f68d085dfd204e3332df6  assets/visual-implementation-contract.example.json
+8b0d45d03f054350ca7c8b4fb297cc8ecc8089df373e830af9ade676c1545041  assets/result-manifest.example.json
+e11434f431945ae4a2377ae1a01c8b6b7adf5d1e04c57d8bb3ccf053956f37a4  assets/project-adapter.example.json
+13cdfd5658e780d994c2c880bc93e89f2798d0249161be67510aac187b9f3046  assets/parallel-batch.example.json
+6f652ac5b0da17785f75bcb038ff94887c00d21dc21f3deca0d0af333085ff21  assets/observability-receipt.example.json
+a741e156646088b01b9b39782c261ad7fe223627c9e58a634624a8b7f69bdf3e  assets/implementation-contract.example.json
+efbd25231a4c1fc15b411c1b2b8ebcae3b59d20463762f6fd8bce275f1110312  assets/context-health-receipt.example.json
+c154b272a477c5091fc5d657067bb00bb6332266732ed2a920385fb0ce79fe1b  agents/openai.yaml
