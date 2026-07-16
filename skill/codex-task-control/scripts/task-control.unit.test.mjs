@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import {
   TaskControlError,
+  auditImplementationContract,
   auditControllerRouting,
   auditParallelRouting,
   controllerAssertBusinessReady,
@@ -18,6 +19,11 @@ import {
   controllerRecoverUndispatchedAttempt,
   controllerIngestCompletion,
   controllerIngestContextHealth,
+  controllerSealCheckpoint,
+  controllerQueryCheckpoint,
+  controllerPrepareHandoff,
+  controllerAcceptHandoff,
+  controllerCancelHandoff,
   controllerIngestFailure,
   controllerIngestProgress,
   controllerIngestNotificationFailed,
@@ -112,6 +118,36 @@ function implementationInput(taskControlHome, projectRoot, overrides = {}) {
     taskMode: overrides.taskMode ?? 'implementation',
     implementationContractPath: overrides.implementationContractPath,
   };
+}
+
+async function createQuiescentController(taskControlHome, projectRoot, controllerThreadId = 'checkpoint-controller') {
+  const input = {
+    taskControlHome,
+    projectRoot,
+    controllerThreadId,
+    parentThreadId: controllerThreadId,
+    threadId: `${controllerThreadId}-bootstrap`,
+    title: 'Bootstrap controller identity',
+    model: 'gpt-5.6-luna',
+    thinking: 'medium',
+    delegationMode: 'explicit',
+    executionSurface: 'visible_task',
+    modelClass: 'economical',
+    quotaReason: 'A bounded ledger bootstrap avoids premium controller work.',
+    workClass: 'repeatable',
+    decisionStatus: 'resolved',
+    scope: 'Create only the temporary controller identity fixture.',
+    acceptance: 'The controller identity is present in the temporary registry.',
+    forbiddenDecisions: 'Do not change routing or project policy.',
+    taskMode: 'control_only',
+  };
+  await controllerRegisterTask(input);
+  const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+  const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+  registry.tasks = [];
+  registry.updatedAt = new Date().toISOString();
+  await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+  return { input, registryPath, projectKey: projectKeyForRoot(projectRoot) };
 }
 
 async function createGitCandidate(projectRoot, label = 'candidate') {
@@ -813,6 +849,105 @@ test('contract-external failure stays diagnostic and cannot stop or rework an im
   }
 });
 
+test('contract audit rejects Python cache self-conflicts before registration and accepts explicit suppression', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-contract-audit-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-contract-audit-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  try {
+    const unsafe = implementationManifest();
+    unsafe.evidenceCommands = [
+      { id: 'inspection', command: 'git status --porcelain' },
+      { id: 'targeted-test', command: 'python tests/tool_test.py' },
+    ];
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(unsafe, null, 2)}\n`, 'utf8');
+    const audit = await auditImplementationContract({ projectRoot, implementationContractPath: 'implementation-contract.json', taskMode: 'implementation' });
+    assert.equal(audit.valid, false);
+    assert.equal(audit.errors[0].code, 'CONTRACT_EPHEMERAL_SELF_CONFLICT');
+    await assert.rejects(controllerRegisterTask(input), (error) => error instanceof TaskControlError && error.code === 'IMPLEMENTATION_CONTRACT_AUDIT_FAILED');
+
+    const safe = structuredClone(unsafe);
+    safe.contractRevision = 'contract-r2';
+    safe.evidenceCommands[1].command = 'python -B tests/tool_test.py';
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(safe, null, 2)}\n`, 'utf8');
+    const safeAudit = await auditImplementationContract({ projectRoot, implementationContractPath: 'implementation-contract.json', taskMode: 'implementation' });
+    assert.equal(safeAudit.valid, true);
+    assert.deepEqual(safeAudit.errors, []);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('evidence failure modes keep advisory and recoverable first failures diagnostic', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-evidence-mode-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-evidence-mode-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  try {
+    const manifest = implementationManifest();
+    manifest.evidenceCommands.find((entry) => entry.id === 'targeted-test').failureMode = 'recoverable';
+    manifest.evidenceCommands.push({ id: 'knowledge-note', command: 'python tools/search_knowledge.py runner', failureMode: 'advisory' });
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+
+    const advisoryPath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'Knowledge search returned no matches.', evidenceCommandId: 'knowledge-note', recoveryExhausted: true, mechanicalRetryEligible: true, evidence: [{ id: 'knowledge-note', reference: 'logs/knowledge.txt' }] });
+    const advisory = await controllerIngestFailure({ ...input, eventPath: advisoryPath, eventType: 'task_failed' });
+    assert.equal(advisory.status, 'executing');
+    assert.equal(advisory.failureHistory.at(-1).authority, 'non_authoritative_diagnostic');
+    assert.equal(advisory.failureHistory.at(-1).failureMode, 'advisory');
+
+    await delay();
+    const recoverablePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'First bounded verification attempt failed.', evidenceCommandId: 'targeted-test', recoveryExhausted: false, mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'logs/first.txt' }] });
+    const recoverable = await controllerIngestFailure({ ...input, eventPath: recoverablePath, eventType: 'task_failed' });
+    assert.equal(recoverable.status, 'executing');
+    assert.equal(recoverable.failureHistory.at(-1).authority, 'non_authoritative_diagnostic');
+    assert.equal(recoverable.failureHistory.at(-1).failureMode, 'recoverable');
+
+    await delay();
+    const exhaustedPath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'Bounded recovery was exhausted.', evidenceCommandId: 'targeted-test', recoveryExhausted: true, mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'logs/exhausted.txt' }] });
+    const exhausted = await controllerIngestFailure({ ...input, eventPath: exhaustedPath, eventType: 'task_failed' });
+    assert.equal(exhausted.status, 'changes_requested');
+    assert.equal(exhausted.failureHistory.at(-1).authority, 'contract_evidence');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('mechanical rework carries valid predecessors and accepts worker artifacts before lifecycle title sync', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-resumable-rework-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-resumable-rework-project-'));
+  const input = implementationInput(taskControlHome, projectRoot, { implementationContractPath: 'implementation-contract.json' });
+  try {
+    await writeFile(join(projectRoot, 'implementation-contract.json'), `${JSON.stringify(implementationManifest(), null, 2)}\n`, 'utf8');
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    const reusePath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Existing implementation was reused.', stageId: 'reuse-check', evidence: [{ id: 'inspection', reference: 'logs/reuse.txt' }] });
+    await controllerIngestProgress({ ...input, eventPath: reusePath });
+    await delay();
+    const failurePath = await createFailureEvent({ taskControlHome, selfThreadId: input.threadId, eventType: 'task_failed', attemptedStage: 'verification', failureClass: 'mechanical', failureDomain: 'test', commandSummary: 'The verification command had a mechanical defect.', evidenceCommandId: 'targeted-test', mechanicalRetryEligible: true, evidence: [{ id: 'targeted-test', reference: 'logs/failure.txt' }] });
+    await controllerIngestFailure({ ...input, eventPath: failurePath, eventType: 'task_failed' });
+    const prepared = await controllerDispatchRework(input);
+    const retried = await controllerConfirmReworkDispatched({ ...input, actionId: prepared.hostAction.actionId, hostReceipt: 'host-delivered-attempt-2' });
+    assert.equal(retried.attemptCount, 2);
+    assert.equal(retried.titleSyncStatus, 'pending');
+    assert.deepEqual(retried.completedStages, ['reuse-check']);
+    assert.deepEqual(retried.missingStages, ['verification']);
+    const carried = retried.stageProgress.find((entry) => entry.attemptCount === 2 && entry.stageId === 'reuse-check');
+    assert.equal(carried.carriedFromAttempt, 1);
+
+    await delay();
+    const verificationPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Verification passed after the bounded mechanical repair.', stageId: 'verification', evidence: [{ id: 'targeted-test', reference: 'logs/green.txt' }] });
+    const verification = await controllerIngestProgress({ ...input, eventPath: verificationPath });
+    assert.deepEqual(verification.missingStages, []);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('prepared rework changes no attempt until host receipt and zombie attempts have a gate-independent recovery', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-rework-recovery-'));
   const projectRoot = 'E:\\work\\project\\rework-recovery';
@@ -931,6 +1066,118 @@ test('handoff-required context health blocks new registration and dispatch', asy
     const scan = await controllerScanPendingEvents(input);
     assert.equal(scan.contextHealth.status, 'handoff_required');
     assert.equal(scan.needsControllerAttention, true);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('schema-v2 context advice is observable but never blocks registration', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-health-v2-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-health-v2-project-'));
+  try {
+    const { input } = await createQuiescentController(taskControlHome, projectRoot, 'health-v2-controller');
+    const reportPath = join(projectRoot, 'context-health-v5.json');
+    const receiptPath = join(projectRoot, 'context-health-receipt-v2.json');
+    await writeFile(reportPath, `${JSON.stringify({ schemaVersion: 5, summary: { threadHealth: { status: 'handoff_recommended' } } })}\n`, 'utf8');
+    await writeFile(receiptPath, `${JSON.stringify({ schemaVersion: 2, controllerThreadId: input.controllerThreadId, status: 'handoff_recommended', capturedAt: new Date().toISOString(), reportPath, metrics: { compactionOutcome: 'ineffective', workingSetTrend: 'growing' } }, null, 2)}\n`, 'utf8');
+    const health = await controllerIngestContextHealth({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, receiptPath });
+    assert.equal(health.receiptSchemaVersion, 2);
+    const registered = await controllerRegisterTask({ ...input, threadId: 'health-v2-worker', title: 'Continue after advisory evidence' });
+    assert.equal(registered.status, 'executing');
+    const invalidPath = join(projectRoot, 'invalid-required-v2.json');
+    await writeFile(invalidPath, `${JSON.stringify({ schemaVersion: 2, controllerThreadId: input.controllerThreadId, status: 'handoff_required', capturedAt: new Date().toISOString(), reportPath, metrics: {} })}\n`, 'utf8');
+    await assert.rejects(controllerIngestContextHealth({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, receiptPath: invalidPath }), (error) => error instanceof TaskControlError && error.code === 'CONTEXT_HEALTH_RECEIPT_INVALID');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('conversation checkpoints preload only confirmed summaries and retain immutable history', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-checkpoint-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-checkpoint-project-'));
+  try {
+    const { input, projectKey } = await createQuiescentController(taskControlHome, projectRoot);
+    const manifestPath = join(projectRoot, 'checkpoint.json');
+    const manifest = {
+      schemaVersion: 1,
+      projectKey,
+      controllerThreadId: input.controllerThreadId,
+      scopeSummary: 'Keep only durable decisions and source indexes in the warm preload.',
+      points: [
+        { factId: 'confirmed-objective', kind: 'objective', authority: 'user_confirmed', summary: 'Complete the approved controller migration without changing project files.', preloadPolicy: 'always', revision: 1, sourceRefs: [{ type: 'thread', ref: input.controllerThreadId, label: 'User-confirmed objective' }], supersedes: [] },
+        { factId: 'candidate-option', kind: 'open_question', authority: 'candidate', summary: 'A candidate optimization remains unreviewed.', preloadPolicy: 'on_demand', revision: 1, sourceRefs: [{ type: 'report', ref: 'candidate-report-1' }], supersedes: [] },
+        { factId: 'rejected-attempt', kind: 'rejected_path', authority: 'failure_evidence', summary: 'The old attempt is loaded only when a dispute needs its evidence.', preloadPolicy: 'dispute_only', revision: 1, sourceRefs: [{ type: 'event', ref: 'failure-event-1' }], supersedes: [] },
+      ],
+    };
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const first = await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath });
+    const preload = await controllerQueryCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, mode: 'preload' });
+    assert.deepEqual(preload.points.map((point) => point.factId), ['confirmed-objective']);
+    assert.equal(preload.omittedPointCount, 2);
+    const candidate = await controllerQueryCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, factId: 'candidate-option' });
+    assert.equal(candidate.points[0].authority, 'candidate');
+    manifest.points[0].revision = 2;
+    manifest.points[0].summary = 'Continue with the same approved boundary and a newer checkpoint revision.';
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    const second = await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath });
+    assert.equal(second.sequence, 2);
+    assert.notEqual(second.checkpointDigest, first.checkpointDigest);
+    assert.equal(await readFile(first.checkpointPath, 'utf8').then(() => true), true, 'old checkpoint file must remain immutable');
+    const unsafe = { ...manifest, points: [{ ...manifest.points[1], preloadPolicy: 'always' }] };
+    await writeFile(manifestPath, `${JSON.stringify(unsafe, null, 2)}\n`, 'utf8');
+    await assert.rejects(controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath }), (error) => error instanceof TaskControlError && error.code === 'CHECKPOINT_MANIFEST_INVALID');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('safe controller handoff is cancellable before acceptance and retires the source after acceptance', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-project-'));
+  try {
+    const { input, projectKey } = await createQuiescentController(taskControlHome, projectRoot, 'handoff-source');
+    const manifestPath = join(projectRoot, 'handoff-checkpoint.json');
+    await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, projectKey, controllerThreadId: input.controllerThreadId, scopeSummary: 'Handoff only the durable controller state.', points: [{ factId: 'next-gate', kind: 'next_gate', authority: 'controller_decision', summary: 'The successor must review the next fan-out gate before dispatch.', preloadPolicy: 'always', revision: 1, sourceRefs: [], supersedes: [] }] }, null, 2)}\n`, 'utf8');
+    const checkpoint = await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath });
+    const first = await controllerPrepareHandoff({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, successorThreadId: 'handoff-successor-a', checkpointId: checkpoint.checkpointId });
+    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'blocked-during-handoff', title: 'Must not dispatch during prepared handoff' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_HANDOFF_PREPARED');
+    const cancelled = await controllerCancelHandoff({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, handoffId: first.handoffId, reason: 'The successor shell was not available.' });
+    assert.equal(cancelled.businessAllowedForSource, true);
+    const prepared = await controllerPrepareHandoff({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, successorThreadId: 'handoff-successor-b', checkpointId: checkpoint.checkpointId });
+    const accepted = await controllerAcceptHandoff({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, successorThreadId: 'handoff-successor-b', handoffId: prepared.handoffId, checkpointDigest: checkpoint.checkpointDigest });
+    assert.equal(accepted.sourceRetired, true);
+    assert.deepEqual(accepted.preload.points.map((point) => point.factId), ['next-gate']);
+    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'source-cannot-return', title: 'Old source must stay retired' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_RETIRED');
+    const successorTask = await controllerRegisterTask({ ...input, controllerThreadId: 'handoff-successor-b', parentThreadId: 'handoff-successor-b', threadId: 'successor-worker', title: 'Review next fan-out gate' });
+    assert.equal(successorTask.displayKey, '01');
+    const scan = await controllerScanPendingEvents({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId });
+    assert.equal(scan.handoffState.status, 'accepted');
+    assert.equal(scan.shouldKeepHeartbeat, false);
+    const report = await controllerBuildDeliveryReport({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, observabilityMode: 'lean' });
+    const html = await readFile(report.reportPath, 'utf8');
+    assert.match(html, /对话知识与交接/);
+    assert.match(html, /checkpoint-0001/);
+    assert.match(html, /handoff-successor-b/);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('safe controller handoff fails closed while a child task or heartbeat debt remains', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-block-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-block-project-'));
+  try {
+    const input = { ...implementationInput(taskControlHome, projectRoot), controllerThreadId: 'busy-controller', parentThreadId: 'busy-controller', threadId: 'busy-worker', title: 'Busy control task', taskMode: 'control_only', implementationContractPath: undefined, model: 'gpt-5.6-luna', workClass: 'repeatable', quotaReason: 'A visible bounded check saves controller quota.' };
+    await controllerRegisterTask(input);
+    const projectKey = projectKeyForRoot(projectRoot);
+    const manifestPath = join(projectRoot, 'busy-checkpoint.json');
+    await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, projectKey, controllerThreadId: input.controllerThreadId, scopeSummary: 'Busy controller checkpoint.', points: [{ factId: 'busy-state', kind: 'current_state', authority: 'controller_decision', summary: 'A child task is still undispatched.', preloadPolicy: 'always', revision: 1, sourceRefs: [{ type: 'task', ref: input.threadId }], supersedes: [] }] }, null, 2)}\n`, 'utf8');
+    const checkpoint = await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath });
+    await assert.rejects(controllerPrepareHandoff({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, successorThreadId: 'busy-successor', checkpointId: checkpoint.checkpointId }), (error) => error instanceof TaskControlError && error.code === 'HANDOFF_NOT_QUIESCENT' && /undispatched_tasks/.test(error.message));
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });
@@ -1116,7 +1363,7 @@ test('diagnostic observability renders Chinese explanations and human-readable c
           context: { peakRatio: 0.82, compactions: 1 },
           repeatedCommandCount: 2,
           retryChainCount: 1,
-          threadHealth: { status: 'warning', reasons: [] },
+          threadHealth: { status: 'handoff_recommended', reasons: [{ code: 'ineffective_compaction', evidence: { beforeInputTokens: 900, afterInputTokens: 950 } }] },
           otel: { status: 'observed', completedResponseTokens: { sampleCount: 2, inputTokens: 2824623, outputTokens: 120000000 }, modelNames: ['gpt-5.6-terra'], reasoningEfforts: ['medium'], inferenceTimingAvailable: false },
           rateLimits: { sampleCount: 2, primary: { usedPercent: { first: 10, last: 11 } }, secondary: null },
         },
@@ -1145,6 +1392,8 @@ test('diagnostic observability renders Chinese explanations and human-readable c
     assert.match(html, /不是 OTel 额外消耗，也不是额度账单/);
     assert.match(html, /任务消耗直观对比/);
     assert.match(html, /发现重复命令（2 类重复指纹）/);
+    assert.match(html, /成对证据显示压缩无效或随后反弹/);
+    assert.doesNotMatch(html, /上下文压力偏高/);
     assert.match(html, /任务外空档：9 分/);
     assert.match(html, /模型回合外空档：20 秒/);
     assert.match(html, /活跃执行内无法归因：45 秒（45%）/);
@@ -1400,6 +1649,8 @@ test('legacy registries without a controller message group stay read-compatible 
     const registryPath = join(fixture.taskControlHome, 'projects', projectKeyForRoot(fixture.projectRoot), 'task-registry.json');
     const legacy = JSON.parse(await readFile(registryPath, 'utf8'));
     delete legacy.controllerMessages;
+    delete legacy.controllerCheckpoints;
+    delete legacy.controllerHandoffs;
     await writeFile(registryPath, `${JSON.stringify(legacy, null, 2)}\n`, 'utf8');
     const self = await querySelf({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId });
     assert.equal(self.task.threadId, fixture.threadId);
@@ -1408,6 +1659,8 @@ test('legacy registries without a controller message group stay read-compatible 
     assert.deepEqual(scan.pendingMessageActions, []);
     const after = JSON.parse(await readFile(registryPath, 'utf8'));
     assert.equal('controllerMessages' in after, false);
+    assert.equal('controllerCheckpoints' in after, false);
+    assert.equal('controllerHandoffs' in after, false);
   });
 });
 

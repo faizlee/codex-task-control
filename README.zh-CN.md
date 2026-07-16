@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.15.0 改为稳定优先 watchdog：连续两轮没有业务变化就停止自动续期；heartbeat 删除只自动补偿一次，再失败便要求人工清理和显式恢复。任何 heartbeat 故障都不阻塞业务生命周期，且全程不调用模型 provider。
+> v0.17.0 在稳定优先 watchdog 之上加入不可变对话检查点、渐进式预加载和可取消的安全主控交接。默认只加载已确认摘要，历史证据按需展开；交接前必须完全收口，且全程不调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,12 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.15.0 已经解决什么
+## v0.17.0 已经解决什么
+
+- 对话检查点独立保存到 `$CODEX_HOME/task-control/checkpoints/`，每次只保留 1-12 条带 authority 和来源索引的摘要，不复制原始 prompt、response、工具输出或项目内容。
+- 默认 preload 只返回用户确认、项目事实、主控决策和已接受成果；候选、失败、争议与已废弃路径必须按 fact ID 或 full 模式显式查询。
+- 安全交接要求无活跃/未派发子任务、待审/收口/侧边栏动作、开放并发批次、延后消息或 heartbeat 债务。prepared 可取消，不会维持 heartbeat；accepted 后 successor 成为新根主控，旧主控永久停止新派发。
+- schema-v2 上下文健康回执只提供 `checkpoint_recommended` / `handoff_recommended` 建议；上下文占比、压缩次数、平均输入和 TTFT 不再自动成为阻塞阈值。旧 schema-v1 `handoff_required` 仅为兼容保留。
 
 - 每次有效 watchdog 扫描都会计算业务状态指纹。连续两轮没有任务、事件、审查、消息或并发批次变化时，自动续期熔断并只通知一次。
 - 已触发的 `COUNT=1` automation 会被视为已经消费。真实 progress 会清零无进展计数并准备新的 one-shot，不会误把已经触发的物理 watchdog 当成仍可续租。
@@ -55,7 +60,7 @@
 - replacement 继承稳定 objective；连续两个 replacement 失败或时间预算耗尽后，r3/new dispatch 直接 fail closed。
 - 诊断缺少玩家影响、正常生命周期复现、增长趋势和阻塞价值时，只能登记为非阻塞技术债。
 - reclaim/blocked 后必须完成用户摘要通知和 delivery report 刷新，才能创建 replacement。
-- 可接收上下文健康回执；`handoff_required` 时禁止继续登记或派发 worker。
+- 可接收新旧上下文健康回执；v2 建议不阻塞，只有历史 v1 `handoff_required` 继续 fail closed。
 - 新 implementation 合同升级为 schema v2，并明确 `allowedWritePaths`；旧 schema-v1 台账保持只读兼容。
 
 - 按项目根目录隔离任务注册表。
@@ -95,14 +100,14 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.15.0 不做什么
+## v0.17.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.15.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.17.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.15.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.17.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
 - 不替项目判断截图“好不好看”；视觉质量继续由项目 `visualOracle` 和登记的直接主控审查。
 - 当前只对 Windows 项目路径做了完整验证。
 
@@ -237,6 +242,22 @@ node $TaskControl controller-build-delivery-report --project-root "C:\work\examp
 
 # 只有用户要求排查耗时或消耗时才运行：
 node $TaskControl controller-build-delivery-report --project-root "C:\work\example" --controller "controller-1" --observability diagnostic --otel-jsonl "$HOME\.codex\otel-local\data"
+```
+
+需要把长对话收敛成按需加载的事实索引时，先按 `skill/codex-task-control/assets/conversation-checkpoint.example.json` 准备 manifest：
+
+```powershell
+node $TaskControl controller-seal-checkpoint --project-root "C:\work\example" --controller "controller-1" --manifest "C:\scratch\checkpoint.json"
+node $TaskControl controller-query-checkpoint --project-root "C:\work\example" --controller "controller-1" --mode preload
+node $TaskControl controller-query-checkpoint --project-root "C:\work\example" --controller "controller-1" --point "open-question-1"
+```
+
+交接前先关闭所有任务、审查、消息、并发批次和 heartbeat 债务，然后准备、接受或取消：
+
+```powershell
+node $TaskControl controller-prepare-handoff --project-root "C:\work\example" --controller "controller-1" --successor "controller-2" --checkpoint "checkpoint-0001"
+node $TaskControl controller-accept-handoff --project-root "C:\work\example" --controller "controller-1" --successor "controller-2" --handoff-id "<id>" --checkpoint-digest "<sha256>"
+node $TaskControl controller-cancel-handoff --project-root "C:\work\example" --controller "controller-1" --handoff-id "<id>" --reason "successor 未创建"
 ```
 
 默认 `lean` 只生成 `index.html`，不读取 rollout/OTel。显式 `diagnostic` 在同目录生成 `diagnostic.html`，并分别显示任务外空档、任务窗口内但不在已配对 turn 中的空档、active turn 和 active turn 内无法归因；只有最后一个比例参与异常判断。页面采用中文解释与万/亿紧凑数字，并保留精确值和任务间比较条。只有同 conversation OTel completed-response 回执存在时，token 才能按 task 直接统计；这些 token 是已发生请求的累计处理量，不是 OTel 开销，也不是额度账单。rate-limit snapshot 仍是账户级包络；unknown 永远保持未归因。

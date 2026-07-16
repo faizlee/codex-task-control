@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "projectKey": "replace-with-project-key",
+  "controllerThreadId": "replace-with-controller-thread-id",
+  "scopeSummary": "本检查点只保留当前目标、已确认决策、已接受成果、阻塞和下一门禁。",
+  "points": [
+    {
+      "factId": "current-objective",
+      "kind": "objective",
+      "authority": "user_confirmed",
+      "summary": "在不修改项目规则的前提下完成当前专题。",
+      "preloadPolicy": "always",
+      "revision": 1,
+      "sourceRefs": [
+        {
+          "type": "thread",
+          "ref": "replace-with-controller-thread-id",
+          "label": "用户确认目标"
+        }
+      ],
+      "supersedes": []
+    },
+    {
+      "factId": "failed-candidate",
+      "kind": "rejected_path",
+      "authority": "failure_evidence",
+      "summary": "旧候选因已记录的合同冲突被拒绝，仅在排查争议时加载。",
+      "preloadPolicy": "dispute_only",
+      "revision": 1,
+      "sourceRefs": [
+        {
+          "type": "report",
+          "ref": "failure-event-id",
+          "label": "失败证据索引"
+        }
+      ],
+      "supersedes": []
+    }
+  ]
+}

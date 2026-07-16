@@ -35,11 +35,13 @@
   "evidenceCommands": [
     {
       "id": "diff-check",
-      "command": "git diff --check"
+      "command": "git diff --check",
+      "failureMode": "blocking"
     },
     {
       "id": "screenshot",
-      "command": "replace-with-project-screenshot-command"
+      "command": "replace-with-project-screenshot-command",
+      "failureMode": "recoverable"
     }
   ],
   "errorPolicy": {

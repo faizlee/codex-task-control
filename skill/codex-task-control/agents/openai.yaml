@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Stable parallel task control with bounded watchdogs"
-  default_prompt: "Use $codex-task-control to fan out valuable visible tasks, keep heartbeat failures outside business lifecycle, stop unchanged watchdog loops, recover stuck attempts, and generate Chinese delivery diagnostics on demand."
+  short_description: "Visible-task control with checkpoints and safe handoff"
+  default_prompt: "Use $codex-task-control to fan out valuable visible tasks, keep lifecycle evidence auditable, seal concise source-linked checkpoints, progressively preload confirmed facts, and perform only quiescent cancellable controller handoffs."

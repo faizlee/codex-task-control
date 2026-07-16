@@ -31,10 +31,20 @@ export const FAILURE_CLASSES = Object.freeze(['mechanical', 'comprehension', 'ju
 export const FAILURE_DOMAINS = Object.freeze(['tooling', 'environment', 'contract', 'test', 'implementation']);
 export const FAILURE_EVENT_TYPES = Object.freeze(['task_failed', 'task_blocked']);
 export const FAILURE_AUTHORITIES = Object.freeze(['contract_evidence', 'non_authoritative_diagnostic']);
+export const EVIDENCE_FAILURE_MODES = Object.freeze(['blocking', 'recoverable', 'advisory']);
 export const OBJECTIVE_FUSE_REPLACEMENT_LIMIT = 2;
 export const DEFAULT_OBJECTIVE_BUDGET_MINUTES = 120;
 export const OBJECTIVE_PROTOCOL_VERSION = 1;
-export const CONTEXT_HEALTH_STATUSES = Object.freeze(['healthy', 'warning', 'handoff_required']);
+export const CONTEXT_HEALTH_STATUSES = Object.freeze(['healthy', 'warning', 'checkpoint_recommended', 'handoff_recommended', 'handoff_required']);
+export const CONTEXT_HEALTH_RECEIPT_V2_STATUSES = Object.freeze(['healthy', 'checkpoint_recommended', 'handoff_recommended']);
+export const CHECKPOINT_PROTOCOL_VERSION = 1;
+export const CHECKPOINT_POINT_KINDS = Object.freeze(['objective', 'current_state', 'confirmed_decision', 'accepted_result', 'blocker', 'rejected_path', 'open_question', 'next_gate', 'source_index']);
+export const CHECKPOINT_AUTHORITIES = Object.freeze(['user_confirmed', 'project_fact', 'controller_decision', 'accepted_result', 'candidate', 'failure_evidence', 'unverified', 'superseded']);
+export const CHECKPOINT_PRELOAD_POLICIES = Object.freeze(['always', 'on_demand', 'dispute_only', 'never']);
+export const CHECKPOINT_SOURCE_TYPES = Object.freeze(['file', 'thread', 'task', 'report', 'event', 'uri']);
+export const CHECKPOINT_ALWAYS_AUTHORITIES = Object.freeze(['user_confirmed', 'project_fact', 'controller_decision', 'accepted_result']);
+export const HANDOFF_PROTOCOL_VERSION = 1;
+export const HANDOFF_STATUSES = Object.freeze(['prepared', 'accepted', 'cancelled']);
 export const DIAGNOSTIC_CLASSIFICATIONS = Object.freeze(['technical_debt', 'milestone_blocker']);
 export const BLOCKER_SOURCES = Object.freeze(['diagnostic', 'external', 'contract', 'superseded']);
 export const HEARTBEAT_STATUSES = Object.freeze(['armed', 'cancelled']);
@@ -192,12 +202,15 @@ function validateImplementationContractManifest(value, taskMode, { requireResult
   if (!Array.isArray(value.evidenceCommands) || value.evidenceCommands.length === 0) fail('IMPLEMENTATION_CONTRACT_INVALID', 'evidenceCommands 必须是非空数组');
   const evidenceIds = new Set();
   const evidenceCommands = value.evidenceCommands.map((entry) => {
-    if (!isObject(entry) || Object.keys(entry).some((key) => !['id', 'command'].includes(key)) || !nonEmpty(entry.id) || !nonEmpty(entry.command)) fail('IMPLEMENTATION_CONTRACT_INVALID', 'evidenceCommands 项只能包含非空 id 和 command');
+    if (!isObject(entry) || Object.keys(entry).some((key) => !['id', 'command', 'failureMode'].includes(key)) || !nonEmpty(entry.id) || !nonEmpty(entry.command)) fail('IMPLEMENTATION_CONTRACT_INVALID', 'evidenceCommands 项只能包含非空 id、command 和可选 failureMode');
     const id = entry.id.trim();
     if (!isSafeThreadId(id) || evidenceIds.has(id)) fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command id 无效或重复: ${id}`);
+    const failureMode = entry.failureMode ?? 'blocking';
+    if (!has(failureMode, EVIDENCE_FAILURE_MODES)) fail('IMPLEMENTATION_CONTRACT_INVALID', `evidence command ${id} failureMode 必须为 ${EVIDENCE_FAILURE_MODES.join('、')}`);
     evidenceIds.add(id);
-    return { id, command: entry.command.trim() };
+    return { id, command: entry.command.trim(), failureMode };
   });
+  const evidenceModes = new Map(evidenceCommands.map((entry) => [entry.id, entry.failureMode]));
   if (!Array.isArray(value.stageGates) || value.stageGates.length === 0) fail('IMPLEMENTATION_CONTRACT_INVALID', 'stageGates 必须是非空数组');
   const stageIds = new Set();
   const stageGates = value.stageGates.map((entry) => {
@@ -207,6 +220,7 @@ function validateImplementationContractManifest(value, taskMode, { requireResult
     stageIds.add(id);
     const requiredEvidence = stringArray(entry.requiredEvidence, `stageGates.${id}.requiredEvidence`, { allowEmpty: false });
     if (requiredEvidence.some((evidenceId) => !evidenceIds.has(evidenceId))) fail('IMPLEMENTATION_CONTRACT_INVALID', `stage ${id} 引用了未登记 evidence command`);
+    if (entry.required && requiredEvidence.some((evidenceId) => evidenceModes.get(evidenceId) === 'advisory')) fail('IMPLEMENTATION_CONTRACT_INVALID', `required stage ${id} 不得把 advisory evidence 作为完成门禁`);
     return { id, required: entry.required, description: entry.description.trim(), requiredEvidence };
   });
   if (!stageGates.some((entry) => entry.required)) fail('IMPLEMENTATION_CONTRACT_INVALID', 'stageGates 至少需要一个 required 阶段');
@@ -265,6 +279,47 @@ export async function loadImplementationContract(projectRoot, reference, taskMod
   }
   const manifest = validateImplementationContractManifest(value, taskMode, options);
   return { implementationContractPath, contractDigest: createHash('sha256').update(raw, 'utf8').digest('hex'), ...manifest };
+}
+
+async function projectIgnoresPythonCache(projectRoot) {
+  const probes = ['__pycache__/task_control_probe.pyc', 'tools/__pycache__/task_control_probe.pyc', 'src/__pycache__/task_control_probe.pyc'];
+  for (const probe of probes) {
+    try {
+      await execFile('git', ['-C', projectRoot, 'check-ignore', '-q', '--', probe], { windowsHide: true });
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function implementationContractAuditFindings(snapshot, projectRoot) {
+  const errors = [];
+  const warnings = [];
+  const commands = snapshot.evidenceCommands.map((entry) => entry.command);
+  const pythonProducer = commands.some((command) => /(?:^|[\s;&|])(?:python(?:3(?:\.\d+)?)?|py(?:\.exe)?|pytest)(?:\s|$)/i.test(command));
+  const bytecodeSuppressed = commands.some((command) => /PYTHONDONTWRITEBYTECODE\s*=\s*1|(?:^|\s)(?:python(?:3(?:\.\d+)?)?|py(?:\.exe)?)\s+-[^\s]*B/i.test(command));
+  const cacheIgnoredByGit = pythonProducer && !bytecodeSuppressed ? await projectIgnoresPythonCache(projectRoot) : false;
+  for (const evidence of snapshot.evidenceCommands) {
+    const strictUntracked = /git\s+(?:status\s+--porcelain|ls-files\s+--others)/i.test(evidence.command);
+    const ignoresPythonCache = /__pycache__|\.pyc|PYTHONDONTWRITEBYTECODE|(?:^|\s)(?:python(?:3(?:\.\d+)?)?|py(?:\.exe)?)\s+-[^\s]*B/i.test(evidence.command);
+    if (pythonProducer && strictUntracked && !bytecodeSuppressed && !cacheIgnoredByGit && !ignoresPythonCache && evidence.failureMode !== 'advisory') {
+      errors.push({ code: 'CONTRACT_EPHEMERAL_SELF_CONFLICT', evidenceCommandId: evidence.id, message: '合同既运行 Python 又把全部未跟踪文件作为阻断条件，但未抑制或排除 __pycache__/*.pyc。' });
+    }
+    if (/search_knowledge\.py|check_knowledge_capture\.py/i.test(evidence.command) && evidence.failureMode === 'blocking') {
+      warnings.push({ code: 'GOVERNANCE_COMMAND_BLOCKING_REVIEW', evidenceCommandId: evidence.id, message: '知识搜索/捕获命令被设为 blocking；请确认“无结果”确实应停止业务实施。' });
+    }
+    if (/(?:resolve-path|getfullpath|realpath).*(?:-eq|==)|(?:-eq|==).*(?:resolve-path|getfullpath|realpath)/i.test(evidence.command)) {
+      warnings.push({ code: 'PATH_IDENTITY_NORMALIZATION_REVIEW', evidenceCommandId: evidence.id, message: '命令包含路径身份比较；请确认大小写、分隔符和 junction/realpath 已统一。' });
+    }
+  }
+  return { errors, warnings };
+}
+
+export async function auditImplementationContract(input) {
+  const snapshot = await loadImplementationContract(input.projectRoot, input.implementationContractPath, input.taskMode, { requireResultRequirements: true, requireCurrentSchema: true });
+  const findings = await implementationContractAuditFindings(snapshot, input.projectRoot);
+  return { valid: findings.errors.length === 0, taskMode: input.taskMode, implementationContractPath: snapshot.implementationContractPath, contractDigest: snapshot.contractDigest, contractVersion: snapshot.contractRevision ?? snapshot.contractCommit, ...findings };
 }
 
 function resolveResultManifestPath(projectRoot, reference) {
@@ -769,6 +824,7 @@ const isTerminalTask = (task) => TERMINAL_STATUSES.has(task.status);
 const contractReady = (task) => !implementationTask(task) || (IMPLEMENTATION_CONTRACT_SCHEMA_VERSIONS.includes(task.contractSchemaVersion) && nonEmpty(task.implementationContractPath) && nonEmpty(task.contractDigest));
 const dispatchAllowed = (task) => task.status === 'executing' && (!hasThreadControl(task) || task.titleSyncStatus === 'synced') && contractReady(task);
 const currentAttemptDispatched = (task) => Number.isInteger(task.lastDispatchedAttempt) && task.lastDispatchedAttempt === (task.attemptCount ?? 1) && isTimestamp(task.lastDispatchedAt);
+const childArtifactAllowed = (task) => task.status === 'executing' && contractReady(task) && currentAttemptDispatched(task);
 
 function compactBaseTitle(value) {
   const normalized = value.trim().replace(/\s+/g, ' ');
@@ -913,9 +969,21 @@ function controllerHealthFor(registry, controllerThreadId) {
   return (registry.controllerHealth ?? []).find((entry) => entry.controllerThreadId === controllerThreadId) ?? null;
 }
 
+function preparedHandoffFor(registry, controllerThreadId) {
+  return (registry.controllerHandoffs ?? []).find((entry) => entry.sourceControllerThreadId === controllerThreadId && entry.status === 'prepared') ?? null;
+}
+
+function acceptedHandoffFor(registry, controllerThreadId) {
+  return (registry.controllerHandoffs ?? []).findLast((entry) => entry.sourceControllerThreadId === controllerThreadId && entry.status === 'accepted') ?? null;
+}
+
 function assertControllerHealthyForDispatch(registry, controllerThreadId) {
   const health = controllerHealthFor(registry, controllerThreadId);
   if (health?.status === 'handoff_required') fail('CONTROLLER_HANDOFF_REQUIRED', `主控 ${controllerThreadId} 已达到 handoff_required；必须先生成结构化 handoff 并迁移干净主控`);
+  const handoff = preparedHandoffFor(registry, controllerThreadId);
+  if (handoff) fail('CONTROLLER_HANDOFF_PREPARED', `主控 ${controllerThreadId} 已准备交接 ${handoff.handoffId}；必须由 successor 接受或由 source 取消后才能登记或派发新工作`);
+  const accepted = acceptedHandoffFor(registry, controllerThreadId);
+  if (accepted) fail('CONTROLLER_RETIRED', `主控 ${controllerThreadId} 已交接给 ${accepted.successorThreadId}；旧主控不能再登记或派发新工作`);
 }
 
 function objectiveTasks(tasks, objectiveId) {
@@ -952,6 +1020,21 @@ function contractVersion(task) {
 
 function currentStageProgress(task) {
   return (task.stageProgress ?? []).filter((entry) => entry.attemptCount === (task.attemptCount ?? 1));
+}
+
+function carriedStageProgressForMechanicalRework(task, nextAttempt, carriedAt) {
+  if (!implementationTask(task)) return [];
+  const failure = [...(task.failureHistory ?? [])].reverse().find((entry) => (entry.authority ?? 'contract_evidence') === 'contract_evidence'
+    && entry.failureClass === 'mechanical'
+    && entry.mechanicalRetryEligible === true
+    && entry.attemptCount === task.attemptCount
+    && task.stageGates.some((gate) => gate.id === entry.attemptedStage));
+  if (!failure) return [];
+  const failedIndex = task.stageGates.findIndex((gate) => gate.id === failure.attemptedStage);
+  const predecessorIds = new Set(task.stageGates.slice(0, failedIndex).map((gate) => gate.id));
+  return currentStageProgress(task)
+    .filter((entry) => predecessorIds.has(entry.stageId))
+    .map((entry) => ({ ...entry, attemptCount: nextAttempt, carriedFromAttempt: task.attemptCount, carriedAt }));
 }
 
 function completedStageIds(task) {
@@ -1788,6 +1871,7 @@ function validateTask(value, projectRoot) {
       const evidenceIds = new Set(value.evidenceCommands.map((entry) => entry.id));
       for (const progress of value.stageProgress) {
         if (!isObject(progress) || !gateIds.has(progress.stageId) || !nonEmpty(progress.summary) || !Number.isInteger(progress.attemptCount) || progress.attemptCount < 1 || !isTimestamp(progress.createdAt) || progress.contractDigest !== value.contractDigest || progress.contractVersion !== (value.contractRevision ?? value.contractCommit) || !Array.isArray(progress.evidence)) fail('REGISTRY_INVALID', 'stageProgress 记录无效');
+        if (progress.carriedFromAttempt !== undefined && (!Number.isInteger(progress.carriedFromAttempt) || progress.carriedFromAttempt < 1 || progress.carriedFromAttempt >= progress.attemptCount || !isTimestamp(progress.carriedAt))) fail('REGISTRY_INVALID', 'stageProgress carry-forward provenance 无效');
         const seenEvidence = new Set();
         for (const evidence of progress.evidence) {
           if (!isObject(evidence) || !evidenceIds.has(evidence.id) || !nonEmpty(evidence.reference) || seenEvidence.has(evidence.id)) fail('REGISTRY_INVALID', 'stageProgress evidence 无效');
@@ -1862,7 +1946,7 @@ function validateTask(value, projectRoot) {
     } else {
       if (!isSafeThreadId(value.objectiveId) || (value.replacementOfThreadId !== null && !isSafeThreadId(value.replacementOfThreadId)) || !Number.isInteger(value.replacementOrdinal) || value.replacementOrdinal < 0 || !Number.isInteger(value.objectiveBudgetMinutes) || value.objectiveBudgetMinutes <= 0 || !isTimestamp(value.objectiveCreatedAt)) fail('REGISTRY_INVALID', 'objective identity/budget 无效');
       for (const failure of value.failureHistory) {
-        if (!isObject(failure) || !FAILURE_EVENT_TYPES.includes(failure.type) || !has(failure.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(failure.failureDomain, FAILURE_DOMAINS) || !nonEmpty(failure.attemptedStage) || !nonEmpty(failure.commandSummary) || typeof failure.mechanicalRetryEligible !== 'boolean' || !Number.isInteger(failure.attemptCount) || failure.attemptCount < 1 || !isTimestamp(failure.createdAt) || !Array.isArray(failure.evidence) || failure.evidence.length === 0 || !failure.evidence.every((entry) => isObject(entry) && nonEmpty(entry.id) && nonEmpty(entry.reference)) || (failure.authority !== undefined && !has(failure.authority, FAILURE_AUTHORITIES)) || (failure.evidenceCommandId !== undefined && failure.evidenceCommandId !== null && !nonEmpty(failure.evidenceCommandId))) fail('REGISTRY_INVALID', 'failureHistory 记录无效');
+        if (!isObject(failure) || !FAILURE_EVENT_TYPES.includes(failure.type) || !has(failure.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(failure.failureDomain, FAILURE_DOMAINS) || !nonEmpty(failure.attemptedStage) || !nonEmpty(failure.commandSummary) || typeof failure.mechanicalRetryEligible !== 'boolean' || !Number.isInteger(failure.attemptCount) || failure.attemptCount < 1 || !isTimestamp(failure.createdAt) || !Array.isArray(failure.evidence) || failure.evidence.length === 0 || !failure.evidence.every((entry) => isObject(entry) && nonEmpty(entry.id) && nonEmpty(entry.reference)) || (failure.authority !== undefined && !has(failure.authority, FAILURE_AUTHORITIES)) || (failure.evidenceCommandId !== undefined && failure.evidenceCommandId !== null && !nonEmpty(failure.evidenceCommandId)) || (failure.failureMode !== undefined && !has(failure.failureMode, EVIDENCE_FAILURE_MODES)) || (failure.recoveryExhausted !== undefined && typeof failure.recoveryExhausted !== 'boolean')) fail('REGISTRY_INVALID', 'failureHistory 记录无效');
       }
       for (const diagnostic of value.diagnostics) {
         if (!isObject(diagnostic) || !isSafeThreadId(diagnostic.diagnosticId) || !has(diagnostic.classification, DIAGNOSTIC_CLASSIFICATIONS) || !nonEmpty(diagnostic.summary) || !isTimestamp(diagnostic.recordedAt) || !Array.isArray(diagnostic.evidenceRefs)) fail('REGISTRY_INVALID', 'diagnostic 记录无效');
@@ -1907,6 +1991,53 @@ function validateTask(value, projectRoot) {
     if (value.status === 'blocked' && currentDeliverable && currentDeliverable.deliveryStatus !== 'rejected') fail('REGISTRY_INVALID', 'blocked 的当前成果包必须显示为 rejected');
   }
   if (!isTimestamp(value.updatedAt) || !lifecycleConsistent(value)) fail('REGISTRY_INVALID', '任务生命周期或 updatedAt 无效');
+  return { ...value };
+}
+
+function assertExactKeys(value, allowed, code, label) {
+  const unexpected = Object.keys(value).filter((key) => !allowed.includes(key));
+  if (unexpected.length) fail(code, `${label} 包含未允许字段: ${unexpected.join(', ')}`);
+}
+
+function validateCheckpointSourceRef(value) {
+  if (!isObject(value)) fail('CHECKPOINT_MANIFEST_INVALID', 'sourceRef 必须是对象');
+  assertExactKeys(value, ['type', 'ref', 'label'], 'CHECKPOINT_MANIFEST_INVALID', 'sourceRef');
+  if (!has(value.type, CHECKPOINT_SOURCE_TYPES) || !nonEmpty(value.ref) || value.ref.length > 2048 || /[\u0000-\u001f]/.test(value.ref)) fail('CHECKPOINT_MANIFEST_INVALID', 'sourceRef type/ref 无效');
+  if (value.type === 'file' && !win32.isAbsolute(value.ref)) fail('CHECKPOINT_MANIFEST_INVALID', 'file sourceRef 必须是 Windows 绝对路径');
+  if (['thread', 'task'].includes(value.type) && !isSafeThreadId(value.ref)) fail('CHECKPOINT_MANIFEST_INVALID', `${value.type} sourceRef 必须是安全 ID`);
+  if (value.label !== undefined && value.label !== null && (!nonEmpty(value.label) || value.label.length > 200)) fail('CHECKPOINT_MANIFEST_INVALID', 'sourceRef label 无效');
+  return { type: value.type, ref: value.type === 'file' ? win32.resolve(value.ref) : value.ref.trim(), label: value.label?.trim() ?? null };
+}
+
+function validateCheckpointManifest(value, identity) {
+  if (!isObject(value)) fail('CHECKPOINT_MANIFEST_INVALID', 'checkpoint manifest 必须是对象');
+  assertExactKeys(value, ['schemaVersion', 'projectKey', 'controllerThreadId', 'scopeSummary', 'points'], 'CHECKPOINT_MANIFEST_INVALID', 'checkpoint manifest');
+  if (value.schemaVersion !== CHECKPOINT_PROTOCOL_VERSION || value.projectKey !== identity.projectKey || value.controllerThreadId !== identity.controllerThreadId || !nonEmpty(value.scopeSummary) || value.scopeSummary.length > 2000 || !Array.isArray(value.points) || value.points.length < 1 || value.points.length > 12) fail('CHECKPOINT_MANIFEST_INVALID', 'checkpoint manifest 身份、摘要或 points 数量无效');
+  const factIds = new Set();
+  const points = value.points.map((point) => {
+    if (!isObject(point)) fail('CHECKPOINT_MANIFEST_INVALID', 'checkpoint point 必须是对象');
+    assertExactKeys(point, ['factId', 'kind', 'authority', 'summary', 'preloadPolicy', 'revision', 'sourceRefs', 'supersedes'], 'CHECKPOINT_MANIFEST_INVALID', 'checkpoint point');
+    if (!isSafeThreadId(point.factId) || factIds.has(point.factId) || !has(point.kind, CHECKPOINT_POINT_KINDS) || !has(point.authority, CHECKPOINT_AUTHORITIES) || !nonEmpty(point.summary) || point.summary.length > 1000 || !has(point.preloadPolicy, CHECKPOINT_PRELOAD_POLICIES) || !Number.isInteger(point.revision) || point.revision < 1 || !Array.isArray(point.sourceRefs) || point.sourceRefs.length > 12 || !Array.isArray(point.supersedes) || point.supersedes.some((factId) => !isSafeThreadId(factId))) fail('CHECKPOINT_MANIFEST_INVALID', `checkpoint point 无效: ${point.factId ?? '(missing)'}`);
+    if (point.preloadPolicy === 'always' && !CHECKPOINT_ALWAYS_AUTHORITIES.includes(point.authority)) fail('CHECKPOINT_MANIFEST_INVALID', `只有已确认 authority 可以 always preload: ${point.factId}`);
+    if (point.authority === 'superseded' && point.preloadPolicy !== 'never') fail('CHECKPOINT_MANIFEST_INVALID', `superseded point 必须设为 never: ${point.factId}`);
+    factIds.add(point.factId);
+    return { factId: point.factId, kind: point.kind, authority: point.authority, summary: point.summary.trim(), preloadPolicy: point.preloadPolicy, revision: point.revision, sourceRefs: point.sourceRefs.map(validateCheckpointSourceRef), supersedes: [...new Set(point.supersedes)] };
+  });
+  return { schemaVersion: CHECKPOINT_PROTOCOL_VERSION, projectKey: identity.projectKey, controllerThreadId: identity.controllerThreadId, scopeSummary: value.scopeSummary.trim(), points };
+}
+
+function validateControllerCheckpoint(value, knownControllers) {
+  if (!isObject(value) || value.schemaVersion !== CHECKPOINT_PROTOCOL_VERSION || !knownControllers.has(value.controllerThreadId) || !Number.isInteger(value.sequence) || value.sequence < 1 || !/^checkpoint-\d{4,}$/.test(value.latestCheckpointId ?? '') || !/^[0-9a-f]{64}$/.test(value.latestCheckpointDigest ?? '') || !nonEmpty(value.checkpointPath) || !win32.isAbsolute(value.checkpointPath) || !isTimestamp(value.sealedAt)) fail('REGISTRY_INVALID', 'controller checkpoint pointer 无效');
+  return { ...value, checkpointPath: win32.resolve(value.checkpointPath) };
+}
+
+function validateControllerHandoff(value, knownControllers, checkpointByController) {
+  if (!isObject(value) || value.schemaVersion !== HANDOFF_PROTOCOL_VERSION || !isSafeThreadId(value.handoffId) || !knownControllers.has(value.sourceControllerThreadId) || !isSafeThreadId(value.successorThreadId) || value.successorThreadId === value.sourceControllerThreadId || !has(value.status, HANDOFF_STATUSES) || !/^checkpoint-\d{4,}$/.test(value.checkpointId ?? '') || !/^[0-9a-f]{64}$/.test(value.checkpointDigest ?? '') || !isTimestamp(value.preparedAt)) fail('REGISTRY_INVALID', 'controller handoff 无效');
+  const checkpoint = checkpointByController.get(value.sourceControllerThreadId);
+  if (!checkpoint || checkpoint.latestCheckpointId !== value.checkpointId || checkpoint.latestCheckpointDigest !== value.checkpointDigest) fail('REGISTRY_INVALID', 'controller handoff 未绑定当前 sealed checkpoint');
+  if (value.status === 'accepted' && (!isTimestamp(value.acceptedAt) || value.cancelledAt !== null || value.cancelReason !== null)) fail('REGISTRY_INVALID', 'accepted handoff 状态无效');
+  if (value.status === 'cancelled' && (!isTimestamp(value.cancelledAt) || !nonEmpty(value.cancelReason) || value.acceptedAt !== null)) fail('REGISTRY_INVALID', 'cancelled handoff 状态无效');
+  if (value.status === 'prepared' && (value.acceptedAt !== null || value.cancelledAt !== null || value.cancelReason !== null)) fail('REGISTRY_INVALID', 'prepared handoff 状态无效');
   return { ...value };
 }
 
@@ -1986,7 +2117,30 @@ export function validateRegistry(value, expectedProjectKey, expectedProjectRoot)
     parallelIds.add(validated.batchId);
     return validated;
   });
-  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), controllerMessages, parallelBatches, updatedAt: value.updatedAt, tasks };
+  const checkpointValues = value.controllerCheckpoints ?? [];
+  if (!Array.isArray(checkpointValues)) fail('REGISTRY_INVALID', 'controllerCheckpoints 必须是数组');
+  const checkpointControllers = new Set();
+  const controllerCheckpoints = checkpointValues.map((checkpoint) => {
+    const validated = validateControllerCheckpoint(checkpoint, knownControllers);
+    if (checkpointControllers.has(validated.controllerThreadId)) fail('REGISTRY_INVALID', `重复 controller checkpoint: ${validated.controllerThreadId}`);
+    checkpointControllers.add(validated.controllerThreadId);
+    return validated;
+  });
+  const checkpointByController = new Map(controllerCheckpoints.map((checkpoint) => [checkpoint.controllerThreadId, checkpoint]));
+  const handoffValues = value.controllerHandoffs ?? [];
+  if (!Array.isArray(handoffValues)) fail('REGISTRY_INVALID', 'controllerHandoffs 必须是数组');
+  const handoffIds = new Set(); const preparedSources = new Set(); const preparedSuccessors = new Set();
+  const controllerHandoffs = handoffValues.map((handoff) => {
+    const validated = validateControllerHandoff(handoff, knownControllers, checkpointByController);
+    if (handoffIds.has(validated.handoffId)) fail('REGISTRY_INVALID', `重复 controller handoff: ${validated.handoffId}`);
+    handoffIds.add(validated.handoffId);
+    if (validated.status === 'prepared') {
+      if (preparedSources.has(validated.sourceControllerThreadId) || preparedSuccessors.has(validated.successorThreadId)) fail('REGISTRY_INVALID', '同一 source 或 successor 只能存在一个 prepared handoff');
+      preparedSources.add(validated.sourceControllerThreadId); preparedSuccessors.add(validated.successorThreadId);
+    }
+    return validated;
+  });
+  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), controllerMessages, parallelBatches, controllerCheckpoints, controllerHandoffs, updatedAt: value.updatedAt, tasks };
 }
 
 async function readIndex(home) {
@@ -2030,7 +2184,7 @@ async function ensureProject(home, projectRoot, controllerThreadId) {
   } catch (error) {
     if (!(error instanceof TaskControlError) || !/ENOENT/.test(error.message)) throw error;
     if (!controllerThreadId) fail('TASK_NOT_REGISTERED', '项目注册表不存在');
-    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], controllerHealth: [], controllerMessages: [], parallelBatches: [], updatedAt: new Date().toISOString(), tasks: [] };
+    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], controllerHealth: [], controllerMessages: [], parallelBatches: [], controllerCheckpoints: [], controllerHandoffs: [], updatedAt: new Date().toISOString(), tasks: [] };
     return { paths, registry: await withExclusiveLock(paths.registryPath, async () => {
       try {
         return validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
@@ -2545,6 +2699,8 @@ export async function controllerRegisterTask(input) {
     contractControl = emptyContractControl('control_only');
   } else {
     const snapshot = await loadImplementationContract(input.projectRoot, input.implementationContractPath, input.taskMode, { requireResultRequirements: true, requireCurrentSchema: true });
+    const contractAudit = await implementationContractAuditFindings(snapshot, input.projectRoot);
+    if (contractAudit.errors.length > 0) fail('IMPLEMENTATION_CONTRACT_AUDIT_FAILED', contractAudit.errors.map((finding) => `${finding.code}:${finding.evidenceCommandId}`).join(', '));
     contractControl = { taskMode: input.taskMode, ...snapshot, resultProtocolVersion: RESULT_PROTOCOL_VERSION, deliverableHistory: [], stageProgress: [] };
   }
   const { paths } = await ensureProject(home, input.projectRoot, input.controllerThreadId);
@@ -2771,7 +2927,9 @@ export async function controllerQueryDeliverables(input) {
   const businessDeliverableCount = tasks.filter((task) => implementationTask(task) && task.integrationStatus === 'integrated' && task.integrationProof !== null && task.deliverables.some((entry) => entry.deliveryStatus === 'integrated')).length;
   const candidateCommitCount = tasks.filter((task) => implementationTask(task) && nonEmpty(task.candidateCommit)).length;
   const controlReviewPassedCount = tasks.filter((task) => task.taskMode === 'control_only' && task.status === 'integrated').length;
-  return { reportSchemaVersion: 3, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount, businessDeliverableCount, candidateCommitCount, controlReviewPassedCount, tasks };
+  const checkpointState = checkpointPointerFor(registry, input.controllerThreadId);
+  const handoffState = preparedHandoffFor(registry, input.controllerThreadId) ?? acceptedHandoffFor(registry, input.controllerThreadId);
+  return { reportSchemaVersion: 4, projectKey: registry.projectKey, projectRoot: registry.projectRoot, controllerThreadId: input.controllerThreadId, registryUpdatedAt: registry.updatedAt, reportPath: deliveryReportPath(home, registry.projectKey, input.controllerThreadId), taskCount: tasks.length, deliverableCount, businessDeliverableCount, candidateCommitCount, controlReviewPassedCount, checkpointState, handoffState, tasks };
 }
 
 function escapeHtml(value) {
@@ -2853,8 +3011,8 @@ function anomalyChineseText(item) {
   if (item.code === 'routing_mismatch') return `模型、推理强度与任务类型不匹配（技术证据：${item.evidence}）`;
   if (item.code === 'repeated_commands') return `发现重复命令（${Number.isFinite(number) ? number : '若干'} 类重复指纹）`;
   if (item.code === 'failed_rework') return `存在失败或返工链（${Number.isFinite(number) ? number : '若干'} 条）`;
-  if (item.code === 'context_pressure') return `上下文压力偏高（峰值比例 ${Number.isFinite(number) ? Math.round(number * 100) : '?'}%）`;
-  if (item.code === 'compaction') return `发生上下文压缩（${Number.isFinite(number) ? number : '若干'} 次）`;
+  if (item.code === 'checkpoint_recommended') return '上下文工作集持续增长，建议在下一个真实里程碑封存检查点（不是阻塞门禁）';
+  if (item.code === 'handoff_recommended') return '成对证据显示压缩无效或随后反弹，建议人工评估干净主控交接（不是自动阻塞）';
   if (item.code === 'large_unassigned_interval') return `活跃模型交互内有较多时间无法准确归因（${Number.isFinite(number) ? number : '?'}%，原因未知）`;
   return `未识别的异常规则（技术标识：${item.code}；证据：${item.evidence}）`;
 }
@@ -3028,6 +3186,8 @@ function diagnosticSummary(report, expectedThreadId, { fullReport = null, lifecy
     scopeUnassignedSeconds: summary.unknown.seconds,
     contextPeakRatio: summary.context.peakRatio,
     compactions: summary.context.compactions,
+    contextTrend: summary.context.trend ?? null,
+    compactionEvidence: summary.context.compactionEvidence ?? [],
     repeatedCommandCount: summary.repeatedCommandCount,
     retryChainCount: summary.retryChainCount,
     failedToolCount: summary.tool.failedCount,
@@ -3053,8 +3213,8 @@ function taskAnomalies(task) {
   if (diagnostic?.status === 'observed') {
     if (diagnostic.repeatedCommandCount > 0) anomalies.push({ code: 'repeated_commands', severity: 'warning', evidence: `${diagnostic.repeatedCommandCount} repeated fingerprint(s)` });
     if (diagnostic.retryChainCount > 0) anomalies.push({ code: 'failed_rework', severity: 'critical', evidence: `${diagnostic.retryChainCount} retry chain(s)` });
-    if (diagnostic.contextPeakRatio !== null && diagnostic.contextPeakRatio >= 0.75) anomalies.push({ code: 'context_pressure', severity: diagnostic.contextPeakRatio >= 0.85 ? 'critical' : 'warning', evidence: `peak=${diagnostic.contextPeakRatio}` });
-    if (diagnostic.compactions > 0) anomalies.push({ code: 'compaction', severity: diagnostic.compactions >= 2 ? 'critical' : 'warning', evidence: `${diagnostic.compactions} compaction(s)` });
+    if (diagnostic.threadHealth?.status === 'checkpoint_recommended') anomalies.push({ code: 'checkpoint_recommended', severity: 'info', evidence: JSON.stringify(diagnostic.threadHealth.reasons ?? []) });
+    if (diagnostic.threadHealth?.status === 'handoff_recommended') anomalies.push({ code: 'handoff_recommended', severity: 'warning', evidence: JSON.stringify(diagnostic.threadHealth.reasons ?? []) });
     if (diagnostic.unknownRatio >= 0.5) anomalies.push({ code: 'large_unassigned_interval', severity: 'info', evidence: `${Math.round(diagnostic.unknownRatio * 100)}% active-turn unassigned; cause unknown` });
   }
   return anomalies;
@@ -3199,8 +3359,11 @@ function renderDeliveryReport(data) {
   const executiveSummary = data.businessDeliverableCount === 0
     ? `<div class="warning"><strong>结论：本专题没有可验证的业务交付。</strong> 当前记录包含 ${data.candidateCommitCount} 个实现候选、${data.controlReviewPassedCount} 个控制/审查结果，但没有同时满足“成果包 + 主控接受 + Git 集成证明”的业务成果。控制任务通过不等于产品功能已经交付。</div>`
     : `<div class="review"><strong>结论：已验证 ${data.businessDeliverableCount} 项业务交付。</strong> 另有 ${data.candidateCommitCount} 个实现候选、${data.controlReviewPassedCount} 个控制/审查结果；候选与控制结论不会冒充主线成果。</div>`;
+  const checkpointSummary = data.checkpointState
+    ? `<div class="diagnostic"><strong>对话检查点：</strong>${escapeHtml(data.checkpointState.latestCheckpointId)} · 第 ${data.checkpointState.sequence} 版 · ${escapeHtml(data.checkpointState.sealedAt)}<br><small>默认预加载只读取已确认摘要；详细证据按 fact/source 引用展开。</small>${data.handoffState ? `<br><strong>主控交接：</strong>${escapeHtml(data.handoffState.status)} · successor ${escapeHtml(data.handoffState.successorThreadId)}` : ''}</div>`
+    : '<div class="legacy">尚未生成对话检查点；这不会阻塞现有任务或报告。</div>';
   const css = ':root{color-scheme:light;--ink:#241e18;--muted:#74695e;--paper:#f4f0e9;--panel:#fffdfa;--line:#cfc5b8;--green:#2e6944;--amber:#9a651c;--red:#9a3e32;--blue:#315f86;--purple:#73509b}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font:15px/1.55 "Microsoft YaHei","Noto Sans SC",sans-serif}header,main{width:min(1320px,calc(100% - 28px));margin:auto}header{padding:28px 0 20px;border-bottom:1px solid var(--line)}h1,h2,h3,h4,p{margin-top:0}.subtitle,small{color:var(--muted)}.translation-note{display:block;margin-top:3px;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;border:1px solid var(--line);background:var(--line);margin-top:20px}.metric{padding:14px;background:var(--panel)}.metric strong{display:block;font-size:24px}main{padding-bottom:48px}section{margin-top:24px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;background:var(--panel)}th,td{padding:11px;border:1px solid var(--line);text-align:left;vertical-align:top}.badge{display:inline-block;padding:3px 8px;border-radius:3px;color:#fff;font-size:12px}.badge.ok{background:var(--green)}.badge.pending{background:var(--amber)}.badge.failed{background:var(--red)}.task-head,.package-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.package{margin:14px 0;padding:16px;background:var(--panel);border-left:4px solid var(--amber)}.package.ok{border-color:var(--green)}.package.failed{border-color:var(--red)}.columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.artifact-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.artifact{margin:0;border:1px solid var(--line);background:#fff}.artifact.selected{outline:3px solid var(--green)}.artifact img{display:block;width:100%;max-height:520px;object-fit:contain;background:#1c1916}.artifact figcaption{display:grid;padding:10px;gap:3px}.artifact figcaption span{color:var(--muted)}.artifact-link{display:block;padding:24px}.warning,.review,.legacy,.next,.missing,.empty,.diagnostic{margin:10px 0;padding:12px;background:#fff7e8;border-left:4px solid var(--amber)}.missing,.package.failed .warning{background:#fff0ed;border-color:var(--red)}.review{background:#edf7ef;border-color:var(--green)}.diagnostic{background:#edf4fa;border-color:var(--blue)}.gantt{display:grid;gap:8px;margin:12px 0 18px}.gantt-row{display:grid;grid-template-columns:70px minmax(220px,1fr) minmax(280px,auto);gap:10px;align-items:center}.gantt-track{height:16px;position:relative;background:#e5ddd2;border-radius:8px;overflow:hidden}.gantt-bar{position:absolute;top:0;height:100%;background:var(--amber)}.gantt-bar.ok{background:var(--green)}.gantt-bar.failed{background:var(--red)}.comparison-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0 20px}.comparison-card{padding:14px;background:var(--panel);border:1px solid var(--line)}.comparison-row{display:grid;grid-template-columns:72px minmax(120px,1fr) 92px;gap:10px;align-items:center;margin:9px 0}.comparison-row>strong{text-align:right}.comparison-track{display:block;height:12px;background:#e5ddd2;border-radius:8px;overflow:hidden}.comparison-bar{display:block;height:100%;border-radius:8px}.comparison-bar.input{background:var(--purple)}.comparison-bar.output{background:var(--green)}.comparison-bar.active{background:var(--blue)}.comparison-bar.tool{background:var(--amber)}.route-cell{min-width:210px}.route-cell>*{display:block;margin-bottom:3px}.token-cell{min-width:210px}.token-pair{display:grid;gap:9px;margin-bottom:8px}.token-pair span,.human-number{display:block}.token-pair b{display:block;color:var(--muted);font-size:12px}.compact-list{margin:0;padding-left:18px}@media(max-width:760px){.metrics{grid-template-columns:repeat(2,1fr)}.columns,.artifact-grid,.comparison-grid{grid-template-columns:1fr}.task-head,.package-head{display:block}.gantt-row{grid-template-columns:48px 1fr}.gantt-row small{grid-column:1/-1}.comparison-row{grid-template-columns:64px minmax(90px,1fr) 84px}th:nth-child(4),td:nth-child(4){min-width:260px}}';
-  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.businessDeliverableCount}</strong><span>已验证业务交付</span></div><div class="metric"><strong>${data.candidateCommitCount}</strong><span>实现候选提交</span></div><div class="metric"><strong>${data.controlReviewPassedCount}</strong><span>控制审查通过</span></div></div></header><main><section><h2>一眼结论</h2>${executiveSummary}</section><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
+  return `<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="task-control-registry-updated-at" content="${escapeHtml(data.registryUpdatedAt)}"><meta name="task-control-observability-mode" content="${escapeHtml(data.observability.mode)}"><title>Codex 任务成果与诊断</title><style>${css}</style></head><body><header><h1>任务成果与控制诊断</h1><p class="subtitle">项目：${escapeHtml(data.projectRoot)} · 主控：${escapeHtml(data.controllerThreadId)}</p><div class="metrics"><div class="metric"><strong>${data.taskCount}</strong><span>专题任务</span></div><div class="metric"><strong>${data.businessDeliverableCount}</strong><span>已验证业务交付</span></div><div class="metric"><strong>${data.candidateCommitCount}</strong><span>实现候选提交</span></div><div class="metric"><strong>${data.controlReviewPassedCount}</strong><span>控制审查通过</span></div></div></header><main><section><h2>一眼结论</h2>${executiveSummary}</section><section><h2>对话知识与交接</h2>${checkpointSummary}</section><section><h2>工作包状态</h2><div class="table-wrap"><table><thead><tr><th>编号</th><th>任务</th><th>状态</th><th>用户得到了什么</th><th>下一门禁</th></tr></thead><tbody>${statusRows}</tbody></table></div></section>${renderObservabilitySection(data)}${timelines}</main></body></html>\n`;
 }
 
 export async function controllerBuildDeliveryReport(input) {
@@ -3208,6 +3371,166 @@ export async function controllerBuildDeliveryReport(input) {
   const html = renderDeliveryReport(data);
   await atomicWriteText(data.reportPath, html);
   return { reportPath: data.reportPath, reportFileUri: pathToFileURL(data.reportPath).href, projectKey: data.projectKey, controllerThreadId: data.controllerThreadId, registryUpdatedAt: data.registryUpdatedAt, taskCount: data.taskCount, deliverableCount: data.deliverableCount, businessDeliverableCount: data.businessDeliverableCount, candidateCommitCount: data.candidateCommitCount, controlReviewPassedCount: data.controlReviewPassedCount, observability: data.observability };
+}
+
+function checkpointDirectory(home, projectKey, controllerThreadId) {
+  return join(home, 'checkpoints', projectKey, controllerThreadId);
+}
+
+function checkpointPointerFor(registry, controllerThreadId) {
+  return (registry.controllerCheckpoints ?? []).find((entry) => entry.controllerThreadId === controllerThreadId) ?? null;
+}
+
+async function readVerifiedCheckpoint(pointer, identity) {
+  const raw = await readFile(pointer.checkpointPath, 'utf8').catch((error) => fail('CHECKPOINT_READ_FAILED', `无法读取 checkpoint: ${error.message}`));
+  let record;
+  try { record = JSON.parse(raw); } catch { fail('CHECKPOINT_READ_FAILED', 'checkpoint JSON 无效'); }
+  if (!isObject(record) || record.schemaVersion !== CHECKPOINT_PROTOCOL_VERSION || record.projectKey !== identity.projectKey || record.controllerThreadId !== identity.controllerThreadId || record.checkpointId !== pointer.latestCheckpointId || record.digest !== pointer.latestCheckpointDigest || !isTimestamp(record.createdAt) || record.sequence !== pointer.sequence) fail('CHECKPOINT_INTEGRITY_FAILED', 'checkpoint 身份或 pointer 不一致');
+  const manifest = validateCheckpointManifest({ schemaVersion: record.schemaVersion, projectKey: record.projectKey, controllerThreadId: record.controllerThreadId, scopeSummary: record.scopeSummary, points: record.points }, identity);
+  const digestInput = { schemaVersion: record.schemaVersion, projectKey: record.projectKey, controllerThreadId: record.controllerThreadId, checkpointId: record.checkpointId, sequence: record.sequence, createdAt: record.createdAt, scopeSummary: manifest.scopeSummary, points: manifest.points };
+  const digest = createHash('sha256').update(JSON.stringify(digestInput), 'utf8').digest('hex');
+  if (digest !== record.digest) fail('CHECKPOINT_INTEGRITY_FAILED', 'checkpoint digest 不匹配');
+  return { ...digestInput, digest };
+}
+
+function checkpointPreload(record, mode = 'preload', factId = null) {
+  if (!['preload', 'full'].includes(mode)) fail('CLI_INVALID_ARGUMENTS', 'checkpoint mode 只能是 preload 或 full');
+  let points;
+  if (nonEmpty(factId)) {
+    assertSafeThreadId(factId, 'factId');
+    const found = record.points.find((point) => point.factId === factId);
+    if (!found) fail('CHECKPOINT_POINT_NOT_FOUND', `checkpoint point 不存在: ${factId}`);
+    points = [found];
+  } else if (mode === 'full') points = record.points;
+  else points = record.points.filter((point) => point.preloadPolicy === 'always' && CHECKPOINT_ALWAYS_AUTHORITIES.includes(point.authority));
+  return { schemaVersion: record.schemaVersion, projectKey: record.projectKey, sourceControllerThreadId: record.controllerThreadId, checkpointId: record.checkpointId, checkpointDigest: record.digest, createdAt: record.createdAt, scopeSummary: record.scopeSummary, mode: nonEmpty(factId) ? 'point' : mode, points, omittedPointCount: record.points.length - points.length, interpretation: '默认预加载仅包含已确认且标记 always 的摘要；sourceRefs 只是按需展开索引，不包含原始 prompt/response。' };
+}
+
+export async function controllerSealCheckpoint(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  if (!nonEmpty(input.manifestPath) || !win32.isAbsolute(input.manifestPath)) fail('CLI_INVALID_ARGUMENTS', 'checkpoint manifest 必须是 Windows 绝对路径');
+  const raw = await readFile(input.manifestPath, 'utf8').catch((error) => fail('CHECKPOINT_MANIFEST_INVALID', `无法读取 checkpoint manifest: ${error.message}`));
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { fail('CHECKPOINT_MANIFEST_INVALID', 'checkpoint manifest JSON 无效'); }
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    assertControllerKnown(registry, input.controllerThreadId);
+    if (preparedHandoffFor(registry, input.controllerThreadId) || acceptedHandoffFor(registry, input.controllerThreadId)) fail('CHECKPOINT_FROZEN_BY_HANDOFF', 'handoff prepared 或 accepted 后不能替换其绑定的 checkpoint');
+    const manifest = validateCheckpointManifest(parsed, { projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId });
+    const previous = checkpointPointerFor(registry, input.controllerThreadId);
+    const sequence = (previous?.sequence ?? 0) + 1;
+    const checkpointId = `checkpoint-${String(sequence).padStart(4, '0')}`;
+    const createdAt = new Date().toISOString();
+    const digestInput = { schemaVersion: CHECKPOINT_PROTOCOL_VERSION, projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId, checkpointId, sequence, createdAt, scopeSummary: manifest.scopeSummary, points: manifest.points };
+    const digest = createHash('sha256').update(JSON.stringify(digestInput), 'utf8').digest('hex');
+    const checkpointPath = join(checkpointDirectory(home, paths.projectKey, input.controllerThreadId), `${checkpointId}.json`);
+    if (await access(checkpointPath).then(() => true).catch(() => false)) fail('CHECKPOINT_ALREADY_EXISTS', `checkpoint 已存在: ${checkpointPath}`);
+    await atomicWriteJson(checkpointPath, { ...digestInput, digest });
+    const pointer = { schemaVersion: CHECKPOINT_PROTOCOL_VERSION, controllerThreadId: input.controllerThreadId, sequence, latestCheckpointId: checkpointId, latestCheckpointDigest: digest, checkpointPath, sealedAt: createdAt };
+    const controllerCheckpoints = [...registry.controllerCheckpoints.filter((entry) => entry.controllerThreadId !== input.controllerThreadId), pointer];
+    try {
+      const next = validateRegistry({ ...registry, controllerCheckpoints, updatedAt: createdAt }, paths.projectKey, paths.projectRoot);
+      await atomicWriteJson(paths.registryPath, next);
+    } catch (error) {
+      await rm(checkpointPath, { force: true });
+      throw error;
+    }
+    return { projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId, checkpointId, checkpointDigest: digest, checkpointPath, checkpointFileUri: pathToFileURL(checkpointPath).href, sequence, pointCount: manifest.points.length, preloadPointCount: manifest.points.filter((point) => point.preloadPolicy === 'always').length };
+  });
+}
+
+export async function controllerQueryCheckpoint(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+  assertControllerKnown(registry, input.controllerThreadId);
+  const pointer = checkpointPointerFor(registry, input.controllerThreadId);
+  if (!pointer) fail('CHECKPOINT_NOT_FOUND', `主控 ${input.controllerThreadId} 还没有 sealed checkpoint`);
+  if (nonEmpty(input.checkpointId) && input.checkpointId !== 'latest' && input.checkpointId !== pointer.latestCheckpointId) fail('CHECKPOINT_NOT_LATEST', 'v1 查询只允许 latest/current checkpoint；历史文件仍保留在磁盘');
+  const record = await readVerifiedCheckpoint(pointer, { projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId });
+  return checkpointPreload(record, input.mode ?? 'preload', input.factId ?? null);
+}
+
+function controllerHandoffBlockers(registry, controllerThreadId) {
+  const queues = controllerWorkQueues(registry.tasks, controllerThreadId);
+  const parallel = controllerParallelRuntime(registry, controllerThreadId);
+  const heartbeat = registry.controllerHeartbeats.find((entry) => entry.controllerThreadId === controllerThreadId) ?? null;
+  const messages = registry.controllerMessages.filter((entry) => entry.controllerThreadId === controllerThreadId && ['deferred_local', 'prepared'].includes(entry.status));
+  const blockers = [];
+  if (queues.activeTasks.length) blockers.push({ code: 'active_tasks', count: queues.activeTasks.length });
+  if (queues.routingTasks.length) blockers.push({ code: 'undispatched_tasks', count: queues.routingTasks.length });
+  if (queues.queuedTasks.length) blockers.push({ code: 'review_routing_or_closeout', count: queues.queuedTasks.length });
+  if (queues.cleanupTasks.length) blockers.push({ code: 'thread_actions', count: queues.cleanupTasks.length });
+  if (parallel.batches.length) blockers.push({ code: 'parallel_batches_open', count: parallel.batches.length });
+  if (messages.length) blockers.push({ code: 'controller_messages_pending', count: messages.length });
+  if (heartbeat?.pendingAction) blockers.push({ code: 'heartbeat_action_pending', count: 1 });
+  if (heartbeat?.status === 'armed' || isSafeThreadId(heartbeat?.automationId)) blockers.push({ code: 'heartbeat_not_closed', count: 1 });
+  return blockers;
+}
+
+export async function controllerPrepareHandoff(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId'); assertSafeThreadId(input.successorThreadId, 'successorThreadId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    assertControllerKnown(registry, input.controllerThreadId);
+    if (input.successorThreadId === input.controllerThreadId || registry.rootControllerThreadIds.includes(input.successorThreadId) || registry.tasks.some((task) => task.threadId === input.successorThreadId)) fail('HANDOFF_SUCCESSOR_INVALID', 'successor 必须是新的、尚未登记到当前项目的可见 task ID');
+    if (preparedHandoffFor(registry, input.controllerThreadId)) fail('HANDOFF_ALREADY_PREPARED', '当前主控已有 prepared handoff');
+    const blockers = controllerHandoffBlockers(registry, input.controllerThreadId);
+    if (blockers.length) fail('HANDOFF_NOT_QUIESCENT', `主控尚未收口，不能交接: ${blockers.map((entry) => `${entry.code}=${entry.count}`).join(', ')}`);
+    const pointer = checkpointPointerFor(registry, input.controllerThreadId);
+    if (!pointer) fail('CHECKPOINT_NOT_FOUND', '安全交接前必须先 seal checkpoint');
+    if (nonEmpty(input.checkpointId) && input.checkpointId !== pointer.latestCheckpointId) fail('CHECKPOINT_NOT_LATEST', 'handoff 必须绑定 latest checkpoint');
+    await readVerifiedCheckpoint(pointer, { projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId });
+    const preparedAt = new Date().toISOString();
+    const handoff = { schemaVersion: HANDOFF_PROTOCOL_VERSION, handoffId: `handoff_${randomUUID().replaceAll('-', '')}`, sourceControllerThreadId: input.controllerThreadId, successorThreadId: input.successorThreadId, checkpointId: pointer.latestCheckpointId, checkpointDigest: pointer.latestCheckpointDigest, status: 'prepared', preparedAt, acceptedAt: null, cancelledAt: null, cancelReason: null };
+    const next = validateRegistry({ ...registry, controllerHandoffs: [...registry.controllerHandoffs, handoff], updatedAt: preparedAt }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...handoff, businessAllowedForSource: false, heartbeatRequired: false, acceptanceCommand: `controller-accept-handoff --project-root <root> --controller ${input.controllerThreadId} --successor ${input.successorThreadId} --handoff-id ${handoff.handoffId} --checkpoint-digest ${handoff.checkpointDigest}` };
+  });
+}
+
+export async function controllerAcceptHandoff(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId'); assertSafeThreadId(input.successorThreadId, 'successorThreadId'); assertSafeThreadId(input.handoffId, 'handoffId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const handoff = registry.controllerHandoffs.find((entry) => entry.handoffId === input.handoffId);
+    if (!handoff || handoff.status !== 'prepared' || handoff.sourceControllerThreadId !== input.controllerThreadId || handoff.successorThreadId !== input.successorThreadId || handoff.checkpointDigest !== input.checkpointDigest) fail('HANDOFF_ACCEPT_INVALID', 'handoff 身份、状态或 checkpoint digest 不匹配');
+    const blockers = controllerHandoffBlockers(registry, input.controllerThreadId);
+    if (blockers.length) fail('HANDOFF_NOT_QUIESCENT', `接受前主控又出现未收口工作: ${blockers.map((entry) => `${entry.code}=${entry.count}`).join(', ')}`);
+    const pointer = checkpointPointerFor(registry, input.controllerThreadId);
+    const record = await readVerifiedCheckpoint(pointer, { projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId });
+    const acceptedAt = new Date().toISOString();
+    const accepted = { ...handoff, status: 'accepted', acceptedAt };
+    const rootControllerThreadIds = registry.rootControllerThreadIds.includes(input.successorThreadId) ? registry.rootControllerThreadIds : [...registry.rootControllerThreadIds, input.successorThreadId];
+    const controllerHandoffs = registry.controllerHandoffs.map((entry) => entry.handoffId === handoff.handoffId ? accepted : entry);
+    const next = validateRegistry({ ...registry, rootControllerThreadIds, controllerHandoffs, updatedAt: acceptedAt }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...accepted, sourceRetired: true, successorRegisteredAsRoot: true, heartbeatRequired: false, preload: checkpointPreload(record, 'preload') };
+  });
+}
+
+export async function controllerCancelHandoff(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId'); assertSafeThreadId(input.handoffId, 'handoffId');
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', '取消 handoff 必须记录 reason');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const handoff = registry.controllerHandoffs.find((entry) => entry.handoffId === input.handoffId);
+    if (!handoff || handoff.status !== 'prepared' || handoff.sourceControllerThreadId !== input.controllerThreadId) fail('HANDOFF_CANCEL_INVALID', '只能由 source 取消 prepared handoff');
+    const cancelledAt = new Date().toISOString();
+    const cancelled = { ...handoff, status: 'cancelled', cancelledAt, cancelReason: input.reason.trim() };
+    const next = validateRegistry({ ...registry, controllerHandoffs: registry.controllerHandoffs.map((entry) => entry.handoffId === handoff.handoffId ? cancelled : entry), updatedAt: cancelledAt }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...cancelled, businessAllowedForSource: true, heartbeatRequired: false };
+  });
 }
 
 export async function controllerIngestContextHealth(input) {
@@ -3218,9 +3541,11 @@ export async function controllerIngestContextHealth(input) {
   const raw = await readFile(input.receiptPath, 'utf8').catch((error) => fail('CONTEXT_HEALTH_RECEIPT_INVALID', `无法读取 context health receipt: ${error.message}`));
   let receipt;
   try { receipt = JSON.parse(raw); } catch { fail('CONTEXT_HEALTH_RECEIPT_INVALID', 'context health receipt JSON 无效'); }
-  if (!isObject(receipt) || receipt.schemaVersion !== 1 || receipt.controllerThreadId !== input.controllerThreadId || !has(receipt.status, CONTEXT_HEALTH_STATUSES) || !isTimestamp(receipt.capturedAt) || !isObject(receipt.metrics) || !nonEmpty(receipt.reportPath) || !win32.isAbsolute(receipt.reportPath)) fail('CONTEXT_HEALTH_RECEIPT_INVALID', 'context health receipt 字段无效');
+  const legacyReceipt = receipt?.schemaVersion === 1 && has(receipt?.status, CONTEXT_HEALTH_STATUSES);
+  const advisoryReceipt = receipt?.schemaVersion === 2 && has(receipt?.status, CONTEXT_HEALTH_RECEIPT_V2_STATUSES);
+  if (!isObject(receipt) || (!legacyReceipt && !advisoryReceipt) || receipt.controllerThreadId !== input.controllerThreadId || !isTimestamp(receipt.capturedAt) || !isObject(receipt.metrics) || !nonEmpty(receipt.reportPath) || !win32.isAbsolute(receipt.reportPath)) fail('CONTEXT_HEALTH_RECEIPT_INVALID', 'context health receipt 字段无效');
   const reportRaw = await readFile(receipt.reportPath).catch((error) => fail('CONTEXT_HEALTH_RECEIPT_INVALID', `无法读取 context health report: ${error.message}`));
-  const health = { controllerThreadId: input.controllerThreadId, status: receipt.status, reportPath: win32.resolve(receipt.reportPath), reportSha256: createHash('sha256').update(reportRaw).digest('hex'), capturedAt: receipt.capturedAt, metrics: receipt.metrics };
+  const health = { receiptSchemaVersion: receipt.schemaVersion, controllerThreadId: input.controllerThreadId, status: receipt.status, reportPath: win32.resolve(receipt.reportPath), reportSha256: createHash('sha256').update(reportRaw).digest('hex'), capturedAt: receipt.capturedAt, metrics: receipt.metrics };
   return withExclusiveLock(paths.registryPath, async () => {
     const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
     const controllerKnown = registry.rootControllerThreadIds.includes(input.controllerThreadId) || registry.tasks.some((task) => task.threadId === input.controllerThreadId);
@@ -3273,6 +3598,7 @@ export async function controllerPrepareMessage(input) {
   assertSafeThreadId(messageId, 'messageId');
   return mutateControllerMessages(input, async (registry) => {
     assertControllerCycleBusinessReady(registry, input.controllerThreadId);
+    assertControllerHealthyForDispatch(registry, input.controllerThreadId);
     const target = taskOrThrow(registry, input.threadId);
     assertTaskController(target, input.controllerThreadId);
     if (target.status !== 'executing' || target.executionStatus !== 'running') fail('MESSAGE_TARGET_NOT_EXECUTING', '普通工作消息只能发给当前 executing/running 的直接子任务');
@@ -3367,7 +3693,7 @@ async function readArtifact(filePath, expectedType) {
   if (expectedType === 'task_progress' && value.stageId !== undefined && !nonEmpty(value.stageId)) fail(code, 'progress event stageId 无效');
   if (expectedType === 'task_progress' && value.evidence !== undefined && !Array.isArray(value.evidence)) fail(code, 'progress event evidence 无效');
   if (FAILURE_EVENT_TYPES.includes(expectedType)) {
-    if (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !nonEmpty(value.attemptedStage) || !has(value.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(value.failureDomain, FAILURE_DOMAINS) || !nonEmpty(value.commandSummary) || !Array.isArray(value.evidence) || value.evidence.length === 0 || typeof value.mechanicalRetryEligible !== 'boolean' || !has(value.authority ?? 'contract_evidence', FAILURE_AUTHORITIES)) fail(code, 'failure event 字段无效');
+    if (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !nonEmpty(value.attemptedStage) || !has(value.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(value.failureDomain, FAILURE_DOMAINS) || !nonEmpty(value.commandSummary) || !Array.isArray(value.evidence) || value.evidence.length === 0 || typeof value.mechanicalRetryEligible !== 'boolean' || !has(value.authority ?? 'contract_evidence', FAILURE_AUTHORITIES) || (value.failureMode !== undefined && !has(value.failureMode, EVIDENCE_FAILURE_MODES)) || (value.recoveryExhausted !== undefined && typeof value.recoveryExhausted !== 'boolean')) fail(code, 'failure event 字段无效');
   }
   return value;
 }
@@ -3388,13 +3714,17 @@ export async function controllerIngestFailure(input) {
     assertEventContractMatches(task, event);
     const authority = event.authority ?? 'contract_evidence';
     let evidenceCommandId = nonEmpty(event.evidenceCommandId) ? event.evidenceCommandId.trim() : null;
+    let failureMode = event.failureMode ?? 'blocking';
+    const recoveryExhausted = event.recoveryExhausted === true;
     if (implementationTask(task) && authority === 'contract_evidence') {
       if (!task.stageGates.some((gate) => gate.id === event.attemptedStage)) fail('STAGE_UNKNOWN', `未登记的 attemptedStage: ${event.attemptedStage}`);
-      const knownEvidence = new Set(task.evidenceCommands.map((entry) => entry.id));
+      const knownEvidence = new Map(task.evidenceCommands.map((entry) => [entry.id, entry]));
       if (evidenceCommandId === null && event.authority === undefined && event.evidence.length === 1 && knownEvidence.has(event.evidence[0].id)) evidenceCommandId = event.evidence[0].id;
       if (evidenceCommandId === null || !knownEvidence.has(evidenceCommandId)) fail('FAILURE_COMMAND_NOT_CONTRACT_BOUND', '权威失败事件必须绑定合同 evidenceCommandId');
+      failureMode = knownEvidence.get(evidenceCommandId).failureMode ?? 'blocking';
+      if (failureMode === 'advisory' || (failureMode === 'recoverable' && !recoveryExhausted)) fail('FAILURE_AUTHORITY_INVALID', 'advisory 或尚未穷尽恢复的 recoverable evidence 不得停止任务');
     }
-    const failureRecord = { type: expectedType, authority, evidenceCommandId, attemptedStage: event.attemptedStage, failureClass: event.failureClass, failureDomain: event.failureDomain, commandSummary: event.commandSummary.trim(), evidence: normalizeEvidenceReferences(event.evidence), mechanicalRetryEligible: event.mechanicalRetryEligible, attemptCount: task.attemptCount, createdAt: event.createdAt };
+    const failureRecord = { type: expectedType, authority, evidenceCommandId, failureMode, recoveryExhausted, attemptedStage: event.attemptedStage, failureClass: event.failureClass, failureDomain: event.failureDomain, commandSummary: event.commandSummary.trim(), evidence: normalizeEvidenceReferences(event.evidence), mechanicalRetryEligible: event.mechanicalRetryEligible, attemptCount: task.attemptCount, createdAt: event.createdAt };
     if (authority === 'non_authoritative_diagnostic') {
       return appendObservabilityReceipt({ ...task, failureHistory: [...task.failureHistory, failureRecord], updatedAt: new Date().toISOString() }, 'failure_diagnostic_ingested', event.createdAt);
     }
@@ -3730,6 +4060,8 @@ export async function controllerScanPendingEvents(input) {
   const objectiveFuses = objectiveIds.map((objectiveId) => objectiveRuntime(registry.tasks, objectiveId, now)).filter((runtime) => runtime.fuseOpen);
   const incidentQueue = directTasks.filter((task) => task.closeout !== null && !closeoutComplete(task)).map(incidentSummary);
   const contextHealth = controllerHealthFor(registry, input.controllerThreadId);
+  const checkpointState = checkpointPointerFor(registry, input.controllerThreadId);
+  const handoffState = preparedHandoffFor(registry, input.controllerThreadId) ?? acceptedHandoffFor(registry, input.controllerThreadId);
   const cleanupDebtTasks = directTasks.filter((task) => isTerminalTask(task) && task.archiveStatus !== 'archived').map((task) => ({ threadId: task.threadId, displayKey: task.displayKey, status: task.status, archiveStatus: task.archiveStatus, actionability: cleanupActionability(task, registry.tasks) }));
   const pendingCleanupTasks = cleanupDebtTasks.filter((task) => task.actionability === 'actionable');
   const deferredCleanupTasks = cleanupDebtTasks.filter((task) => task.actionability !== 'actionable');
@@ -3769,6 +4101,8 @@ export async function controllerScanPendingEvents(input) {
     objectiveFuses,
     incidentQueue,
     contextHealth,
+    checkpointState,
+    handoffState,
     pendingCleanupTasks,
     deferredCleanupTasks,
     deferredMessages,
@@ -3829,6 +4163,7 @@ export async function controllerMarkChangesRequested(input) {
 export async function controllerDispatchRework(input) {
   const result = await mutateController({ ...input, mutate: (task, registry) => {
     assertControllerCycleBusinessReady(registry, input.controllerThreadId);
+    assertControllerHealthyForDispatch(registry, input.controllerThreadId);
     if (task.status !== 'changes_requested') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 重新派发`);
     if (task.failureClass !== 'mechanical') fail('REWORK_REQUIRES_CONTROLLER', `${task.failureClass} 失败不得继续交给原 worker；必须由主控收回并重新分类`);
     if ((task.attemptCount ?? 1) >= 2) fail('REWORK_LIMIT_REACHED', '同一可见任务只允许一次机械返工；必须由主控收回');
@@ -3847,7 +4182,8 @@ export async function controllerConfirmReworkDispatched(input) {
     if (pending === null || pending.actionId !== input.actionId) fail('REWORK_ACTION_STALE', '返工准备动作不存在或已被替换');
     if (task.status !== 'changes_requested' || task.failureClass !== 'mechanical') fail('TASK_TRANSITION_INVALID', '返工确认时任务已不再处于可返工状态');
     const now = new Date().toISOString();
-    return appendObservabilityReceipt({ ...task, pendingRework: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: pending.nextAttempt, lastDispatchedAttempt: pending.nextAttempt, lastDispatchedAt: now, reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'rework_dispatched', now);
+    const carriedProgress = carriedStageProgressForMechanicalRework(task, pending.nextAttempt, now);
+    return appendObservabilityReceipt({ ...task, pendingRework: null, status: 'executing', executionStatus: 'running', nextOwner: 'worker', attemptCount: pending.nextAttempt, lastDispatchedAttempt: pending.nextAttempt, lastDispatchedAt: now, stageProgress: [...task.stageProgress, ...carriedProgress], reviewVerdict: 'pending', notificationStatus: 'pending', executionEndedAt: null, updatedAt: now }, 'rework_dispatched', now);
   }});
 }
 
@@ -4082,24 +4418,27 @@ export function buildFailureNotification(task, eventType, attemptedStage) {
 
 export async function createFailureEvent(input) {
   const result = await querySelf(input);
-  if (!dispatchAllowed(result.task) || !currentAttemptDispatched(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交失败事件');
+  if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交失败事件');
   if (!FAILURE_EVENT_TYPES.includes(input.eventType) || !nonEmpty(input.attemptedStage) || !has(input.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(input.failureDomain, FAILURE_DOMAINS) || !nonEmpty(input.commandSummary) || typeof input.mechanicalRetryEligible !== 'boolean') fail('CLI_INVALID_ARGUMENTS', 'report-failure 参数不完整');
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
   const evidence = normalizeEvidenceReferences(input.evidence ?? []);
   if (evidence.length === 0) fail('FAILURE_EVIDENCE_REQUIRED', 'failure event 必须提供至少一条证据引用');
   let authority = 'contract_evidence';
+  let failureMode = 'blocking';
+  const recoveryExhausted = input.recoveryExhausted === true;
   if (implementationTask(result.task)) {
     if (!result.task.stageGates.some((gate) => gate.id === input.attemptedStage.trim())) fail('STAGE_UNKNOWN', `未登记的 attemptedStage: ${input.attemptedStage}`);
-    const knownEvidence = new Set(result.task.evidenceCommands.map((entry) => entry.id));
-    authority = nonEmpty(input.evidenceCommandId) && knownEvidence.has(input.evidenceCommandId.trim()) ? 'contract_evidence' : 'non_authoritative_diagnostic';
+    const evidenceCommand = nonEmpty(input.evidenceCommandId) ? result.task.evidenceCommands.find((entry) => entry.id === input.evidenceCommandId.trim()) : null;
+    failureMode = evidenceCommand?.failureMode ?? (evidenceCommand ? 'blocking' : 'advisory');
+    authority = evidenceCommand && failureMode !== 'advisory' && (failureMode !== 'recoverable' || recoveryExhausted) ? 'contract_evidence' : 'non_authoritative_diagnostic';
   }
   const prefix = input.eventType === 'task_failed' ? 'task-failed' : 'task-blocked';
-  return writeChildArtifact(result.paths, result.task.threadId, prefix, { schemaVersion: 1, type: input.eventType, projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, attemptedStage: input.attemptedStage.trim(), failureClass: input.failureClass, failureDomain: input.failureDomain, commandSummary: input.commandSummary.trim(), evidenceCommandId: nonEmpty(input.evidenceCommandId) ? input.evidenceCommandId.trim() : null, authority, evidence, mechanicalRetryEligible: input.mechanicalRetryEligible, ...contractSummary(result.task), createdAt: new Date().toISOString() });
+  return writeChildArtifact(result.paths, result.task.threadId, prefix, { schemaVersion: 1, type: input.eventType, projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, attemptedStage: input.attemptedStage.trim(), failureClass: input.failureClass, failureDomain: input.failureDomain, commandSummary: input.commandSummary.trim(), evidenceCommandId: nonEmpty(input.evidenceCommandId) ? input.evidenceCommandId.trim() : null, failureMode, recoveryExhausted, authority, evidence, mechanicalRetryEligible: input.mechanicalRetryEligible, ...contractSummary(result.task), createdAt: new Date().toISOString() });
 }
 
 export async function createProgressEvent(input) {
   const result = await querySelf(input);
-  if (!dispatchAllowed(result.task) || !currentAttemptDispatched(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交进度');
+  if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，不能提交进度');
   if (!nonEmpty(input.summary)) fail('CLI_INVALID_ARGUMENTS', 'progress summary 不能为空');
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
   const pendingStages = implementationTask(result.task) ? await pendingStagesForCreation(result.paths, result.task) : new Map();
@@ -4109,7 +4448,7 @@ export async function createProgressEvent(input) {
 
 export async function createCompletionEvent(input) {
   const result = await querySelf(input);
-  if (!dispatchAllowed(result.task) || !currentAttemptDispatched(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', 'thread title 尚未同步或当前轮尚未登记真实派发，任务不得提交 completion');
+  if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，任务不得提交 completion');
   if (input.status !== undefined && input.status !== 'awaiting_review') fail('CHILD_STATUS_FORBIDDEN', '子任务只能提交 awaiting_review');
   if (!nonEmpty(input.candidateCommit)) fail('CLI_INVALID_ARGUMENTS', 'candidateCommit 不能为空');
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
@@ -4177,11 +4516,19 @@ function requiredBoolean(args, name) {
   return value === 'true';
 }
 
+function optionalBoolean(args, name, defaultValue = false) {
+  const value = option(args, name);
+  if (value === undefined) return defaultValue;
+  if (!['true', 'false'].includes(value)) fail('CLI_INVALID_ARGUMENTS', `${name} 必须是 true 或 false`);
+  return value === 'true';
+}
+
 function helpText() {
   return [
-    'codex-task-control v0.15.0',
+    'codex-task-control v0.17.0',
     '',
     '实施合同命令：',
+    '  audit-implementation-contract --project-root <root> --contract <project-relative-json> --task-mode implementation|visual_implementation',
     '  register ... --task-mode control_only|implementation|visual_implementation [--implementation-contract <project-relative-json>] [--parallel-policy legacy_compat|batch_v1 --batch-id <id> --candidate-id <id>]',
     '  controller-plan-parallel-batch --project-root <root> --controller <id> --manifest <project-relative-json>',
     '  controller-evaluate-fanout --project-root <root> --controller <id> --batch-id <id>',
@@ -4194,6 +4541,11 @@ function helpText() {
     '  controller-query-deliverables --project-root <root> --controller <id>',
     '  controller-build-delivery-report --project-root <root> --controller <id> [--observability lean|diagnostic] [--otel-jsonl <file-or-dir>] [--desktop-log <file>]',
     '  controller-ingest-context-health --project-root <root> --controller <id> --receipt <json>',
+    '  controller-seal-checkpoint --project-root <root> --controller <id> --manifest <absolute-json>',
+    '  controller-query-checkpoint --project-root <root> --controller <id> [--checkpoint latest] [--mode preload|full] [--point <fact-id>]',
+    '  controller-prepare-handoff --project-root <root> --controller <source-id> --successor <new-visible-task-id> --checkpoint <latest-checkpoint-id>',
+    '  controller-accept-handoff --project-root <root> --controller <source-id> --successor <new-visible-task-id> --handoff-id <id> --checkpoint-digest <sha256>',
+    '  controller-cancel-handoff --project-root <root> --controller <source-id> --handoff-id <id> --reason <text>',
     '  controller-record-diagnostic ... --diagnostic-id <id> --classification technical_debt|milestone_blocker --summary <text> ...',
     '  mark-accepted ... --reason <review-reason> [--selected-artifact <artifact-id> ...]',
     '  mark-integrated ... [--integration-target-ref <git-ref>]  # implementation 默认验证 candidate 是 HEAD 的祖先',
@@ -4214,6 +4566,7 @@ function helpText() {
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
     'heartbeat 使用单次 watchdog；连续两轮无业务变化自动熔断，删除只自动补偿一次，清理失败后必须人工确认并显式 resume。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
+    'checkpoint 独立保存在 task-control/checkpoints；默认只预加载已确认的 always 摘要。handoff 必须无活跃/待审/消息/heartbeat 债务，可在接受前取消；接受后旧主控退休。',
   ].join('\n');
 }
 
@@ -4240,6 +4593,7 @@ export async function runCli(args = process.argv.slice(2)) {
   let result;
   if (command === 'help' || command === '--help' || command === '-h') result = helpText();
   else if (command === 'query-parent') result = await queryParent({ ...storage, selfThreadId: required(args, '--self') });
+  else if (command === 'audit-implementation-contract') result = await auditImplementationContract({ projectRoot: required(args, '--project-root'), implementationContractPath: required(args, '--contract'), taskMode: required(args, '--task-mode') });
   else if (command === 'audit-controller-routing') result = auditControllerRouting({ model: required(args, '--model'), thinking: required(args, '--thinking'), controllerWorkClass: required(args, '--work-class'), escalationTrigger: option(args, '--escalation-trigger'), escalationReason: option(args, '--reason'), maxAuthority: option(args, '--max-authority') });
   else if (command === 'audit-model-routing') result = await auditModelRouting(storage);
   else if (command === 'audit-thinking-routing') result = await auditThinkingRouting(storage);
@@ -4266,7 +4620,7 @@ export async function runCli(args = process.argv.slice(2)) {
     const selfThreadId = required(args, '--self');
     const eventType = required(args, '--event-type');
     const attemptedStage = required(args, '--attempted-stage');
-    const eventPath = await createFailureEvent({ ...storage, selfThreadId, eventType, attemptedStage, failureClass: required(args, '--failure-class'), failureDomain: required(args, '--failure-domain'), commandSummary: required(args, '--command-summary'), evidenceCommandId: option(args, '--evidence-command-id'), mechanicalRetryEligible: requiredBoolean(args, '--mechanical-retry-eligible'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')) });
+    const eventPath = await createFailureEvent({ ...storage, selfThreadId, eventType, attemptedStage, failureClass: required(args, '--failure-class'), failureDomain: required(args, '--failure-domain'), commandSummary: required(args, '--command-summary'), evidenceCommandId: option(args, '--evidence-command-id'), recoveryExhausted: optionalBoolean(args, '--recovery-exhausted'), mechanicalRetryEligible: requiredBoolean(args, '--mechanical-retry-eligible'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')) });
     const task = (await querySelf({ ...storage, selfThreadId })).task;
     result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildFailureNotification(task, eventType, attemptedStage), notificationRequired: true, ...contractSummary(task) };
   }
@@ -4283,6 +4637,11 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-query-deliverables') result = await controllerQueryDeliverables({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-build-delivery-report') result = await controllerBuildDeliveryReport({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), observabilityMode: option(args, '--observability') ?? 'lean', otelJsonl: option(args, '--otel-jsonl'), desktopLog: option(args, '--desktop-log') });
   else if (command === 'controller-ingest-context-health') result = await controllerIngestContextHealth({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
+  else if (command === 'controller-seal-checkpoint') result = await controllerSealCheckpoint({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), manifestPath: required(args, '--manifest') });
+  else if (command === 'controller-query-checkpoint') result = await controllerQueryCheckpoint({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), checkpointId: option(args, '--checkpoint') ?? 'latest', mode: option(args, '--mode') ?? 'preload', factId: option(args, '--point') });
+  else if (command === 'controller-prepare-handoff') result = await controllerPrepareHandoff({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), successorThreadId: required(args, '--successor'), checkpointId: required(args, '--checkpoint') });
+  else if (command === 'controller-accept-handoff') result = await controllerAcceptHandoff({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), successorThreadId: required(args, '--successor'), handoffId: required(args, '--handoff-id'), checkpointDigest: required(args, '--checkpoint-digest') });
+  else if (command === 'controller-cancel-handoff') result = await controllerCancelHandoff({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), handoffId: required(args, '--handoff-id'), reason: required(args, '--reason') });
   else if (command === 'controller-scan-events') result = await controllerScanPendingEvents({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), heartbeatGeneration: option(args, '--heartbeat-generation'), heartbeatAutomationId: option(args, '--automation-id'), heartbeatActionId: option(args, '--heartbeat-action-id'), heartbeatOccurrence: option(args, '--heartbeat-occurrence'), heartbeatRrule: option(args, '--heartbeat-rrule'), heartbeatFiredAt: option(args, '--heartbeat-fired-at') });
   else if (command === 'controller-rearm-heartbeat') result = await controllerRearmHeartbeat({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: option(args, '--reason') ?? 'reconcile' });
   else if (command === 'controller-confirm-heartbeat-action') result = await controllerConfirmHeartbeatAction({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), observed: option(args, '--observed') === 'true', pendingCreateCleanupOutcome: option(args, '--pending-create-cleanup-outcome') });
