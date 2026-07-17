@@ -10,6 +10,8 @@ import {
   auditArchiveBacklog,
   auditModelRouting,
   auditThinkingRouting,
+  auditUserAgentsPolicy,
+  syncUserAgentsPolicy,
   TaskControlError,
   buildCompletionNotification,
   controllerIngestCompletion,
@@ -150,6 +152,46 @@ afterEach(async () => {
 });
 
 describe('project-isolated task control', () => {
+  it('audits user AGENTS policy read-only and synchronizes only with current-turn authority', async () => {
+    const codexHome = await freshCodexHome();
+    const agentsPath = join(codexHome, 'AGENTS.md');
+    const legacyRule = '- 子任务执行 `complete` 后必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知；发送失败必须生成 notification_failed。只有真实消息发送成功后，主控才可标记 notificationStatus=sent。';
+    await writeFile(agentsPath, `# user rules\n\n${legacyRule}\n`, 'utf8');
+    const before = await readFile(agentsPath, 'utf8');
+    const audit = await auditUserAgentsPolicy({ codexHome });
+    assert.equal(audit.compliant, false);
+    assert.equal(audit.reason, 'legacy_direct_send_conflict');
+    assert.equal(await readFile(agentsPath, 'utf8'), before, 'audit must not modify AGENTS.md');
+    await expectCode(() => syncUserAgentsPolicy({ codexHome, authorization: 'old_conversation' }), 'AGENTS_POLICY_SYNC_UNAUTHORIZED');
+    const synced = await syncUserAgentsPolicy({ codexHome, authorization: 'user_explicit_current_turn' });
+    assert.equal(synced.compliant, true);
+    assert.equal(synced.changed, true);
+    const after = await readFile(agentsPath, 'utf8');
+    assert.match(after, /codex-task-control:parent-notification-policy:start/);
+    assert.match(after, /deferred_parent/);
+    assert.doesNotMatch(after, /必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知/);
+  });
+
+  it('installer fails closed on AGENTS drift and synchronizes only with the explicit flag', async () => {
+    const codexHome = await freshCodexHome();
+    const agentsPath = join(codexHome, 'AGENTS.md');
+    const legacyRule = '- 子任务执行 `complete` 后必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知；发送失败必须生成 notification_failed。只有真实消息发送成功后，主控才可标记 notificationStatus=sent。';
+    await writeFile(agentsPath, `# user rules\n\n${legacyRule}\n`, 'utf8');
+    const installer = fileURLToPath(new URL('../scripts/install.ps1', import.meta.url));
+    const denied = spawnSync('pwsh', ['-NoProfile', '-File', installer, '-CodexHome', codexHome, '-Force'], { encoding: 'utf8' });
+    assert.notEqual(denied.status, 0, `${denied.stdout}\n${denied.stderr}`);
+    assert.equal(await exists(join(codexHome, 'skills', 'codex-task-control')), false);
+    assert.match(`${denied.stdout}\n${denied.stderr}`, /User AGENTS policy is not compatible/);
+
+    const installed = spawnSync('pwsh', ['-NoProfile', '-File', installer, '-CodexHome', codexHome, '-Force', '-SyncUserAgents'], { encoding: 'utf8' });
+    assert.equal(installed.status, 0, `${installed.stdout}\n${installed.stderr}`);
+    assert.equal(await exists(join(codexHome, 'skills', 'codex-task-control', 'SKILL.md')), true);
+    const agents = await readFile(agentsPath, 'utf8');
+    assert.match(agents, /codex-task-control:parent-notification-policy:start/);
+    assert.match(agents, /deferred_parent/);
+    assert.match(installed.stdout, /User AGENTS parent-notification policy: compliant/);
+  });
+
   it('keeps same-name tasks isolated between projects', async () => {
     const codexHome = await freshCodexHome();
     await register(codexHome, 'C:/work/alpha/same-name', 'thread-a');
@@ -219,10 +261,11 @@ describe('project-isolated task control', () => {
     const codexHome = await freshCodexHome();
     const root = 'C:/work/lifecycle';
     await register(codexHome, root, 'child');
-    const firstEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-1' });
+    const firstEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-1', parentTurnState: 'idle' });
     assert.equal(buildCompletionNotification({ threadId: 'child' }), '任务已完成，等待主控审查。任务：child');
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: firstEvent });
-    const receipt = await createNotificationFailureReceipt({ codexHome, selfThreadId: 'child', reason: 'send_message_to_thread unavailable' });
+    const firstArtifact = JSON.parse(await readFile(firstEvent, 'utf8'));
+    const receipt = await createNotificationFailureReceipt({ codexHome, selfThreadId: 'child', actionId: firstArtifact.parentNotification.actionId, reason: 'send_message_to_thread unavailable' });
     await controllerIngestNotificationFailed({ codexHome, projectRoot: root, controllerThreadId: defaultController, receiptPath: receipt });
 
     const pendingDecision = await controllerMarkChangesRequested({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', failureClass: 'mechanical', reason: 'A dedicated test was omitted.' });
@@ -230,9 +273,9 @@ describe('project-isolated task control', () => {
     const rework = await controllerDispatchRework({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
     const resumed = await controllerConfirmReworkDispatched({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', actionId: rework.pendingRework.actionId, hostReceipt: 'host-send-ok' });
     await controllerRecordTitleSynced({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', title: resumed.desiredThreadTitle });
-    const secondEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-2' });
+    const secondEvent = await createCompletionEvent({ codexHome, selfThreadId: 'child', candidateCommit: 'candidate-2', parentTurnState: 'idle' });
     await controllerIngestCompletion({ codexHome, projectRoot: root, controllerThreadId: defaultController, eventPath: secondEvent });
-    await controllerMarkNotificationSent({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
+    await controllerMarkNotificationSent({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child', hostReceipt: 'host-delivered-completion-2' });
     await controllerMarkAccepted({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
     await controllerMarkIntegrated({ codexHome, projectRoot: root, controllerThreadId: defaultController, threadId: 'child' });
 

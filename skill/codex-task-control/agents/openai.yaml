@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Visible-task control with progressive parent context"
-  default_prompt: "Use $codex-task-control to route visible tasks with concise confirmed preload, on-demand direct-parent context, bounded same-objective repairs, registered-worktree results, and reviewable evidence."
+  short_description: "Visible tasks with queued parent notifications"
+  default_prompt: "Use $codex-task-control to route visible tasks with event-first queued notifications in both directions, concise confirmed preload, on-demand direct-parent context, bounded same-objective repairs, registered-worktree results, and reviewable evidence."

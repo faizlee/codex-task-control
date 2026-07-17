@@ -27,7 +27,7 @@ Allowed values:
 - `status`: `executing`, `awaiting_review`, `changes_requested`, `accepted`, `integrated`, `blocked`, `reclaimed`.
 - `reviewVerdict`: `pending`, `changes_requested`, `accepted`.
 - `integrationStatus`: `not_integrated`, `integrated`.
-- `notificationStatus`: `pending`, `sent`, `failed`.
+- `notificationStatus`: `pending`, `observed`, `sent`, `failed`. `observed` means the direct controller ingested an event that was deliberately deferred instead of interrupting its running/unknown turn.
 - `thinking`: `low`, `medium`, `high`.
 - `titleSyncStatus`: `pending`, `synced`, `failed`.
 - `archiveStatus`: `not_ready`, `pending`, `archived`, `failed`.
@@ -115,7 +115,7 @@ Only the task's `directControllerThreadId` may perform register/ingest for that 
 
 Self lookup scans the project index. Exactly one matching task is required; zero matches and matches in multiple projects both fail closed. Parent identity always comes from that task's `parentThreadId`. Thread IDs are path-safe identifiers containing only letters, digits, colon, underscore, and hyphen.
 
-Progress artifacts are independently created JSON files with `schemaVersion: 1`, `type: "task_progress"`, the task's identity, current `attemptCount`, a non-empty checkpoint `summary`, and an ISO `createdAt`. Implementation progress also carries `stageId`, named evidence references, task mode, contract version/digest, and the current completed/missing-stage summary. Completion artifacts use `type: "task_completed"`, the same identity, `status: "awaiting_review"`, non-empty `candidateCommit`, contract summary, and `createdAt`. Notification failure receipts have `type: "notification_failed"`, the same identity fields, a non-empty `reason`, and `createdAt`.
+Progress artifacts are independently created JSON files with `schemaVersion: 1`, `type: "task_progress"`, the task's identity, current `attemptCount`, a non-empty checkpoint `summary`, a schema-v1 `parentNotification` envelope, and an ISO `createdAt`. Implementation progress also carries `stageId`, named evidence references, task mode, contract version/digest, and the current completed/missing-stage summary. Completion and failure artifacts carry the same parent-notification envelope. It records queue delivery, the observed direct-parent turn state, and either `deferred_parent` or `prepared`. Completion artifacts use `type: "task_completed"`, the same identity, `status: "awaiting_review"`, non-empty `candidateCommit`, contract summary, and `createdAt`. Legacy artifacts without the envelope remain readable. Notification failure receipts have `type: "notification_failed"`, the same identity fields, a non-empty `reason`, and `createdAt`.
 
 The controller verifies project, parent, attempt, freshness, lifecycle, and contract identity before ingesting. Progress/completion require a recorded real dispatch. Rework confirmation itself records that host receipt and current attempt; a second `controller-record-dispatched` call is neither required nor allowed. Scans expose `preparedReworks` and `zombieAttempts` alongside the normal queues.
 
@@ -243,7 +243,9 @@ When no actionable work remains, a confirmed heartbeat produces `delete_controll
 
 This ordering cannot stop the Codex App from spending one model wake before the Skill sees an obsolete scheduled message. The stability-first protocol deliberately accepts that bounded cost: unchanged cycles and failed cleanup stop automatic rearm, business commands stay recoverable, and resumption is explicit. A host-native pre-context hook would remove the extra wake but is no longer required for deadlock/livelock safety.
 
-`notificationStatus: sent` is allowed only after a real successful thread message. Completion ingestion alone leaves notification pending. A later `notification_failed` receipt remains ingestible because freshness is compared with `completionEventCreatedAt`, not the controller's later ingestion timestamp.
+Worker-to-controller notification is event-first. `running` and `unknown` direct-parent states never return a host send action; the event remains `deferred_parent`, and direct-controller scan/ingestion records `notificationStatus: observed`. Confirmed `idle` may return a short-lived `send_thread_message` action using `start_next_turn_only`; ingestion stays `pending` until the real host receipt is recorded as `sent`. Only a real attempted idle-send failure may create `notification_failed`. Legacy events without an envelope preserve the former `pending` behavior. A later valid failure receipt remains ingestible because freshness is compared with `completionEventCreatedAt`, not the controller's later ingestion timestamp.
+
+`audit-user-agents-policy --codex-home ...` is read-only and verifies the marked user-level parent-notification rule. `sync-user-agents-policy` requires the literal current-turn authorization token and may replace only the managed block, its exact legacy direct-send rule, or the exact unmarked current rule. Ambiguous or missing policy locations fail closed. The installer audits before replacing the Skill; `-SyncUserAgents` is valid only after explicit user authorization and synchronizes that one marked rule, never project files or the live task ledger.
 
 ## Lock contract
 

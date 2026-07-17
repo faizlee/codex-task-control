@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import {
@@ -33,6 +34,7 @@ import {
   controllerMarkAccepted,
   controllerMarkBlocked,
   controllerMarkIntegrated,
+  controllerMarkNotificationSent,
   controllerMarkCloseoutNotificationSent,
   controllerQueryDeliverables,
   controllerPrepareMessage,
@@ -911,7 +913,7 @@ test('task-control protocol failure recovers the same candidate for completion o
     assert.equal(failed.status, 'changes_requested');
     assert.equal(failed.failureHistory.length, 1);
     const originalFailure = structuredClone(failed.failureHistory[0]);
-    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.20.0', reason: 'v0.20.0 preserves registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
+    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.21.0', reason: 'v0.21.0 preserves registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
     assert.equal(recovered.status, 'executing');
     assert.equal(recovered.attemptCount, 1);
     assert.equal(recovered.controlPlaneRecovery.status, 'completion_only');
@@ -2042,6 +2044,95 @@ test('normal controller messages defer locally while a visible task is running a
   });
 });
 
+test('worker completion defaults to a durable deferred-parent event and controller ingestion records observed', async () => {
+  await withFixture(async (fixture) => {
+    const script = fileURLToPath(new URL('./task-control.mjs', import.meta.url));
+    const output = JSON.parse(execFileSync(process.execPath, [
+      script,
+      'complete',
+      '--self', fixture.threadId,
+      '--candidate-commit', 'queued-candidate',
+      '--task-control-home', fixture.taskControlHome,
+    ], { encoding: 'utf8' }));
+    assert.equal(output.notificationRequired, false);
+    assert.equal(output.notificationDeferred, true);
+    assert.equal(output.notificationText, null);
+    assert.equal(output.parentNotification.disposition, 'deferred_parent');
+    assert.equal(output.parentNotification.targetTurnState, 'unknown');
+    assert.equal(output.parentNotification.hostAction, null);
+
+    const event = JSON.parse(await readFile(output.eventPath, 'utf8'));
+    assert.deepEqual(event.parentNotification, {
+      protocolVersion: 1,
+      deliveryMode: 'queue',
+      targetTurnState: 'unknown',
+      disposition: 'deferred_parent',
+      actionId: null,
+      actionExpiresAt: null,
+    });
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.equal(scan.pendingEvents[0].parentNotification.disposition, 'deferred_parent');
+    const awaiting = await controllerIngestCompletion({ ...fixture, eventPath: output.eventPath });
+    assert.equal(awaiting.notificationStatus, 'observed');
+    await assert.rejects(
+      controllerMarkNotificationSent(fixture),
+      (error) => error instanceof TaskControlError && error.code === 'NOTIFICATION_ALREADY_RECORDED',
+    );
+  });
+});
+
+test('worker notification returns a send action only for a confirmed idle direct parent', async () => {
+  await withFixture(async (fixture) => {
+    const script = fileURLToPath(new URL('./task-control.mjs', import.meta.url));
+    const output = JSON.parse(execFileSync(process.execPath, [
+      script,
+      'complete',
+      '--self', fixture.threadId,
+      '--candidate-commit', 'idle-parent-candidate',
+      '--parent-turn-state', 'idle',
+      '--task-control-home', fixture.taskControlHome,
+    ], { encoding: 'utf8' }));
+    assert.equal(output.notificationRequired, true);
+    assert.equal(output.notificationDeferred, false);
+    assert.match(output.notificationText, /等待主控审查/);
+    assert.equal(output.parentNotification.disposition, 'prepared');
+    assert.equal(output.parentNotification.hostAction.type, 'send_thread_message');
+    assert.equal(output.parentNotification.hostAction.deliveryMode, 'start_next_turn_only');
+    const awaiting = await controllerIngestCompletion({ ...fixture, eventPath: output.eventPath });
+    assert.equal(awaiting.notificationStatus, 'pending');
+    const sent = await controllerMarkNotificationSent({ ...fixture, hostReceipt: 'host-delivered-idle-parent-notification' });
+    assert.equal(sent.notificationStatus, 'sent');
+  });
+});
+
+test('legacy completion events without a parent queue envelope remain read-compatible', async () => {
+  await withFixture(async (fixture) => {
+    const eventPath = await createCompletionEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, candidateCommit: 'legacy-candidate' });
+    const event = JSON.parse(await readFile(eventPath, 'utf8'));
+    delete event.parentNotification;
+    await writeFile(eventPath, `${JSON.stringify(event, null, 2)}\n`, 'utf8');
+    const awaiting = await controllerIngestCompletion({ ...fixture, eventPath });
+    assert.equal(awaiting.notificationStatus, 'pending');
+  });
+});
+
+test('worker progress and failure use the same event-first parent queue and reject invalid turn state', async () => {
+  await withFixture(async (fixture) => {
+    const progressPath = await createProgressEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, summary: 'Completed the bounded inspection.' });
+    const failurePath = await createFailureEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, eventType: 'task_blocked', attemptedStage: 'inspection', failureClass: 'mechanical', failureDomain: 'tooling', commandSummary: 'The local inspection tool is unavailable.', mechanicalRetryEligible: false, evidence: [{ id: 'tool-log', reference: 'logs/tool-unavailable.txt' }] });
+    const progress = JSON.parse(await readFile(progressPath, 'utf8'));
+    const failure = JSON.parse(await readFile(failurePath, 'utf8'));
+    assert.equal(progress.parentNotification.disposition, 'deferred_parent');
+    assert.equal(failure.parentNotification.disposition, 'deferred_parent');
+    const scan = await controllerScanPendingEvents(fixture);
+    assert.ok(scan.pendingEvents.filter((event) => ['task_progress', 'task_blocked'].includes(event.type)).every((event) => event.parentNotification.disposition === 'deferred_parent'));
+    await assert.rejects(
+      createCompletionEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, candidateCommit: 'invalid-state', parentTurnState: 'busy' }),
+      (error) => error instanceof TaskControlError && error.code === 'CLI_INVALID_ARGUMENTS',
+    );
+  });
+});
+
 test('interrupt is fail closed except for explicitly authorized stop or cancel', async () => {
   await withFixture(async (fixture) => {
     await assert.rejects(
@@ -2700,9 +2791,10 @@ test('CLI enforces readiness and drives an explicit controller reclaim flow', as
 test('lifecycle titles synchronize before terminal archive and heartbeat cleanup', async () => {
   await withFixture(async (fixture) => {
     await delay();
-    const eventPath = await createCompletionEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, candidateCommit: 'candidate-2' });
+    const eventPath = await createCompletionEvent({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, candidateCommit: 'candidate-2', parentTurnState: 'idle' });
     await delay();
-    const receiptPath = await createNotificationFailureReceipt({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, reason: 'send_message_to_thread unavailable' });
+    const event = JSON.parse(await readFile(eventPath, 'utf8'));
+    const receiptPath = await createNotificationFailureReceipt({ taskControlHome: fixture.taskControlHome, selfThreadId: fixture.threadId, actionId: event.parentNotification.actionId, reason: 'send_message_to_thread unavailable' });
     const awaiting = await controllerIngestCompletion({ ...fixture, eventPath });
     assert.equal(awaiting.desiredThreadTitle, '待审｜01 审计 Provider 调用');
     await controllerRecordTitleSynced({ ...fixture, title: awaiting.desiredThreadTitle });

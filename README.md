@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.20.0 preview. Workers now start with only confirmed direct-parent checkpoint facts and may read completed direct-parent turns on demand without inheriting the full controller conversation. Adaptive briefs, safe handoff, and the stability-first watchdog remain. The tool makes zero model-provider calls.
+> Windows-first v0.21.0 preview. Worker-to-controller progress, completion, and failure notifications are now event-first and queued: a running or unknown parent is never interrupted, while an idle parent can receive a receipt-backed next-turn message. Installation also audits the matching managed user-level `AGENTS.md` rule. The tool makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,7 +23,11 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.20.0 does
+## What v0.21.0 does
+
+- Writes worker progress, completion, and failure events before considering a parent notification. `running` or `unknown` parents receive `deferred_parent` with no host action; only confirmed `idle` returns `send_thread_message`.
+- Distinguishes `observed` from `sent`: direct-parent heartbeat/scan ingestion is enough to observe a deferred result, while `sent` still requires a real host delivery receipt.
+- Adds a read-only user `AGENTS.md` policy audit. Authorized installation can synchronize only the marked parent-notification rule; drift otherwise stops installation before the existing Skill is replaced.
 
 - Extends the backward-compatible `query-parent` command with `--context-mode preload`: startup receives only the direct parent's verified `always` checkpoint facts, or a non-blocking `unavailable` result when no checkpoint exists.
 - Adds read-only `query-parent-context`. It returns a bounded host `read_thread` action for the registered direct parent, starting with three completed turns and no tool outputs; older pages are followed only while they add relevant evidence.
@@ -68,6 +72,7 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Lets a worker submit a first-class failed/blocked event before required stages finish, with attempted stage, classified cause, command summary, and evidence references.
 - Audits stalled execution from lease/progress/attempt evidence even when no completion or ordinary message arrives.
 - Defers ordinary controller-to-worker messages in the local ledger while the visible task is running or its turn state is unknown. Only an externally confirmed idle state releases a `send_thread_message` action, and delivery requires a matching action ID plus a real host receipt.
+- Applies the same non-interruption rule in the reverse direction. Worker lifecycle commands default the parent state to `unknown`, so omitting state is safe and cannot inject a new turn into an active controller.
 - Rejects ordinary interrupt/steer requests. Only an explicitly authorized `stop` or `cancel` can produce a `steer_thread_message` action, and a deferred message is cancelled instead of restarting a terminal task.
 - Preserves stable objective identity across replacements and fails closed before r3 after two failed replacements or an exhausted time budget.
 - Requires product-value evidence before a diagnostic may block a milestone; otherwise it remains non-blocking technical debt.
@@ -117,14 +122,14 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.20.0 does not do
+## What v0.21.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.20.0 therefore persists a dispatch wave and message deferrals locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.21.0 therefore persists dispatch waves and both message directions locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
-- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.20.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
+- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.21.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
@@ -146,13 +151,21 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-macOS/Linux can install the skill files, but the v0.20.0 ledger remains Windows-first:
+If this release reports that the managed parent-notification rule in the user-level `AGENTS.md` is missing or still uses the legacy direct-send wording, obtain explicit user authorization in the current conversation, then run:
+
+```powershell
+pwsh -File .\scripts\install.ps1 -Force -SyncUserAgents
+```
+
+Without that flag, the audit is read-only and installation fails before replacing the existing Skill. With the authorized flag, only the marked parent-notification block is changed; project files and the live task ledger are untouched.
+
+macOS/Linux can install the skill files, but the v0.21.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
 ```
 
-The installer copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`, then runs read-only model-routing, thinking-routing, and terminal archive-backlog audits. It does not edit your global `AGENTS.md` or live task ledger. Any reported legacy task must be handled by its registered direct controller.
+The installer first audits the managed user-level parent-notification rule, copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`, verifies the rule again, then runs read-only model-routing, thinking-routing, and terminal archive-backlog audits. It never edits the live task ledger. Any reported legacy task must be handled by its registered direct controller.
 
 ## Configure the controller policy
 
@@ -262,7 +275,7 @@ node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\ex
 If an older task-control protocol already stopped a valid registered-worktree candidate, the direct controller may reopen only its frozen completion after installing the fixed version:
 
 ```powershell
-node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.20.0" --reason "v0.20.0 preserves registered worktree result authority; business scope and evidence are unchanged." --host-receipt "<real controller approval receipt>"
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.21.0" --reason "v0.21.0 preserves registered worktree result authority; business scope and evidence are unchanged." --host-receipt "<real controller approval receipt>"
 ```
 
 Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.
@@ -293,7 +306,7 @@ Apply the finalizer's host action before continuing. For `finalize_controller_cy
 At completion the worker supplies a project-owned schema-v2 result manifest; the controller then reviews actual files, reasons, validation choices, and historical evidence:
 
 ```powershell
-node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" --result-manifest "docs/test-reports/task-result.json"
+node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" --result-manifest "docs/test-reports/task-result.json" --parent-turn-state "unknown"
 node $TaskControl mark-accepted --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --reason "Contract and visual oracle passed." --selected-artifact "after"
 node $TaskControl mark-integrated --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --integration-target-ref "HEAD"
 node $TaskControl controller-query-deliverables --project-root "C:\work\example" --controller "controller-1"
@@ -340,6 +353,7 @@ For a meaningful checkpoint, the child can emit progress and notify its direct p
 node $TaskControl progress `
   --self "worker-1" `
   --summary "Existing authentication path was reused and checked." `
+  --parent-turn-state "unknown" `
   --stage "reuse-check" `
   --evidence-ref "diff-check=artifacts/diff-check.txt"
 node $TaskControl controller-ingest-progress `
@@ -353,7 +367,8 @@ When the child has a candidate:
 ```powershell
 node $TaskControl complete `
   --self "worker-1" `
-  --candidate-commit "candidate-auth-audit-v1"
+  --candidate-commit "candidate-auth-audit-v1" `
+  --parent-turn-state "unknown"
 ```
 
 The child stops at `awaiting_review`. The controller ingests the emitted event and owns the remaining transitions:

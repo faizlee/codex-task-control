@@ -9,7 +9,7 @@ import { promisify } from 'node:util';
 export const TASK_STATUSES = Object.freeze(['executing', 'awaiting_review', 'changes_requested', 'accepted', 'integrated', 'blocked', 'reclaimed']);
 export const REVIEW_VERDICTS = Object.freeze(['pending', 'changes_requested', 'accepted']);
 export const INTEGRATION_STATUSES = Object.freeze(['not_integrated', 'integrated']);
-export const NOTIFICATION_STATUSES = Object.freeze(['pending', 'sent', 'failed']);
+export const NOTIFICATION_STATUSES = Object.freeze(['pending', 'observed', 'sent', 'failed']);
 export const THINKING_LEVELS = Object.freeze(['low', 'medium', 'high']);
 export const DELEGATION_MODES = Object.freeze(['explicit']);
 export const MODEL_CLASSES = Object.freeze(['economical']);
@@ -69,6 +69,15 @@ export const CONTROLLER_MESSAGE_STATUSES = Object.freeze(['deferred_local', 'pre
 export const CONTROLLER_MESSAGE_INTERRUPT_AUTHORITIES = Object.freeze(['user_explicit', 'controller_safety']);
 export const CONTROLLER_MESSAGE_MAX_LENGTH = 4000;
 export const CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS = 30 * 1000;
+export const PARENT_NOTIFICATION_PROTOCOL_VERSION = 1;
+export const PARENT_NOTIFICATION_TARGET_STATES = Object.freeze(['running', 'idle', 'unknown']);
+export const PARENT_NOTIFICATION_DISPOSITIONS = Object.freeze(['deferred_parent', 'prepared']);
+export const USER_AGENTS_POLICY_VERSION = 1;
+export const USER_AGENTS_POLICY_START = '<!-- codex-task-control:parent-notification-policy:start -->';
+export const USER_AGENTS_POLICY_END = '<!-- codex-task-control:parent-notification-policy:end -->';
+export const USER_AGENTS_PARENT_NOTIFICATION_RULE = '- 子任务执行 `progress`、`complete` 或 `report-failure` 时必须先生成持久事件，再依据直接父任务的真实 turn 状态处理通知：父任务为 `running` 或 `unknown` 时必须保持 `deferred_parent`，不得调用 `send_message_to_thread`；只有确认父任务 `idle` 且命令返回 `send_thread_message` 动作时才可发送，并记录真实回执。延迟通知由父任务的 heartbeat / `controller-scan-events` 摄取并标记 `observed`，不得冒充 `sent`；只有真实发送成功才能标记 `sent`，发送失败才生成 `notification_failed`。普通完成、失败、阻塞和进度通知都不得中断父任务。';
+export const USER_AGENTS_PARENT_NOTIFICATION_BLOCK = `${USER_AGENTS_POLICY_START}\n${USER_AGENTS_PARENT_NOTIFICATION_RULE}\n${USER_AGENTS_POLICY_END}`;
+export const LEGACY_USER_AGENTS_PARENT_NOTIFICATION_RULE = '- 子任务执行 `complete` 后必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知；发送失败必须生成 notification_failed。只有真实消息发送成功后，主控才可标记 notificationStatus=sent。';
 export const PARALLEL_BATCH_PROTOCOL_VERSION = 1;
 export const PARALLEL_BATCH_STATUSES = Object.freeze(['planned', 'dispatching', 'running', 'reconciling', 'frozen', 'closed']);
 export const PARALLEL_LANES = Object.freeze(['implementation', 'qa', 'no_code', 'readonly']);
@@ -79,7 +88,7 @@ export const PARALLEL_POLICY_MODES = Object.freeze(['legacy_compat', 'batch_v1']
 export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
-export const TASK_CONTROL_VERSION = '0.20.0';
+export const TASK_CONTROL_VERSION = '0.21.0';
 export const REGISTER_TASK_MODES = Object.freeze(['control_only', 'implementation', 'visual_implementation']);
 export const IMPLEMENTATION_POLICIES = Object.freeze(['adaptive_brief', 'hard_contract']);
 export const SCOPE_POLICIES = Object.freeze(['bounded_incidental', 'strict_scope']);
@@ -166,6 +175,83 @@ export function resolveTaskControlHome(input = {}) {
   if (nonEmpty(input.taskControlHome)) return input.taskControlHome;
   const codexHome = nonEmpty(input.codexHome) ? input.codexHome : (process.env.CODEX_HOME || join(homedir(), '.codex'));
   return join(codexHome, 'task-control');
+}
+
+function resolveCodexHomeForUserPolicy(input = {}) {
+  if (nonEmpty(input.taskControlHome)) fail('CLI_INVALID_ARGUMENTS', '用户级 AGENTS 策略审计必须使用 codexHome，不能从 taskControlHome 推断');
+  return nonEmpty(input.codexHome) ? input.codexHome : (process.env.CODEX_HOME || join(homedir(), '.codex'));
+}
+
+function normalizedPolicyText(value) {
+  return value.replaceAll('\r\n', '\n');
+}
+
+function occurrenceCount(value, fragment) {
+  return value.split(fragment).length - 1;
+}
+
+export async function auditUserAgentsPolicy(input = {}) {
+  const codexHome = resolveCodexHomeForUserPolicy(input);
+  const agentsPath = join(codexHome, 'AGENTS.md');
+  let raw;
+  try {
+    raw = await readFile(agentsPath, 'utf8');
+  } catch (error) {
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return { compliant: false, policyVersion: USER_AGENTS_POLICY_VERSION, agentsPath, reason: 'agents_file_missing', legacyConflict: false, managedBlockPresent: false, canSyncSafely: false };
+    }
+    fail('AGENTS_POLICY_READ_FAILED', `无法读取用户级 AGENTS.md: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const normalized = normalizedPolicyText(raw);
+  const startCount = occurrenceCount(normalized, USER_AGENTS_POLICY_START);
+  const endCount = occurrenceCount(normalized, USER_AGENTS_POLICY_END);
+  const compliant = normalized.includes(USER_AGENTS_PARENT_NOTIFICATION_BLOCK) && startCount === 1 && endCount === 1;
+  const legacyConflict = normalized.includes(LEGACY_USER_AGENTS_PARENT_NOTIFICATION_RULE);
+  const managedBlockPresent = startCount > 0 || endCount > 0;
+  const unmarkedCurrentRule = normalized.includes(USER_AGENTS_PARENT_NOTIFICATION_RULE) && !managedBlockPresent;
+  let reason = 'compliant';
+  if (!compliant) {
+    if (legacyConflict) reason = 'legacy_direct_send_conflict';
+    else if (startCount !== endCount || startCount > 1) reason = 'managed_block_invalid';
+    else if (managedBlockPresent) reason = 'managed_block_drift';
+    else if (unmarkedCurrentRule) reason = 'current_rule_unmanaged';
+    else reason = 'required_policy_missing';
+  }
+  return {
+    compliant,
+    policyVersion: USER_AGENTS_POLICY_VERSION,
+    agentsPath,
+    reason,
+    legacyConflict,
+    managedBlockPresent,
+    canSyncSafely: compliant || legacyConflict || (startCount === 1 && endCount === 1) || unmarkedCurrentRule,
+    requiredDigest: createHash('sha256').update(USER_AGENTS_PARENT_NOTIFICATION_BLOCK, 'utf8').digest('hex'),
+  };
+}
+
+export async function syncUserAgentsPolicy(input = {}) {
+  if (input.authorization !== 'user_explicit_current_turn') fail('AGENTS_POLICY_SYNC_UNAUTHORIZED', '同步用户级 AGENTS.md 必须具有当前对话的用户明确授权');
+  const audit = await auditUserAgentsPolicy(input);
+  if (audit.compliant) return { ...audit, changed: false };
+  if (!audit.canSyncSafely) fail('AGENTS_POLICY_SYNC_UNSAFE', `无法安全定位受管理规则，拒绝改写 AGENTS.md: ${audit.reason}`);
+  const raw = await readFile(audit.agentsPath, 'utf8');
+  const lineEnding = raw.includes('\r\n') ? '\r\n' : '\n';
+  let normalized = normalizedPolicyText(raw);
+  const startIndex = normalized.indexOf(USER_AGENTS_POLICY_START);
+  const endIndex = normalized.indexOf(USER_AGENTS_POLICY_END);
+  if (startIndex >= 0 && endIndex > startIndex) {
+    normalized = `${normalized.slice(0, startIndex)}${USER_AGENTS_PARENT_NOTIFICATION_BLOCK}${normalized.slice(endIndex + USER_AGENTS_POLICY_END.length)}`;
+  } else if (normalized.includes(LEGACY_USER_AGENTS_PARENT_NOTIFICATION_RULE)) {
+    normalized = normalized.replace(LEGACY_USER_AGENTS_PARENT_NOTIFICATION_RULE, USER_AGENTS_PARENT_NOTIFICATION_BLOCK);
+  } else if (normalized.includes(USER_AGENTS_PARENT_NOTIFICATION_RULE)) {
+    normalized = normalized.replace(USER_AGENTS_PARENT_NOTIFICATION_RULE, USER_AGENTS_PARENT_NOTIFICATION_BLOCK);
+  } else {
+    fail('AGENTS_POLICY_SYNC_UNSAFE', '受管理规则在同步前发生变化，拒绝改写 AGENTS.md');
+  }
+  await atomicWriteText(audit.agentsPath, normalized.replaceAll('\n', lineEnding));
+  const verified = await auditUserAgentsPolicy(input);
+  if (!verified.compliant) fail('AGENTS_POLICY_SYNC_FAILED', `AGENTS.md 同步后仍不一致: ${verified.reason}`);
+  return { ...verified, changed: true };
 }
 
 function pathsFor(home, projectRoot) {
@@ -1964,6 +2050,62 @@ function controllerMessageAction(message) {
 
 function controllerMessageSummary(message) {
   return { ...message, hostAction: controllerMessageAction(message) };
+}
+
+function parentNotificationEnvelope(targetTurnState = 'unknown') {
+  if (!has(targetTurnState, PARENT_NOTIFICATION_TARGET_STATES)) fail('CLI_INVALID_ARGUMENTS', 'parent turn state 必须是 running、idle 或 unknown');
+  const prepared = targetTurnState === 'idle';
+  return {
+    protocolVersion: PARENT_NOTIFICATION_PROTOCOL_VERSION,
+    deliveryMode: 'queue',
+    targetTurnState,
+    disposition: prepared ? 'prepared' : 'deferred_parent',
+    actionId: prepared ? `parentmsg_${randomUUID().replaceAll('-', '')}` : null,
+    actionExpiresAt: prepared ? new Date(Date.now() + CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS).toISOString() : null,
+  };
+}
+
+function validateParentNotificationEnvelope(value) {
+  if (!isObject(value)
+    || value.protocolVersion !== PARENT_NOTIFICATION_PROTOCOL_VERSION
+    || value.deliveryMode !== 'queue'
+    || !has(value.targetTurnState, PARENT_NOTIFICATION_TARGET_STATES)
+    || !has(value.disposition, PARENT_NOTIFICATION_DISPOSITIONS)
+    || value.disposition !== (value.targetTurnState === 'idle' ? 'prepared' : 'deferred_parent')
+    || (value.disposition === 'prepared' && (!isSafeThreadId(value.actionId) || !isTimestamp(value.actionExpiresAt)))
+    || (value.disposition === 'deferred_parent' && (value.actionId !== null || value.actionExpiresAt !== null))) {
+    fail('EVENT_INVALID', 'parent notification envelope 无效');
+  }
+  return { ...value };
+}
+
+function notificationStatusAfterIngest(event) {
+  return event.parentNotification?.disposition === 'deferred_parent' ? 'observed' : 'pending';
+}
+
+function workerParentNotificationSummary(task, eventPath, messageText, envelopeInput) {
+  const envelope = validateParentNotificationEnvelope(envelopeInput);
+  const prepared = envelope.disposition === 'prepared';
+  const hostAction = prepared ? {
+    type: 'send_thread_message',
+    actionId: envelope.actionId,
+    targetThreadId: task.parentThreadId,
+    messageText,
+    deliveryMode: 'start_next_turn_only',
+    receiptRequired: true,
+    expiresAt: envelope.actionExpiresAt,
+    precondition: 'the registered direct parent turn is still idle immediately before host send',
+    onSuccess: 'direct parent ingests the event, then records controller-mark-notification-sent --host-receipt <host-receipt>',
+    onFailure: `worker creates notification-failed --action-id ${envelope.actionId} with the real host error`,
+  } : null;
+  return {
+    parentThreadId: task.parentThreadId,
+    notificationText: prepared ? messageText : null,
+    notificationRequired: prepared,
+    notificationDeferred: !prepared,
+    notificationFailureRequiredOnSendError: prepared,
+    parentNotification: { ...envelope, eventPath, hostAction },
+  };
 }
 
 function validateControllerMessage(value, tasks, knownControllers) {
@@ -4076,12 +4218,14 @@ async function readArtifact(filePath, expectedType) {
   const code = expectedType === 'notification_failed' ? 'NOTIFICATION_RECEIPT_INVALID' : 'EVENT_INVALID';
   const value = await readJson(filePath, code);
   if (!isObject(value) || value.schemaVersion !== 1 || value.type !== expectedType || !nonEmpty(value.projectKey) || !isSafeThreadId(value.threadId) || !isSafeThreadId(value.parentThreadId) || !isSafeThreadId(value.controllerThreadId) || !isTimestamp(value.createdAt)) fail(code, '事件身份或时间字段无效');
+  if (['task_progress', 'task_completed', ...FAILURE_EVENT_TYPES].includes(expectedType) && value.parentNotification !== undefined) validateParentNotificationEnvelope(value.parentNotification);
   if (expectedType === 'task_progress' && (!nonEmpty(value.summary) || !Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'progress event summary 或 attemptCount 无效');
   if (expectedType === 'task_completed' && value.attemptCount !== undefined && (!Number.isInteger(value.attemptCount) || value.attemptCount < 1)) fail(code, 'completion event attemptCount 无效');
   if (expectedType === 'task_completed' && value.resultManifest !== undefined && !isObject(value.resultManifest)) fail(code, 'completion event resultManifest 无效');
   if (expectedType === 'task_progress' && value.stageId !== undefined && value.stageId !== null && !nonEmpty(value.stageId)) fail(code, 'progress event stageId 无效');
   if (expectedType === 'task_progress' && value.evidence !== undefined && !Array.isArray(value.evidence)) fail(code, 'progress event evidence 无效');
   if (expectedType === 'incidental_repair' && (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !isSafeThreadId(value.repairId))) fail(code, '附带修复 event attemptCount 或 repairId 无效');
+  if (expectedType === 'notification_failed' && (!isSafeThreadId(value.actionId) || !nonEmpty(value.sourceEventPath) || !nonEmpty(value.reason))) fail(code, 'notification_failed 缺少 idle-send action、来源事件或原因');
   if (FAILURE_EVENT_TYPES.includes(expectedType)) {
     if (!Number.isInteger(value.attemptCount) || value.attemptCount < 1 || !nonEmpty(value.attemptedStage) || !has(value.failureClass, FAILURE_CLASSES.filter((entry) => entry !== 'unclassified')) || !has(value.failureDomain, FAILURE_DOMAINS) || !nonEmpty(value.commandSummary) || !Array.isArray(value.evidence) || value.evidence.length === 0 || typeof value.mechanicalRetryEligible !== 'boolean' || !has(value.authority ?? 'contract_evidence', FAILURE_AUTHORITIES) || (value.failureMode !== undefined && !has(value.failureMode, EVIDENCE_FAILURE_MODES)) || (value.recoveryExhausted !== undefined && typeof value.recoveryExhausted !== 'boolean')) fail(code, 'failure event 字段无效');
   }
@@ -4121,7 +4265,7 @@ export async function controllerIngestFailure(input) {
       return appendObservabilityReceipt({ ...task, failureHistory: [...task.failureHistory, failureRecord], updatedAt: new Date().toISOString() }, 'failure_diagnostic_ingested', event.createdAt);
     }
     const reason = `${event.failureDomain}/${event.failureClass}: ${event.commandSummary.trim()}`;
-    return appendObservabilityReceipt({ ...task, failureHistory: [...task.failureHistory, failureRecord], status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: event.failureClass, changesRequestedReason: reason, reviewVerdict: 'changes_requested', failureEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, updatedAt: new Date().toISOString() }, 'failure_ingested', event.createdAt);
+    return appendObservabilityReceipt({ ...task, failureHistory: [...task.failureHistory, failureRecord], status: 'changes_requested', executionStatus: 'stopped', nextOwner: 'undecided', failureClass: event.failureClass, changesRequestedReason: reason, reviewVerdict: 'changes_requested', notificationStatus: notificationStatusAfterIngest(event), failureEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, updatedAt: new Date().toISOString() }, 'failure_ingested', event.createdAt);
   }});
 }
 
@@ -4198,14 +4342,16 @@ export async function controllerIngestCompletion(input) {
     } else if (event.resultManifest !== undefined) {
       fail('RESULT_MANIFEST_NOT_APPLICABLE', 'legacy completion event 不得伪造 result manifest');
     }
-    return appendObservabilityReceipt({ ...task, controlPlaneRecovery, deliverableHistory, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: 'pending', updatedAt: new Date().toISOString() }, 'completion_ingested', event.createdAt);
+    return appendObservabilityReceipt({ ...task, controlPlaneRecovery, deliverableHistory, status: 'awaiting_review', executionStatus: 'awaiting_review', nextOwner: 'controller', candidateCommit: event.candidateCommit, completionEventCreatedAt: event.createdAt, executionEndedAt: event.createdAt, reviewVerdict: 'pending', integrationStatus: 'not_integrated', notificationStatus: notificationStatusAfterIngest(event), updatedAt: new Date().toISOString() }, 'completion_ingested', event.createdAt);
   }});
 }
 
 export async function controllerMarkNotificationSent(input) {
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
     if (task.notificationStatus !== 'pending') fail('NOTIFICATION_ALREADY_RECORDED', `notificationStatus 已是 ${task.notificationStatus}`);
-    return { ...task, notificationStatus: 'sent', updatedAt: new Date().toISOString() };
+    if (!nonEmpty(input.hostReceipt)) fail('NOTIFICATION_RECEIPT_REQUIRED', '标记 sent 必须记录真实 host receipt');
+    const now = new Date().toISOString();
+    return { ...task, notificationStatus: 'sent', notificationReceipt: input.hostReceipt.trim(), notificationSentAt: now, updatedAt: now };
   }});
 }
 
@@ -4214,6 +4360,10 @@ export async function controllerIngestNotificationFailed(input) {
   const paths = pathsFor(home, input.projectRoot);
   const receipt = await readArtifact(input.receiptPath, 'notification_failed');
   if (receipt.projectKey !== paths.projectKey || !nonEmpty(receipt.reason)) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed 项目或 reason 无效');
+  const sourceType = artifactTypeForPath(receipt.sourceEventPath);
+  if (!['task_progress', 'task_completed', ...FAILURE_EVENT_TYPES].includes(sourceType)) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed 来源不是可通知的 worker 事件');
+  const sourceEvent = await readArtifact(receipt.sourceEventPath, sourceType);
+  if (sourceEvent.projectKey !== receipt.projectKey || sourceEvent.threadId !== receipt.threadId || sourceEvent.parentThreadId !== receipt.parentThreadId || sourceEvent.controllerThreadId !== receipt.controllerThreadId || sourceEvent.parentNotification?.disposition !== 'prepared' || sourceEvent.parentNotification.actionId !== receipt.actionId) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed 未绑定同一任务的已持久化 idle-send action');
   return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: receipt.threadId, heartbeatReason: 'reconcile', mutate: (task) => {
     if (receipt.parentThreadId !== task.parentThreadId || receipt.controllerThreadId !== task.directControllerThreadId) fail('NOTIFICATION_RECEIPT_INVALID', 'notification_failed parent/controller 不匹配');
     const freshnessAnchor = task.completionEventCreatedAt ?? task.updatedAt;
@@ -4458,7 +4608,7 @@ export async function controllerScanPendingEvents(input) {
       if (type === 'incidental_repair' && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
       if (FAILURE_EVENT_TYPES.includes(type) && (task.status !== 'executing' || artifact.attemptCount !== task.attemptCount)) continue;
       if (type === 'notification_failed' && task.notificationStatus !== 'pending') continue;
-      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...contractSummary(task), ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : type === 'task_progress' ? { attemptCount: artifact.attemptCount, summary: artifact.summary, stageId: artifact.stageId ?? null, evidence: artifact.evidence ?? [] } : type === 'incidental_repair' ? { attemptCount: artifact.attemptCount, repairId: artifact.repairId, originalBlocker: artifact.originalBlocker, sameObjectiveReason: artifact.sameObjectiveReason, functionalDomain: artifact.functionalDomain, affectedFiles: artifact.affectedFiles, conflictDomains: artifact.conflictDomains, riskAssessment: artifact.riskAssessment, redEvidence: artifact.redEvidence, greenEvidence: artifact.greenEvidence } : FAILURE_EVENT_TYPES.includes(type) ? { attemptCount: artifact.attemptCount, attemptedStage: artifact.attemptedStage, failureClass: artifact.failureClass, failureDomain: artifact.failureDomain, commandSummary: artifact.commandSummary, evidenceCommandId: artifact.evidenceCommandId ?? null, authority: artifact.authority ?? 'contract_evidence', evidence: artifact.evidence, mechanicalRetryEligible: artifact.mechanicalRetryEligible } : { reason: artifact.reason }) });
+      pendingEvents.push({ type, eventPath, threadId: task.threadId, parentThreadId: task.parentThreadId, createdAt: artifact.createdAt, ...(artifact.parentNotification === undefined ? {} : { parentNotification: artifact.parentNotification }), ...contractSummary(task), ...(type === 'task_completed' ? { candidateCommit: artifact.candidateCommit } : type === 'task_progress' ? { attemptCount: artifact.attemptCount, summary: artifact.summary, stageId: artifact.stageId ?? null, evidence: artifact.evidence ?? [] } : type === 'incidental_repair' ? { attemptCount: artifact.attemptCount, repairId: artifact.repairId, originalBlocker: artifact.originalBlocker, sameObjectiveReason: artifact.sameObjectiveReason, functionalDomain: artifact.functionalDomain, affectedFiles: artifact.affectedFiles, conflictDomains: artifact.conflictDomains, riskAssessment: artifact.riskAssessment, redEvidence: artifact.redEvidence, greenEvidence: artifact.greenEvidence } : FAILURE_EVENT_TYPES.includes(type) ? { attemptCount: artifact.attemptCount, attemptedStage: artifact.attemptedStage, failureClass: artifact.failureClass, failureDomain: artifact.failureDomain, commandSummary: artifact.commandSummary, evidenceCommandId: artifact.evidenceCommandId ?? null, authority: artifact.authority ?? 'contract_evidence', evidence: artifact.evidence, mechanicalRetryEligible: artifact.mechanicalRetryEligible } : { reason: artifact.reason }) });
     }
   }
   pendingEvents.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.eventPath.localeCompare(right.eventPath));
@@ -5038,7 +5188,7 @@ export async function createFailureEvent(input) {
     }
   }
   const prefix = input.eventType === 'task_failed' ? 'task-failed' : 'task-blocked';
-  return writeChildArtifact(result.paths, result.task.threadId, prefix, { schemaVersion: 1, type: input.eventType, projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, attemptedStage: input.attemptedStage.trim(), failureClass: input.failureClass, failureDomain: input.failureDomain, commandSummary: input.commandSummary.trim(), evidenceCommandId: nonEmpty(input.evidenceCommandId) ? input.evidenceCommandId.trim() : null, failureMode, evidenceClass, recoveryExhausted, authority, evidence, mechanicalRetryEligible: input.mechanicalRetryEligible, ...contractSummary(result.task), createdAt: new Date().toISOString() });
+  return writeChildArtifact(result.paths, result.task.threadId, prefix, { schemaVersion: 1, type: input.eventType, projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, attemptedStage: input.attemptedStage.trim(), failureClass: input.failureClass, failureDomain: input.failureDomain, commandSummary: input.commandSummary.trim(), evidenceCommandId: nonEmpty(input.evidenceCommandId) ? input.evidenceCommandId.trim() : null, failureMode, evidenceClass, recoveryExhausted, authority, evidence, mechanicalRetryEligible: input.mechanicalRetryEligible, parentNotification: parentNotificationEnvelope(input.parentTurnState ?? 'unknown'), ...contractSummary(result.task), createdAt: new Date().toISOString() });
 }
 
 export async function createProgressEvent(input) {
@@ -5049,7 +5199,7 @@ export async function createProgressEvent(input) {
   await assertImplementationContractCurrent(result.task, result.registry.projectRoot);
   const pendingStages = implementationTask(result.task) ? await pendingStagesForCreation(result.paths, result.task) : new Map();
   const checkpoint = validateStageCheckpoint(result.task, input.stageId, input.evidence ?? [], { pendingStages });
-  return writeChildArtifact(result.paths, result.task.threadId, 'progress', { schemaVersion: 1, type: 'task_progress', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, summary: input.summary.trim(), ...(implementationTask(result.task) ? { ...checkpoint, ...contractSummary(result.task) } : {}), createdAt: new Date().toISOString() });
+  return writeChildArtifact(result.paths, result.task.threadId, 'progress', { schemaVersion: 1, type: 'task_progress', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, attemptCount: result.task.attemptCount, summary: input.summary.trim(), parentNotification: parentNotificationEnvelope(input.parentTurnState ?? 'unknown'), ...(implementationTask(result.task) ? { ...checkpoint, ...contractSummary(result.task) } : {}), createdAt: new Date().toISOString() });
 }
 
 export async function createCompletionEvent(input) {
@@ -5068,13 +5218,24 @@ export async function createCompletionEvent(input) {
     : null;
   const recovery = result.task.controlPlaneRecovery;
   if (recovery?.status === 'completion_only' && (input.candidateCommit !== recovery.candidateCommit || resultManifest === null || resultManifest.resultManifestPath.toLowerCase() !== recovery.resultManifestPath.toLowerCase() || resultManifest.resultManifestDigest !== recovery.resultManifestDigest)) fail('CONTROL_PLANE_RECOVERY_CANDIDATE_DRIFT', '控制面恢复只允许重新提交已冻结的同一 candidate commit 和 result manifest');
-  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, attemptCount: result.task.attemptCount, status: 'awaiting_review', candidateCommit: input.candidateCommit, ...summary, ...(resultManifest === null ? {} : { resultManifest }), createdAt: new Date().toISOString() });
+  return writeChildArtifact(result.paths, result.task.threadId, 'completion', { schemaVersion: 1, type: 'task_completed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, displayKey: result.task.displayKey, title: result.task.title, desiredThreadTitle: result.task.desiredThreadTitle, attemptCount: result.task.attemptCount, status: 'awaiting_review', candidateCommit: input.candidateCommit, parentNotification: parentNotificationEnvelope(input.parentTurnState ?? 'unknown'), ...summary, ...(resultManifest === null ? {} : { resultManifest }), createdAt: new Date().toISOString() });
 }
 
 export async function createNotificationFailureReceipt(input) {
   const result = await querySelf(input);
-  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', '通知失败原因不能为空');
-  return writeChildArtifact(result.paths, result.task.threadId, 'notification-failed', { schemaVersion: 1, type: 'notification_failed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, reason: input.reason.trim(), createdAt: new Date().toISOString() });
+  if (!nonEmpty(input.reason) || !isSafeThreadId(input.actionId)) fail('CLI_INVALID_ARGUMENTS', '通知失败必须提供真实 actionId 和非空原因');
+  let sourceEventPath = null;
+  for (const eventPath of await listTaskEventFiles(result.paths, result.task)) {
+    const type = artifactTypeForPath(eventPath);
+    if (!['task_progress', 'task_completed', ...FAILURE_EVENT_TYPES].includes(type)) continue;
+    const event = await readArtifact(eventPath, type);
+    if (event.parentNotification?.disposition === 'prepared' && event.parentNotification.actionId === input.actionId) {
+      sourceEventPath = eventPath;
+      break;
+    }
+  }
+  if (sourceEventPath === null) fail('NOTIFICATION_ACTION_NOT_FOUND', 'notification_failed 必须引用当前任务已持久化的 idle-send action');
+  return writeChildArtifact(result.paths, result.task.threadId, 'notification-failed', { schemaVersion: 1, type: 'notification_failed', projectKey: result.registry.projectKey, threadId: result.task.threadId, parentThreadId: result.task.parentThreadId, controllerThreadId: result.task.directControllerThreadId, actionId: input.actionId, sourceEventPath, reason: input.reason.trim(), createdAt: new Date().toISOString() });
 }
 
 function adapterReferencePath(projectRoot, reference) {
@@ -5150,7 +5311,7 @@ function optionalBoolean(args, name, defaultValue = false) {
 
 function helpText() {
   return [
-    'codex-task-control v0.20.0',
+    'codex-task-control v0.21.0',
     '',
     '实施简报与风险合同命令：',
     '  audit-implementation-contract --project-root <root> --contract <project-relative-json> --task-mode implementation|visual_implementation',
@@ -5162,12 +5323,16 @@ function helpText() {
     '  audit-parallel-routing [--codex-home <CODEX_HOME>]',
     '  query-parent --self <thread> [--context-mode preload]  # 无 context-mode 时保持旧版，仅返回 parent ID',
     '  query-parent-context --self <thread> --reason <why-history-is-needed> [--point <fact-id>]',
-    '  progress --self <thread> --summary <text> [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
+    '  progress --self <thread> --summary <text> [--parent-turn-state running|idle|unknown] [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
     '  incidental-repair --self <thread> --repair-id <id> --original-blocker <text> --same-objective-reason <text> --functional-domain <id> --affected-file <path|changeType|reason> --local-only true --reversible true --risk-assessment <text> --red-evidence-ref <id=reference> --green-evidence-ref <id=reference> [--conflict-domain <id> ...] [--risk-flag <flag> ...]',
     '  controller-ingest-incidental-repair --project-root <root> --controller <id> --event <event.json>',
-    '  controller-recover-control-plane-candidate --project-root <root> --controller <id> --thread <id> --control-plane-component task_control_protocol --candidate-commit <sha> --result-manifest <path> --skill-version 0.20.0 --reason <reason> --host-receipt <receipt>',
-    '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--evidence-command-id <contract-id>] [--evidence-ref <id=reference> ...]',
-    '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json>',
+    '  controller-recover-control-plane-candidate --project-root <root> --controller <id> --thread <id> --control-plane-component task_control_protocol --candidate-commit <sha> --result-manifest <path> --skill-version 0.21.0 --reason <reason> --host-receipt <receipt>',
+    '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--parent-turn-state running|idle|unknown] [--evidence-command-id <contract-id>] [--evidence-ref <id=reference> ...]',
+    '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json> [--parent-turn-state running|idle|unknown]',
+    '  notification-failed --self <thread> --action-id <returned-idle-send-action-id> --reason <host-error>',
+    '  controller-mark-notification-sent --project-root <root> --controller <id> --thread <id> --host-receipt <real-host-receipt>',
+    '  audit-user-agents-policy --codex-home <CODEX_HOME>',
+    '  sync-user-agents-policy --codex-home <CODEX_HOME> --authorization user_explicit_current_turn',
     '  controller-query-deliverables --project-root <root> --controller <id>',
     '  controller-build-delivery-report --project-root <root> --controller <id> [--observability lean|diagnostic] [--otel-jsonl <file-or-dir>] [--desktop-log <file>]',
     '  controller-ingest-context-health --project-root <root> --controller <id> --receipt <json>',
@@ -5197,6 +5362,7 @@ function helpText() {
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
     'heartbeat 使用单次 watchdog；连续两轮无业务变化自动熔断，删除只自动补偿一次，清理失败后必须人工确认并显式 resume。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
+    'worker 到直接父主控同样采用事件先入账：父主控 running/unknown 时只保留 deferred_parent，不返回发送动作；确认 idle 才返回 send_thread_message。父主控扫描入账 deferred 事件后标记 observed，只有真实发送成功才标记 sent。',
     'worker 启动时可让 query-parent 预加载直接父任务 checkpoint 中已确认的 always 摘要；需要历史路线时才用 query-parent-context 读取直接父任务的已完成回合，不继承全量上下文。',
     'checkpoint 独立保存在 task-control/checkpoints；handoff 必须无活跃/待审/消息/heartbeat 债务，可在接受前取消；接受后旧主控退休。',
   ].join('\n');
@@ -5232,22 +5398,28 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'audit-thinking-routing') result = await auditThinkingRouting(storage);
   else if (command === 'audit-archive-backlog') result = await auditArchiveBacklog(storage);
   else if (command === 'audit-parallel-routing') result = await auditParallelRouting(storage);
+  else if (command === 'audit-user-agents-policy') result = await auditUserAgentsPolicy({ codexHome: required(args, '--codex-home') });
+  else if (command === 'sync-user-agents-policy') result = await syncUserAgentsPolicy({ codexHome: required(args, '--codex-home'), authorization: required(args, '--authorization') });
   else if (command === 'query-self') {
     const task = (await querySelf({ ...storage, selfThreadId: required(args, '--self') })).task;
     result = { ...task, dispatchAllowed: dispatchAllowed(task) };
   }
   else if (command === 'complete') {
     const selfThreadId = required(args, '--self');
-    const eventPath = await createCompletionEvent({ ...storage, selfThreadId, candidateCommit: required(args, '--candidate-commit'), resultManifestPath: option(args, '--result-manifest'), status: option(args, '--status') });
+    const parentTurnState = option(args, '--parent-turn-state') ?? 'unknown';
+    const eventPath = await createCompletionEvent({ ...storage, selfThreadId, candidateCommit: required(args, '--candidate-commit'), resultManifestPath: option(args, '--result-manifest'), status: option(args, '--status'), parentTurnState });
     const task = (await querySelf({ ...storage, selfThreadId })).task;
-    result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildCompletionNotification(task), notificationRequired: true, notificationFailureRequiredOnSendError: true, ...contractSummary(task) };
+    const event = await readArtifact(eventPath, 'task_completed');
+    result = { eventPath, ...workerParentNotificationSummary(task, eventPath, buildCompletionNotification(task), event.parentNotification), ...contractSummary(task) };
   }
   else if (command === 'progress') {
     const selfThreadId = required(args, '--self');
     const summary = required(args, '--summary');
-    const eventPath = await createProgressEvent({ ...storage, selfThreadId, summary, stageId: option(args, '--stage'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')) });
+    const parentTurnState = option(args, '--parent-turn-state') ?? 'unknown';
+    const eventPath = await createProgressEvent({ ...storage, selfThreadId, summary, stageId: option(args, '--stage'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')), parentTurnState });
     const task = (await querySelf({ ...storage, selfThreadId })).task;
-    result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildProgressNotification(task, summary), notificationRequired: true, ...contractSummary(task) };
+    const event = await readArtifact(eventPath, 'task_progress');
+    result = { eventPath, ...workerParentNotificationSummary(task, eventPath, buildProgressNotification(task, summary), event.parentNotification), ...contractSummary(task) };
   }
   else if (command === 'incidental-repair') {
     const selfThreadId = required(args, '--self');
@@ -5259,11 +5431,13 @@ export async function runCli(args = process.argv.slice(2)) {
     const selfThreadId = required(args, '--self');
     const eventType = required(args, '--event-type');
     const attemptedStage = required(args, '--attempted-stage');
-    const eventPath = await createFailureEvent({ ...storage, selfThreadId, eventType, attemptedStage, failureClass: required(args, '--failure-class'), failureDomain: required(args, '--failure-domain'), commandSummary: required(args, '--command-summary'), evidenceCommandId: option(args, '--evidence-command-id'), recoveryExhausted: optionalBoolean(args, '--recovery-exhausted'), mechanicalRetryEligible: requiredBoolean(args, '--mechanical-retry-eligible'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')) });
+    const parentTurnState = option(args, '--parent-turn-state') ?? 'unknown';
+    const eventPath = await createFailureEvent({ ...storage, selfThreadId, eventType, attemptedStage, failureClass: required(args, '--failure-class'), failureDomain: required(args, '--failure-domain'), commandSummary: required(args, '--command-summary'), evidenceCommandId: option(args, '--evidence-command-id'), recoveryExhausted: optionalBoolean(args, '--recovery-exhausted'), mechanicalRetryEligible: requiredBoolean(args, '--mechanical-retry-eligible'), evidence: parseEvidenceReferences(options(args, '--evidence-ref')), parentTurnState });
     const task = (await querySelf({ ...storage, selfThreadId })).task;
-    result = { eventPath, parentThreadId: task.parentThreadId, notificationText: buildFailureNotification(task, eventType, attemptedStage), notificationRequired: true, ...contractSummary(task) };
+    const event = await readArtifact(eventPath, eventType);
+    result = { eventPath, ...workerParentNotificationSummary(task, eventPath, buildFailureNotification(task, eventType, attemptedStage), event.parentNotification), ...contractSummary(task) };
   }
-  else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason') });
+  else if (command === 'notification-failed') result = await createNotificationFailureReceipt({ ...storage, selfThreadId: required(args, '--self'), actionId: required(args, '--action-id'), reason: required(args, '--reason') });
   else if (command === 'register') result = await controllerRegisterTask({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), threadId: required(args, '--thread'), parentThreadId: required(args, '--parent'), title: required(args, '--title'), model: required(args, '--model'), thinking: required(args, '--thinking'), delegationMode: required(args, '--delegation'), executionSurface: required(args, '--execution-surface'), modelClass: required(args, '--model-class'), quotaReason: required(args, '--quota-reason'), workClass: required(args, '--work-class'), decisionStatus: required(args, '--decision-status'), scope: required(args, '--scope'), acceptance: required(args, '--acceptance'), forbiddenDecisions: required(args, '--forbidden-decisions'), taskMode: option(args, '--task-mode'), implementationPolicy: option(args, '--execution-policy'), scopePolicy: option(args, '--scope-policy'), implementationBriefPath: option(args, '--implementation-brief'), implementationContractPath: option(args, '--implementation-contract'), hardContractTrigger: option(args, '--hard-contract-trigger'), hardContractReason: option(args, '--hard-contract-reason'), replacementOfThreadId: option(args, '--replacement-of'), objectiveId: option(args, '--objective-id'), objectiveBudgetMinutes: option(args, '--objective-budget-minutes'), parallelPolicy: option(args, '--parallel-policy'), parallelBatchId: option(args, '--batch-id'), parallelCandidateId: option(args, '--candidate-id') });
   else if (command === 'controller-plan-parallel-batch') result = await controllerPlanParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), manifestPath: required(args, '--manifest') });
   else if (command === 'controller-evaluate-fanout') result = await controllerEvaluateParallelBatch({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), batchId: required(args, '--batch-id') });
@@ -5295,7 +5469,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-record-heartbeat-action-failed') result = await controllerRecordHeartbeatActionFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), actionId: required(args, '--action-id'), automationId: option(args, '--automation-id'), reason: required(args, '--reason') });
   else if (command === 'controller-mark-heartbeat-notification-sent') result = await controllerMarkHeartbeatNotificationSent({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
   else if (command === 'controller-record-dispatched') result = await controllerRecordDispatched({ ...controllerInput(args) });
-  else if (command === 'controller-mark-notification-sent') result = await controllerMarkNotificationSent({ ...controllerInput(args) });
+  else if (command === 'controller-mark-notification-sent') result = await controllerMarkNotificationSent({ ...controllerInput(args), hostReceipt: required(args, '--host-receipt') });
   else if (command === 'mark-changes-requested') result = await controllerMarkChangesRequested({ ...controllerInput(args), failureClass: required(args, '--failure-class'), reason: required(args, '--reason') });
   else if (command === 'controller-dispatch-rework') result = await controllerDispatchRework({ ...controllerInput(args) });
   else if (command === 'controller-confirm-rework-dispatched') result = await controllerConfirmReworkDispatched({ ...controllerInput(args), actionId: required(args, '--action-id'), hostReceipt: required(args, '--host-receipt') });
