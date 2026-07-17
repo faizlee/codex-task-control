@@ -64,6 +64,8 @@ import {
   createNotificationFailureReceipt,
   loadProjectAdapter,
   projectKeyForRoot,
+  queryParent,
+  queryParentContext,
   querySelf,
   runCli,
 } from './task-control.mjs';
@@ -909,7 +911,7 @@ test('task-control protocol failure recovers the same candidate for completion o
     assert.equal(failed.status, 'changes_requested');
     assert.equal(failed.failureHistory.length, 1);
     const originalFailure = structuredClone(failed.failureHistory[0]);
-    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.19.0', reason: 'v0.19.0 fixes registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
+    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.20.0', reason: 'v0.20.0 preserves registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
     assert.equal(recovered.status, 'executing');
     assert.equal(recovered.attemptCount, 1);
     assert.equal(recovered.controlPlaneRecovery.status, 'completion_only');
@@ -1499,6 +1501,61 @@ test('conversation checkpoints preload only confirmed summaries and retain immut
     const unsafe = { ...manifest, points: [{ ...manifest.points[1], preloadPolicy: 'always' }] };
     await writeFile(manifestPath, `${JSON.stringify(unsafe, null, 2)}\n`, 'utf8');
     await assert.rejects(controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath }), (error) => error instanceof TaskControlError && error.code === 'CHECKPOINT_MANIFEST_INVALID');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('worker parent context uses confirmed preload and bounded direct-parent reads without changing legacy query-parent', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-parent-context-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-parent-context-project-'));
+  try {
+    const { input, projectKey } = await createQuiescentController(taskControlHome, projectRoot, 'parent-context-controller');
+    const manifestPath = join(projectRoot, 'parent-context-checkpoint.json');
+    await writeFile(manifestPath, `${JSON.stringify({
+      schemaVersion: 1,
+      projectKey,
+      controllerThreadId: input.controllerThreadId,
+      scopeSummary: 'Expose only confirmed facts automatically and keep historical routes on demand.',
+      points: [
+        { factId: 'confirmed-route', kind: 'confirmed_decision', authority: 'controller_decision', summary: 'Use the already-verified non-headless route for GUI screenshots.', preloadPolicy: 'always', revision: 1, sourceRefs: [{ type: 'thread', ref: input.controllerThreadId, label: 'Confirmed controller route' }], supersedes: [] },
+        { factId: 'old-failure', kind: 'rejected_path', authority: 'failure_evidence', summary: 'A headless framebuffer attempt returned no visual evidence.', preloadPolicy: 'on_demand', revision: 1, sourceRefs: [{ type: 'event', ref: 'failure-headless-framebuffer' }], supersedes: [] },
+      ],
+    }, null, 2)}\n`, 'utf8');
+    await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath });
+    const worker = { ...input, threadId: 'parent-context-worker', title: 'Use progressive parent context' };
+    await controllerRegisterTask(worker);
+
+    assert.equal(await queryParent({ taskControlHome, selfThreadId: worker.threadId }), input.controllerThreadId, 'legacy query-parent must keep returning only the parent ID');
+    const startup = await queryParent({ taskControlHome, selfThreadId: worker.threadId, contextMode: 'preload' });
+    assert.equal(startup.parentThreadId, input.controllerThreadId);
+    assert.equal(startup.checkpointStatus, 'available');
+    assert.deepEqual(startup.preload.points.map((point) => point.factId), ['confirmed-route']);
+    assert.equal(startup.parentContextPolicy.fullInheritanceAllowed, false);
+    assert.equal(startup.parentContextPolicy.directParentOnly, true);
+
+    const expanded = await queryParentContext({ taskControlHome, selfThreadId: worker.threadId, reason: 'The screenshot route may have a prior rejected attempt.', factId: 'old-failure' });
+    assert.equal(expanded.source, 'checkpoint_point');
+    assert.deepEqual(expanded.checkpoint.points.map((point) => point.factId), ['old-failure']);
+
+    const history = await queryParentContext({ taskControlHome, selfThreadId: worker.threadId, reason: 'An unexpected framebuffer result may already have a controller-approved recovery route.' });
+    assert.equal(history.source, 'direct_parent_completed_turns');
+    assert.deepEqual(history.hostAction, { type: 'read_thread', threadId: input.controllerThreadId, turnLimit: 3, includeOutputs: false });
+    assert.equal(history.parentContextPolicy.completedTurnsOnly, true);
+    assert.equal(history.parentContextPolicy.authority, 'advisory');
+
+    const nested = { ...input, controllerThreadId: worker.threadId, parentThreadId: worker.threadId, threadId: 'nested-parent-context-worker', title: 'Read only the direct parent' };
+    await controllerRegisterTask(nested);
+    const nestedStartup = await queryParent({ taskControlHome, selfThreadId: nested.threadId, contextMode: 'preload' });
+    assert.equal(nestedStartup.parentThreadId, worker.threadId);
+    assert.equal(nestedStartup.checkpointStatus, 'unavailable', 'a nested worker must not silently inherit the root controller checkpoint');
+    assert.equal(nestedStartup.preload, null);
+    const nestedHistory = await queryParentContext({ taskControlHome, selfThreadId: nested.threadId, reason: 'The nested task needs its direct controller history, not the root controller history.' });
+    assert.equal(nestedHistory.hostAction.threadId, worker.threadId);
+
+    await assert.rejects(queryParentContext({ taskControlHome, selfThreadId: worker.threadId, reason: '' }), (error) => error instanceof TaskControlError && error.code === 'CLI_INVALID_ARGUMENTS');
+    await assert.rejects(queryParent({ taskControlHome, selfThreadId: worker.threadId, contextMode: 'full' }), (error) => error instanceof TaskControlError && error.code === 'CLI_INVALID_ARGUMENTS');
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
     await rm(projectRoot, { recursive: true, force: true });

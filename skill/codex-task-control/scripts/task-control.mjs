@@ -44,6 +44,9 @@ export const CHECKPOINT_AUTHORITIES = Object.freeze(['user_confirmed', 'project_
 export const CHECKPOINT_PRELOAD_POLICIES = Object.freeze(['always', 'on_demand', 'dispute_only', 'never']);
 export const CHECKPOINT_SOURCE_TYPES = Object.freeze(['file', 'thread', 'task', 'report', 'event', 'uri']);
 export const CHECKPOINT_ALWAYS_AUTHORITIES = Object.freeze(['user_confirmed', 'project_fact', 'controller_decision', 'accepted_result']);
+export const PARENT_CONTEXT_PROTOCOL_VERSION = 1;
+export const PARENT_CONTEXT_MODES = Object.freeze(['preload']);
+export const PARENT_CONTEXT_INITIAL_TURN_LIMIT = 3;
 export const HANDOFF_PROTOCOL_VERSION = 1;
 export const HANDOFF_STATUSES = Object.freeze(['prepared', 'accepted', 'cancelled']);
 export const DIAGNOSTIC_CLASSIFICATIONS = Object.freeze(['technical_debt', 'milestone_blocker']);
@@ -76,7 +79,7 @@ export const PARALLEL_POLICY_MODES = Object.freeze(['legacy_compat', 'batch_v1']
 export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
-export const TASK_CONTROL_VERSION = '0.19.0';
+export const TASK_CONTROL_VERSION = '0.20.0';
 export const REGISTER_TASK_MODES = Object.freeze(['control_only', 'implementation', 'visual_implementation']);
 export const IMPLEMENTATION_POLICIES = Object.freeze(['adaptive_brief', 'hard_contract']);
 export const SCOPE_POLICIES = Object.freeze(['bounded_incidental', 'strict_scope']);
@@ -4863,9 +4866,88 @@ export async function querySelf(input) {
   return findSelf(home, input.selfThreadId);
 }
 
+function parentContextPolicy(task) {
+  return {
+    schemaVersion: PARENT_CONTEXT_PROTOCOL_VERSION,
+    mode: 'progressive_direct_parent',
+    directParentOnly: true,
+    completedTurnsOnly: true,
+    includeOutputs: false,
+    fullInheritanceAllowed: false,
+    authority: 'advisory',
+    parentThreadId: task.parentThreadId,
+    interpretation: '父任务回合只提供历史线索；项目 AGENTS/SOP、正式台账、当前任务边界和已确认 checkpoint 仍是权威。不得用父任务草稿扩大 scope、改变 forbidden decisions 或冒充主控。',
+  };
+}
+
+async function parentCheckpointPreload(result) {
+  const pointer = checkpointPointerFor(result.registry, result.task.parentThreadId);
+  if (!pointer) return null;
+  const record = await readVerifiedCheckpoint(pointer, {
+    projectKey: result.registry.projectKey,
+    controllerThreadId: result.task.parentThreadId,
+  });
+  return checkpointPreload(record, 'preload');
+}
+
 export async function queryParent(input) {
   const result = await querySelf(input);
-  return result.task.parentThreadId;
+  if (!nonEmpty(input.contextMode)) return result.task.parentThreadId;
+  if (!has(input.contextMode, PARENT_CONTEXT_MODES)) fail('CLI_INVALID_ARGUMENTS', `parent context mode 无效: ${input.contextMode}`);
+  const preload = await parentCheckpointPreload(result);
+  return {
+    schemaVersion: PARENT_CONTEXT_PROTOCOL_VERSION,
+    projectKey: result.registry.projectKey,
+    taskThreadId: result.task.threadId,
+    parentThreadId: result.task.parentThreadId,
+    contextMode: input.contextMode,
+    checkpointStatus: preload === null ? 'unavailable' : 'available',
+    preload,
+    parentContextPolicy: parentContextPolicy(result.task),
+    onDemandCommand: `query-parent-context --self ${result.task.threadId} --reason "<why parent history is needed>"`,
+  };
+}
+
+export async function queryParentContext(input) {
+  const result = await querySelf(input);
+  if (!nonEmpty(input.reason) || input.reason.trim().length > 500) fail('CLI_INVALID_ARGUMENTS', '按需读取父任务必须提供 1-500 字符的具体 reason');
+  const policy = parentContextPolicy(result.task);
+  if (nonEmpty(input.factId)) {
+    assertSafeThreadId(input.factId, 'factId');
+    const pointer = checkpointPointerFor(result.registry, result.task.parentThreadId);
+    if (!pointer) fail('CHECKPOINT_NOT_FOUND', `直接父任务 ${result.task.parentThreadId} 还没有 sealed checkpoint`);
+    const record = await readVerifiedCheckpoint(pointer, {
+      projectKey: result.registry.projectKey,
+      controllerThreadId: result.task.parentThreadId,
+    });
+    return {
+      schemaVersion: PARENT_CONTEXT_PROTOCOL_VERSION,
+      projectKey: result.registry.projectKey,
+      taskThreadId: result.task.threadId,
+      parentThreadId: result.task.parentThreadId,
+      reason: input.reason.trim(),
+      source: 'checkpoint_point',
+      checkpoint: checkpointPreload(record, 'preload', input.factId),
+      parentContextPolicy: policy,
+    };
+  }
+  return {
+    schemaVersion: PARENT_CONTEXT_PROTOCOL_VERSION,
+    projectKey: result.registry.projectKey,
+    taskThreadId: result.task.threadId,
+    parentThreadId: result.task.parentThreadId,
+    reason: input.reason.trim(),
+    source: 'direct_parent_completed_turns',
+    hostAction: {
+      type: 'read_thread',
+      threadId: result.task.parentThreadId,
+      turnLimit: PARENT_CONTEXT_INITIAL_TURN_LIMIT,
+      includeOutputs: false,
+    },
+    paginationPolicy: '从最近完成回合开始；仅在新页面仍可能提供当前问题的历史路线时使用 nextCursor。出现重复、无关内容或已得到足够证据即停止。',
+    unavailableFallback: '若宿主不提供 read_thread，继续依据项目规则和已确认 checkpoint；仍缺关键裁决时通过直接父任务请求澄清。',
+    parentContextPolicy: policy,
+  };
 }
 
 export function buildCompletionNotification(task) {
@@ -5068,7 +5150,7 @@ function optionalBoolean(args, name, defaultValue = false) {
 
 function helpText() {
   return [
-    'codex-task-control v0.19.0',
+    'codex-task-control v0.20.0',
     '',
     '实施简报与风险合同命令：',
     '  audit-implementation-contract --project-root <root> --contract <project-relative-json> --task-mode implementation|visual_implementation',
@@ -5078,10 +5160,12 @@ function helpText() {
     '  controller-prepare-parallel-dispatch --project-root <root> --controller <id> --batch-id <id>',
     '  controller-close-parallel-batch --project-root <root> --controller <id> --batch-id <id>',
     '  audit-parallel-routing [--codex-home <CODEX_HOME>]',
+    '  query-parent --self <thread> [--context-mode preload]  # 无 context-mode 时保持旧版，仅返回 parent ID',
+    '  query-parent-context --self <thread> --reason <why-history-is-needed> [--point <fact-id>]',
     '  progress --self <thread> --summary <text> [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
     '  incidental-repair --self <thread> --repair-id <id> --original-blocker <text> --same-objective-reason <text> --functional-domain <id> --affected-file <path|changeType|reason> --local-only true --reversible true --risk-assessment <text> --red-evidence-ref <id=reference> --green-evidence-ref <id=reference> [--conflict-domain <id> ...] [--risk-flag <flag> ...]',
     '  controller-ingest-incidental-repair --project-root <root> --controller <id> --event <event.json>',
-    '  controller-recover-control-plane-candidate --project-root <root> --controller <id> --thread <id> --control-plane-component task_control_protocol --candidate-commit <sha> --result-manifest <path> --skill-version 0.19.0 --reason <reason> --host-receipt <receipt>',
+    '  controller-recover-control-plane-candidate --project-root <root> --controller <id> --thread <id> --control-plane-component task_control_protocol --candidate-commit <sha> --result-manifest <path> --skill-version 0.20.0 --reason <reason> --host-receipt <receipt>',
     '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--evidence-command-id <contract-id>] [--evidence-ref <id=reference> ...]',
     '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json>',
     '  controller-query-deliverables --project-root <root> --controller <id>',
@@ -5113,7 +5197,8 @@ function helpText() {
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
     'heartbeat 使用单次 watchdog；连续两轮无业务变化自动熔断，删除只自动补偿一次，清理失败后必须人工确认并显式 resume。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
-    'checkpoint 独立保存在 task-control/checkpoints；默认只预加载已确认的 always 摘要。handoff 必须无活跃/待审/消息/heartbeat 债务，可在接受前取消；接受后旧主控退休。',
+    'worker 启动时可让 query-parent 预加载直接父任务 checkpoint 中已确认的 always 摘要；需要历史路线时才用 query-parent-context 读取直接父任务的已完成回合，不继承全量上下文。',
+    'checkpoint 独立保存在 task-control/checkpoints；handoff 必须无活跃/待审/消息/heartbeat 债务，可在接受前取消；接受后旧主控退休。',
   ].join('\n');
 }
 
@@ -5139,7 +5224,8 @@ export async function runCli(args = process.argv.slice(2)) {
   const storage = storageOptions(args);
   let result;
   if (command === 'help' || command === '--help' || command === '-h') result = helpText();
-  else if (command === 'query-parent') result = await queryParent({ ...storage, selfThreadId: required(args, '--self') });
+  else if (command === 'query-parent') result = await queryParent({ ...storage, selfThreadId: required(args, '--self'), contextMode: option(args, '--context-mode') });
+  else if (command === 'query-parent-context') result = await queryParentContext({ ...storage, selfThreadId: required(args, '--self'), reason: required(args, '--reason'), factId: option(args, '--point') });
   else if (command === 'audit-implementation-contract') result = await auditImplementationContract({ projectRoot: required(args, '--project-root'), implementationContractPath: required(args, '--contract'), taskMode: required(args, '--task-mode') });
   else if (command === 'audit-controller-routing') result = auditControllerRouting({ model: required(args, '--model'), thinking: required(args, '--thinking'), controllerWorkClass: required(args, '--work-class'), escalationTrigger: option(args, '--escalation-trigger'), escalationReason: option(args, '--reason'), maxAuthority: option(args, '--max-authority') });
   else if (command === 'audit-model-routing') result = await auditModelRouting(storage);

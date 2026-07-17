@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.19.0 在自适应任务简报上加入“同任务有界附带修复”：同目标、同功能域、本地可逆的小缺陷可以原任务修复，严格范围和硬合同仍然 fail closed。全程不调用模型 provider。
+> v0.20.0 让 worker 启动时只预加载直接父任务已确认的检查点事实，并在确有历史需求时按需读取直接父任务的已完成回合；普通并发任务不会继承主控全量对话。自适应简报、同任务附带修复和稳定优先心跳继续保留，全程不调用模型 provider。
 
 [English](README.md)
 
@@ -12,8 +12,12 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.19.0 已经解决什么
+## v0.20.0 已经解决什么
 
+- 保持旧 `query-parent` 返回父任务 ID 的兼容行为；新 worker 使用 `--context-mode preload` 时，只获得直接父任务检查点里已确认的 `always` 要点。没有检查点返回 `unavailable`，不阻塞执行。
+- 新增只读 `query-parent-context`：只返回登记直接父任务的 `read_thread` 宿主动作，先读最近 3 个已完成回合且不加载工具输出；只有继续翻页仍能提供相关新证据时才读取更早内容。
+- 父任务原始对话只是历史线索，不能覆盖项目 AGENTS/SOP、正式台账、当前 scope、forbidden decisions、worktree 身份或已确认检查点。嵌套 worker 不能越过直接父任务继承根主控检查点。
+- 不要求 worker 写阅读报告、额外 progress、通知或独立消息回合；普通并发 worker 禁止通过全量历史 fork 创建。
 - 对话检查点独立保存到 `$CODEX_HOME/task-control/checkpoints/`，每次只保留 1-12 条带 authority 和来源索引的摘要，不复制原始 prompt、response、工具输出或项目内容。
 - 默认 preload 只返回用户确认、项目事实、主控决策和已接受成果；候选、失败、争议与已废弃路径必须按 fact ID 或 full 模式显式查询。
 - 安全交接要求无活跃/未派发子任务、待审/收口/侧边栏动作、开放并发批次、延后消息或 heartbeat 债务。prepared 可取消，不会维持 heartbeat；accepted 后 successor 成为新根主控，旧主控永久停止新派发。
@@ -97,21 +101,21 @@
 - 把可执行清理与历史债务分开：标题/归档工具调用一旦记录失败，仍可审计，但不会反复生成动作或单独维持 heartbeat。
 - 只有登记的直接主控可以带原因显式重新排队失败的侧边栏动作。
 - `integrated`、`blocked` 或 `reclaimed` 的可见任务按后代优先顺序归档，但完整台账历史永久保留。
-- 子任务只能查询自己、生成带阶段证据的 progress event、completion event 或通知失败回执。
+- 子任务可以查询自己、预加载直接父任务已确认检查点，并按需请求直接父任务的已完成回合；生命周期写入仍只允许自己的 progress、repair、failure、completion 或通知失败回执。
 - 只有 controller 可以登记、要求返工、接受和集成。
 - 拒绝不安全 task ID、旧事件、项目错配、父子环和矛盾状态。
 - 使用原子写入和保守的 stale-lock 恢复协议。
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.19.0 不做什么
+## v0.20.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.19.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.20.0 用本地 dispatch wave、消息延后和确认命令做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.19.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.20.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
 - 不替项目判断截图“好不好看”；adaptive 视觉任务由 worker 选择真实交互证据并交直接主控审查，hard contract 才可绑定固定 visual oracle。
 - 当前只对 Windows 项目路径做了完整验证。
 
@@ -208,7 +212,13 @@ node $TaskControl controller-record-dispatched `
   --thread "worker-1"
 
 node $TaskControl query-self --self "worker-1"
-node $TaskControl query-parent --self "worker-1"
+node $TaskControl query-parent --self "worker-1" --context-mode preload
+
+# 只有历史主控信息确实有帮助时才读取：
+node $TaskControl query-parent-context --self "worker-1" --reason "意外 framebuffer 结果可能已有主控批准的恢复路线。"
+
+# 不读取对话，只展开一个检查点索引事实：
+node $TaskControl query-parent-context --self "worker-1" --reason "查看已索引的旧失败路线。" --point "old-failure"
 node $TaskControl complete --self "worker-1" --candidate-commit "candidate-v1" --result-manifest "docs/test-reports/task-result.json"
 ```
 
@@ -222,7 +232,7 @@ node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\ex
 如果旧版 task-control 已经把有效 worktree 候选停成 `changes_requested`，安装修复版本后由直接主控只恢复同一 completion：
 
 ```powershell
-node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.19.0" --reason "v0.19.0 修复已登记 worktree 的成果根；业务 scope 与证据未改变。" --host-receipt "<真实主控授权回执>"
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.20.0" --reason "v0.20.0 继续保留已登记 worktree 成果权威；业务 scope 与证据未改变。" --host-receipt "<真实主控授权回执>"
 ```
 
 不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。
