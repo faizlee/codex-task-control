@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.22.0 把主控健康复查合并进唯一的 one-shot heartbeat：普通单任务 15 分钟、并发 10 分钟、Terra high 25 分钟、风险状态 5 分钟；真实进度从事件时间重排下一次检查。子任务通知继续采用“事件先入账、运行中不直发”，全程不调用模型 provider。
+> v0.23.0 为长期项目/专题主控增加独立身份、终态硬门禁、连续性审计和误终态 successor 恢复；自适应 one-shot heartbeat 与“事件先入账、运行中不直发”保持不变，全程不调用模型 provider。
 
 [English](README.md)
 
@@ -12,11 +12,14 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.22.0 已经解决什么
+## v0.23.0 已经解决什么
 
 - 每个直接主控仍只有一个 `COUNT=1` heartbeat；事件扫描与健康复查共用它，不会再创建第二个 10 分钟定时器。
 - `controller-scan-events` 返回结构化 `taskHealthReview`：`healthy` 静默继续，`at_risk` 缩短复查，`stalled`、`blocked_controller`、`blocked_user`、`runaway` 给出不同的停止与裁决动作。
 - 健康判断只认新阶段、证据、测试结果、候选提交、完成/失败事件或阻塞范围缩小；重复命令、换一种说法描述同一错误、标题/归档 bookkeeping 和“仍在处理”不算进度。
+- 长期 `project_controller` / `topic_controller` 必须先登记独立身份。受保护的主控对话不能再注册成普通任务，也不能走 `complete → accepted → integrated → archive` 的 worker 生命周期。
+- 正式 handoff 会继承专题、稳定标题和 generation，保存 predecessor/successor。没有已接受 successor 时，只有 sealed checkpoint 加当前回合用户明确终止授权才能关闭长期主控。
+- 新增连续性审计：终态/已归档主控没有 successor、稳定专题标题被改成一次性标题、或主控被普通 worker 生命周期收口都会明确报错。误终态恢复使用“在新任务中继续”产生的新可见任务和真实回执登记 successor generation，旧终态证据不改写。
 - 无进展 watchdog 熔断后，失败入账、收回、恢复和收口仍可继续，但禁止新登记和派发，直到主控完成清理并显式 `controller-resume-watchdog`，避免一边失控一边继续开新任务。
 
 - 子任务执行 progress、complete 或 report-failure 时先落持久事件；父主控为 `running`/`unknown` 时不返回宿主发送动作，只有确认 `idle` 才允许发送。
@@ -118,14 +121,14 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.22.0 不做什么
+## v0.23.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.22.0 用本地 dispatch wave 和双向消息延后做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.23.0 用本地 dispatch wave 和双向消息延后做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.22.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.23.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
 - 不替项目判断截图“好不好看”；adaptive 视觉任务由 worker 选择真实交互证据并交直接主控审查，hard contract 才可绑定固定 visual oracle。
 - 当前只对 Windows 项目路径做了完整验证。
 
@@ -151,7 +154,7 @@ pwsh -File .\scripts\install.ps1 -Force
 pwsh -File .\scripts\install.ps1 -Force -SyncUserAgents
 ```
 
-不带该参数时只审计，且会在覆盖旧 Skill 前停止；带参数时也只修改带标记的父通知与自适应健康规则，不改项目文件或实时台账。安装器随后复制到 `${CODEX_HOME:-~/.codex}/skills/codex-task-control`，再次核验规则，并执行只读的模型路由、thinking 路由和终态归档积压审计。
+不带该参数时只审计，且会在覆盖旧 Skill 前停止；带参数时也只修改带标记的父通知、自适应健康和主控连续性规则，不改项目文件或实时台账。安装器随后复制到 `${CODEX_HOME:-~/.codex}/skills/codex-task-control`，再次核验规则，并执行只读的模型路由、thinking 路由、终态归档积压和主控连续性审计。
 
 核心规则：绝不使用内部 subagent 或 `spawn_agent`；委派只能创建用户可见的 Codex task/thread。先规划并发批次，默认至少保留两个安全候选；单任务必须登记退化证据。每个候选都要独立登记和真实改名，整批通过 `controller-prepare-parallel-dispatch` 后才逐个发送并记录。后续普通消息必须先经过 `controller-prepare-message`；运行中不直接调用宿主发送，确认 idle 后才 release，interrupt 只用于有权限的停止/取消。
 
@@ -246,7 +249,7 @@ node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\ex
 如果旧版 task-control 已经把有效 worktree 候选停成 `changes_requested`，安装修复版本后由直接主控只恢复同一 completion：
 
 ```powershell
-node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.22.0" --reason "v0.22.0 继续保留已登记 worktree 成果权威；业务 scope 与证据未改变。" --host-receipt "<真实主控授权回执>"
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.23.0" --reason "v0.23.0 继续保留已登记 worktree 成果权威；业务 scope 与证据未改变。" --host-receipt "<真实主控授权回执>"
 ```
 
 不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。
@@ -300,6 +303,19 @@ node $TaskControl controller-query-checkpoint --project-root "C:\work\example" -
 node $TaskControl controller-prepare-handoff --project-root "C:\work\example" --controller "controller-1" --successor "controller-2" --checkpoint "checkpoint-0001"
 node $TaskControl controller-accept-handoff --project-root "C:\work\example" --controller "controller-1" --successor "controller-2" --handoff-id "<id>" --checkpoint-digest "<sha256>"
 node $TaskControl controller-cancel-handoff --project-root "C:\work\example" --controller "controller-1" --handoff-id "<id>" --reason "successor 未创建"
+```
+
+长期项目/专题主控在承接工作前先登记独立 identity，并与普通任务归档债务分开审计：
+
+```powershell
+node $TaskControl controller-register-identity --project-root "C:\work\example" --controller "controller-1" --thread "topic-controller-1" --controller-role "topic_controller" --topic "归隐谷 / 农场经营" --stable-title "FarmGodot 专题主控：归隐谷 / 农场经营"
+node $TaskControl audit-controller-continuity --codex-home "$env:USERPROFILE\.codex"
+```
+
+已经误归档的主控必须先使用 Codex“在新任务中继续”创建 successor，并从 predecessor 对话封存 checkpoint；随后只登记连续性，不改写旧任务：
+
+```powershell
+node $TaskControl controller-recover-terminal-successor --project-root "C:\work\example" --controller "controller-1" --predecessor "old-topic-controller" --successor "new-topic-controller" --controller-role "topic_controller" --topic "归隐谷 / 农场经营" --stable-title "FarmGodot 专题主控：归隐谷 / 农场经营" --checkpoint "checkpoint-0001" --checkpoint-digest "<sha256>" --reason "长期主控被误登记为一次性 control_only 任务。" --host-receipt "<在新任务中继续的真实回执>" --authority "user_explicit_current_turn"
 ```
 
 默认 `lean` 只生成 `index.html`，不读取 rollout/OTel。显式 `diagnostic` 在同目录生成 `diagnostic.html`，并分别显示任务外空档、任务窗口内但不在已配对 turn 中的空档、active turn 和 active turn 内无法归因；只有最后一个比例参与异常判断。页面采用中文解释与万/亿紧凑数字，并保留精确值和任务间比较条。只有同 conversation OTel completed-response 回执存在时，token 才能按 task 直接统计；这些 token 是已发生请求的累计处理量，不是 OTel 开销，也不是额度账单。rate-limit snapshot 仍是账户级包络；unknown 永远保持未归因。

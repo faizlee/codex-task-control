@@ -1,6 +1,6 @@
 {
   "name": "codex-task-control",
-  "version": "0.22.0",
+  "version": "0.23.0",
   "private": true,
   "description": "A quota-aware visible-task controller with adaptive health-aware one-shot watchdogs, bidirectional queued notifications, progressive direct-parent context, bounded same-task repairs, parallel fan-out, safe handoff, and on-demand diagnostics.",
   "type": "module",

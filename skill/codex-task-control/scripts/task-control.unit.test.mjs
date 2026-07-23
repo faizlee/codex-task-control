@@ -8,6 +8,7 @@ import test from 'node:test';
 
 import {
   TaskControlError,
+  auditControllerContinuity,
   auditImplementationContract,
   auditControllerRouting,
   auditParallelRouting,
@@ -53,7 +54,13 @@ import {
   controllerRecordHeartbeatActionFailed,
   controllerRecordTitleFailed,
   controllerRecordTitleSynced,
+  controllerRecordIdentityArchiveFailed,
+  controllerRecordIdentityArchiveSucceeded,
+  controllerRetryIdentityArchive,
   controllerRegisterTask,
+  controllerRegisterIdentity,
+  controllerRecoverTerminalSuccessor,
+  controllerTerminateIdentity,
   controllerRearmHeartbeat,
   controllerResumeWatchdog,
   controllerFinalizeCycle,
@@ -913,7 +920,7 @@ test('task-control protocol failure recovers the same candidate for completion o
     assert.equal(failed.status, 'changes_requested');
     assert.equal(failed.failureHistory.length, 1);
     const originalFailure = structuredClone(failed.failureHistory[0]);
-    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.22.0', reason: 'v0.22.0 preserves registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
+    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.23.0', reason: 'v0.23.0 preserves registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
     assert.equal(recovered.status, 'executing');
     assert.equal(recovered.attemptCount, 1);
     assert.equal(recovered.controlPlaneRecovery.status, 'completion_only');
@@ -1564,11 +1571,168 @@ test('worker parent context uses confirmed preload and bounded direct-parent rea
   }
 });
 
+test('controller identity cannot be registered or closed through the ordinary worker lifecycle', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-controller-identity-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-controller-identity-project-'));
+  try {
+    await controllerRegisterIdentity({ taskControlHome, projectRoot, registrarThreadId: 'project-controller', controllerThreadId: 'project-controller', controllerRole: 'project_controller', topic: 'FarmGodot', stableTitle: 'FarmGodot 总主控' });
+    const topic = await controllerRegisterIdentity({ taskControlHome, projectRoot, registrarThreadId: 'project-controller', controllerThreadId: 'farm-topic-controller', controllerRole: 'topic_controller', topic: '归隐谷 / 农场经营', stableTitle: 'FarmGodot 专题主控：归隐谷 / 农场经营' });
+    assert.equal(topic.protectedFromTaskLifecycle, true);
+    const workerInput = {
+      taskControlHome,
+      projectRoot,
+      controllerThreadId: 'project-controller',
+      parentThreadId: 'project-controller',
+      threadId: 'farm-topic-controller',
+      title: 'Review the farm topic handoff',
+      model: 'gpt-5.6-luna',
+      thinking: 'medium',
+      delegationMode: 'explicit',
+      executionSurface: 'visible_task',
+      modelClass: 'economical',
+      quotaReason: 'A bounded control check would otherwise save premium quota.',
+      workClass: 'repeatable',
+      decisionStatus: 'resolved',
+      scope: 'Review only the existing topic discussion.',
+      acceptance: 'Return a durable control result.',
+      forbiddenDecisions: 'Do not modify product decisions.',
+      taskMode: 'control_only',
+    };
+    await assert.rejects(controllerRegisterTask({ ...workerInput, threadId: 'controller-shaped-title', title: '农场专题主控：补充讨论入库交接' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_TITLE_AS_TASK_FORBIDDEN');
+    await assert.rejects(controllerRegisterTask(workerInput), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_IDENTITY_AS_TASK_FORBIDDEN');
+    const audit = await auditControllerContinuity({ taskControlHome });
+    assert.equal(audit.compliant, true);
+    assert.equal(audit.heartbeatRequired, false);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('misclassified terminal topic controller recovers to a new visible successor without rewriting old evidence', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-terminal-controller-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-terminal-controller-project-'));
+  try {
+    await controllerRegisterIdentity({ taskControlHome, projectRoot, registrarThreadId: 'master-controller', controllerThreadId: 'master-controller', controllerRole: 'project_controller', topic: 'FarmGodot', stableTitle: 'FarmGodot 总主控' });
+    const input = {
+      taskControlHome,
+      projectRoot,
+      controllerThreadId: 'master-controller',
+      parentThreadId: 'master-controller',
+      threadId: 'legacy-farm-topic',
+      title: 'Supplement discussion intake handoff',
+      model: 'gpt-5.6-luna',
+      thinking: 'medium',
+      delegationMode: 'explicit',
+      executionSurface: 'visible_task',
+      modelClass: 'economical',
+      quotaReason: 'A bounded control review avoids rereading the full topic conversation.',
+      workClass: 'repeatable',
+      decisionStatus: 'resolved',
+      scope: 'Review only the existing topic discussion.',
+      acceptance: 'Return a durable control result.',
+      forbiddenDecisions: 'Do not modify product decisions.',
+      taskMode: 'control_only',
+    };
+    const registered = await controllerRegisterTask(input);
+    await controllerRecordTitleSynced({ ...input, title: registered.desiredThreadTitle });
+    await controllerRecordDispatched(input);
+    const completionPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'control-review-result' });
+    await controllerIngestCompletion({ ...input, eventPath: completionPath });
+    await controllerMarkAccepted({ ...input, reason: 'The bounded control review is complete.' });
+    const integrated = await controllerMarkIntegrated(input);
+    await controllerRecordTitleSynced({ ...input, title: integrated.desiredThreadTitle });
+    await controllerRecordArchiveSucceeded(input);
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const legacyRegistry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const legacyTask = legacyRegistry.tasks.find((task) => task.threadId === input.threadId);
+    legacyTask.title = '农场专题主控：补充讨论入库交接';
+    legacyTask.desiredThreadTitle = `完成｜${legacyTask.displayKey} 农场专题主控：补充讨论入库交接`;
+    legacyTask.lastSyncedTitle = legacyTask.desiredThreadTitle;
+    legacyRegistry.updatedAt = new Date().toISOString();
+    await writeFile(registryPath, `${JSON.stringify(legacyRegistry, null, 2)}\n`, 'utf8');
+    const before = await querySelf({ taskControlHome, selfThreadId: input.threadId });
+
+    const incident = await auditControllerContinuity({ taskControlHome });
+    assert.equal(incident.compliant, false);
+    assert.deepEqual(incident.incidents[0].violations.sort(), ['controller_closed_as_worker', 'controller_title_repurposed', 'terminal_controller_without_successor']);
+    assert.equal(incident.incidents[0].recoveryRequired, true);
+
+    const projectKey = projectKeyForRoot(projectRoot);
+    const manifestPath = join(projectRoot, 'terminal-controller-checkpoint.json');
+    await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, projectKey, controllerThreadId: input.threadId, scopeSummary: 'Preserve the completed farm-topic discussion for a clean successor.', points: [{ factId: 'topic-state', kind: 'current_state', authority: 'controller_decision', summary: 'Continue the farm topic from the preserved predecessor conversation.', preloadPolicy: 'always', revision: 1, sourceRefs: [{ type: 'thread', ref: input.threadId }], supersedes: [] }] }, null, 2)}\n`, 'utf8');
+    const checkpoint = await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.threadId, manifestPath });
+    const recovered = await controllerRecoverTerminalSuccessor({
+      taskControlHome,
+      projectRoot,
+      ownerControllerThreadId: input.controllerThreadId,
+      predecessorThreadId: input.threadId,
+      successorThreadId: 'farm-topic-successor',
+      controllerRole: 'topic_controller',
+      topic: '归隐谷 / 农场经营',
+      stableTitle: 'FarmGodot 专题主控：归隐谷 / 农场经营',
+      checkpointId: checkpoint.checkpointId,
+      checkpointDigest: checkpoint.checkpointDigest,
+      reason: 'The long-lived topic controller was misclassified and archived as one control-only task.',
+      hostReceipt: 'continue-in-new-task:host-receipt-1',
+      authority: 'user_explicit_current_turn',
+    });
+    assert.equal(recovered.predecessorTerminalEvidencePreserved, true);
+    assert.equal(recovered.generation, 2);
+    assert.equal(recovered.heartbeatRequired, false);
+    assert.equal(recovered.threadActions[0].threadId, 'farm-topic-successor');
+    const after = await querySelf({ taskControlHome, selfThreadId: input.threadId });
+    assert.deepEqual(after.task.observabilityReceipts, before.task.observabilityReceipts, 'old terminal lifecycle evidence must remain immutable');
+    assert.equal(after.task.archiveStatus, 'archived');
+    const postAudit = await auditControllerContinuity({ taskControlHome });
+    assert.equal(postAudit.incidents[0].recoveryRequired, false);
+    assert.equal(postAudit.compliant, true);
+    assert.equal(postAudit.unresolvedIncidentCount, 0);
+    await assert.rejects(controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.threadId, manifestPath }), (error) => error instanceof TaskControlError && error.code === 'CHECKPOINT_FROZEN_BY_SUCCESSION');
+    await assert.rejects(controllerRegisterTask({ ...input, threadId: 'farm-topic-successor', title: 'Do not reuse successor as a worker' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_IDENTITY_AS_TASK_FORBIDDEN');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    assert.equal(registry.controllerHeartbeats.filter((entry) => entry.status === 'armed' || entry.automationId !== null).length, 0, 'long-lived controller identity alone must not retain an active heartbeat');
+    assert.equal(registry.tasks.find((task) => task.threadId === input.threadId).title, before.task.title);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test('controller termination requires a sealed checkpoint and current-turn user authority before archive', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-controller-termination-home-'));
+  const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-controller-termination-project-'));
+  try {
+    const controllerThreadId = 'terminating-topic-controller';
+    await controllerRegisterIdentity({ taskControlHome, projectRoot, registrarThreadId: controllerThreadId, controllerThreadId, controllerRole: 'topic_controller', topic: 'Retired topic', stableTitle: 'FarmGodot 专题主控：已结束专题' });
+    await assert.rejects(controllerTerminateIdentity({ taskControlHome, projectRoot, controllerThreadId, authority: 'controller_decision', reason: 'No longer needed.' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_TERMINATION_AUTHORITY_REQUIRED');
+    await assert.rejects(controllerTerminateIdentity({ taskControlHome, projectRoot, controllerThreadId, authority: 'user_explicit_current_turn', reason: 'The user explicitly ended the topic.' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_TERMINATION_CHECKPOINT_REQUIRED');
+    const projectKey = projectKeyForRoot(projectRoot);
+    const manifestPath = join(projectRoot, 'termination-checkpoint.json');
+    await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, projectKey, controllerThreadId, scopeSummary: 'Preserve the final topic state before user-authorized termination.', points: [{ factId: 'final-state', kind: 'current_state', authority: 'user_confirmed', summary: 'The user explicitly ended this long-lived topic controller.', preloadPolicy: 'always', revision: 1, sourceRefs: [{ type: 'thread', ref: controllerThreadId }], supersedes: [] }] }, null, 2)}\n`, 'utf8');
+    await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId, manifestPath });
+    const terminated = await controllerTerminateIdentity({ taskControlHome, projectRoot, controllerThreadId, authority: 'user_explicit_current_turn', reason: 'The user explicitly ended the topic.' });
+    assert.equal(terminated.archiveStatus, 'pending');
+    assert.deepEqual(terminated.threadActions, [{ type: 'set_thread_archived', threadId: controllerThreadId, archived: true }]);
+    await assert.rejects(controllerRegisterTask({ ...implementationInput(taskControlHome, projectRoot), controllerThreadId, parentThreadId: controllerThreadId, threadId: 'post-termination-worker', taskMode: 'control_only', implementationPolicy: undefined, implementationBriefPath: undefined, implementationContractPath: undefined, model: 'gpt-5.6-luna', workClass: 'repeatable' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_TERMINATED');
+    const failed = await controllerRecordIdentityArchiveFailed({ taskControlHome, projectRoot, controllerThreadId, reason: 'Host archive did not persist.' });
+    assert.equal(failed.archiveStatus, 'failed');
+    const retry = await controllerRetryIdentityArchive({ taskControlHome, projectRoot, controllerThreadId, reason: 'The host archive surface is available again.' });
+    assert.equal(retry.archiveStatus, 'pending');
+    const archived = await controllerRecordIdentityArchiveSucceeded({ taskControlHome, projectRoot, controllerThreadId });
+    assert.equal(archived.archiveStatus, 'archived');
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test('safe controller handoff is cancellable before acceptance and retires the source after acceptance', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-home-'));
   const projectRoot = await mkdtemp(join(tmpdir(), 'codex-task-control-handoff-project-'));
   try {
     const { input, projectKey } = await createQuiescentController(taskControlHome, projectRoot, 'handoff-source');
+    await controllerRegisterIdentity({ taskControlHome, projectRoot, registrarThreadId: input.controllerThreadId, controllerThreadId: input.controllerThreadId, controllerRole: 'topic_controller', topic: 'Handoff topic', stableTitle: 'Stable handoff topic controller' });
     const manifestPath = join(projectRoot, 'handoff-checkpoint.json');
     await writeFile(manifestPath, `${JSON.stringify({ schemaVersion: 1, projectKey, controllerThreadId: input.controllerThreadId, scopeSummary: 'Handoff only the durable controller state.', points: [{ factId: 'next-gate', kind: 'next_gate', authority: 'controller_decision', summary: 'The successor must review the next fan-out gate before dispatch.', preloadPolicy: 'always', revision: 1, sourceRefs: [], supersedes: [] }] }, null, 2)}\n`, 'utf8');
     const checkpoint = await controllerSealCheckpoint({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, manifestPath });
@@ -1580,6 +1744,8 @@ test('safe controller handoff is cancellable before acceptance and retires the s
     const accepted = await controllerAcceptHandoff({ taskControlHome, projectRoot, controllerThreadId: input.controllerThreadId, successorThreadId: 'handoff-successor-b', handoffId: prepared.handoffId, checkpointDigest: checkpoint.checkpointDigest });
     assert.equal(accepted.sourceRetired, true);
     assert.deepEqual(accepted.preload.points.map((point) => point.factId), ['next-gate']);
+    const continuity = await auditControllerContinuity({ taskControlHome });
+    assert.deepEqual(continuity.threadActions, [{ projectKey, projectRoot: projectRoot.toLowerCase(), type: 'set_thread_archived', threadId: input.controllerThreadId, archived: true }]);
     await assert.rejects(controllerRegisterTask({ ...input, threadId: 'source-cannot-return', title: 'Old source must stay retired' }), (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_RETIRED');
     const successorTask = await controllerRegisterTask({ ...input, controllerThreadId: 'handoff-successor-b', parentThreadId: 'handoff-successor-b', threadId: 'successor-worker', title: 'Review next fan-out gate' });
     assert.equal(successorTask.displayKey, '01');

@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.22.0 preview. The controller now folds deterministic task-health review into its single adaptive one-shot heartbeat: 15 minutes for one ordinary task, 10 for concurrent work, 25 for Terra high, and 5 for risk/controller queues. Worker notifications remain event-first and queued. The tool makes zero model-provider calls.
+> Windows-first v0.23.0 preview. Long-lived project/topic controllers now have explicit identities, protected lifecycle gates, continuity audits, and an immutable successor-recovery path for accidental terminal closure. Adaptive one-shot health review and event-first queued notifications remain unchanged. The tool makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,11 +23,14 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.22.0 does
+## What v0.23.0 does
 
 - Keeps one `COUNT=1` heartbeat per direct controller; event ingestion and due health review share it instead of creating a second timer.
 - Returns schema-v1 `taskHealthReview` with `healthy`, `at_risk`, `stalled`, `blocked_controller`, `blocked_user`, `runaway`, and `idle` states plus reasons and a bounded next action.
 - Counts only durable stage/evidence/test/candidate/completion/failure or narrowed-blocker changes as meaningful progress. Repeated commands, rephrased errors, generic “still working” text, and title/archive bookkeeping do not reset the watchdog.
+- Registers long-lived `project_controller` and `topic_controller` identities before they own work. A protected controller thread cannot be registered, completed, accepted, integrated, or archived through the ordinary worker lifecycle.
+- Extends an accepted handoff into an identity chain with stable topic, title, generation, predecessor, and successor. Without an accepted successor, termination requires a sealed checkpoint and current-turn user authority.
+- Audits terminal or archived controller-shaped tasks, one-off title repurposing, and controller closure through the worker lifecycle. Recovery continues the old conversation into a new visible task and records a successor generation without rewriting old task evidence.
 - Keeps recovery and closeout open after a no-progress fuse, but blocks new registration/dispatch until cleanup and an explicit watchdog resume.
 
 - Writes worker progress, completion, and failure events before considering a parent notification. `running` or `unknown` parents receive `deferred_parent` with no host action; only confirmed `idle` returns `send_thread_message`.
@@ -127,14 +130,14 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.22.0 does not do
+## What v0.23.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.22.0 therefore persists dispatch waves and both message directions locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.23.0 therefore persists dispatch waves and both message directions locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
-- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.22.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
+- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.23.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
@@ -164,13 +167,13 @@ pwsh -File .\scripts\install.ps1 -Force -SyncUserAgents
 
 Without that flag, the audit is read-only and installation fails before replacing the existing Skill. With the authorized flag, only the marked parent-notification block is changed; project files and the live task ledger are untouched.
 
-macOS/Linux can install the skill files, but the v0.22.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.23.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
 ```
 
-The installer first audits the managed user-level task-control policy block, copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`, verifies the block again, then runs read-only model-routing, thinking-routing, and terminal archive-backlog audits. It never edits the live task ledger. Any reported legacy task must be handled by its registered direct controller.
+The installer first audits the managed user-level task-control policy block, copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`, verifies the block again, then runs read-only model-routing, thinking-routing, terminal archive-backlog, and controller-continuity audits. It never edits the live task ledger. Any reported legacy task must be handled by its registered direct controller.
 
 ## Configure the controller policy
 
@@ -280,7 +283,7 @@ node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\ex
 If an older task-control protocol already stopped a valid registered-worktree candidate, the direct controller may reopen only its frozen completion after installing the fixed version:
 
 ```powershell
-node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.22.0" --reason "v0.22.0 preserves registered worktree result authority; business scope and evidence are unchanged." --host-receipt "<real controller approval receipt>"
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.23.0" --reason "v0.23.0 preserves registered worktree result authority; business scope and evidence are unchanged." --host-receipt "<real controller approval receipt>"
 ```
 
 Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.
@@ -335,6 +338,19 @@ After all task, review, message, batch, and heartbeat debt is closed, prepare an
 node $TaskControl controller-prepare-handoff --project-root "C:\work\example" --controller "controller-1" --successor "controller-2" --checkpoint "checkpoint-0001"
 node $TaskControl controller-accept-handoff --project-root "C:\work\example" --controller "controller-1" --successor "controller-2" --handoff-id "<id>" --checkpoint-digest "<sha256>"
 node $TaskControl controller-cancel-handoff --project-root "C:\work\example" --controller "controller-1" --handoff-id "<id>" --reason "successor was not created"
+```
+
+Register long-lived controllers before they receive work, and audit continuity separately from ordinary task archive debt:
+
+```powershell
+node $TaskControl controller-register-identity --project-root "C:\work\example" --controller "controller-1" --thread "topic-controller-1" --controller-role "topic_controller" --topic "Farm operations" --stable-title "FarmGodot Topic Controller: Farm Operations"
+node $TaskControl audit-controller-continuity --codex-home "$env:USERPROFILE\.codex"
+```
+
+For an already archived controller-shaped task, first use Codex “continue in new task”, seal a checkpoint from the predecessor conversation, then record the accepted successor without changing the old task:
+
+```powershell
+node $TaskControl controller-recover-terminal-successor --project-root "C:\work\example" --controller "controller-1" --predecessor "old-topic-controller" --successor "new-topic-controller" --controller-role "topic_controller" --topic "Farm operations" --stable-title "FarmGodot Topic Controller: Farm Operations" --checkpoint "checkpoint-0001" --checkpoint-digest "<sha256>" --reason "The controller was misclassified as one control-only task." --host-receipt "<continue-in-new-task receipt>" --authority "user_explicit_current_turn"
 ```
 
 The default `lean` report writes `index.html` and performs no rollout/OTel scan. `diagnostic` writes `diagnostic.html` beside it and runs only on explicit request. It separates task-external idle, task-window time outside paired turns, active-turn time, and active-turn unassigned time; only the last ratio can trigger an unassigned-time diagnostic. Reports use Chinese explanations, `万`/`亿` compact values with exact counts, and task-relative comparison bars. Completed-response tokens are task-correlated only when same-conversation OTel receipts exist and describe already-observed cumulative processing, not OTel overhead or a quota bill. Rate-limit snapshots remain an account envelope. Unknown intervals remain unassigned.

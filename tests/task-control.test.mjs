@@ -170,6 +170,7 @@ describe('project-isolated task control', () => {
     assert.match(after, /codex-task-control:parent-notification-policy:start/);
     assert.match(after, /deferred_parent/);
     assert.match(after, /默认单任务 15 分钟，并发批次 10 分钟，Terra high 长任务 25 分钟/);
+    assert.match(after, /长期项目主控或专题主控必须先登记独立 `controller identity`/);
     assert.doesNotMatch(after, /必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知/);
   });
 
@@ -191,6 +192,7 @@ describe('project-isolated task control', () => {
     assert.match(agents, /codex-task-control:parent-notification-policy:start/);
     assert.match(agents, /deferred_parent/);
     assert.match(agents, /每个直接主控只维护一个 `COUNT=1` 临时 heartbeat/);
+    assert.match(agents, /误终态只能通过 Codex“在新任务中继续”/);
     assert.match(installed.stdout, /User AGENTS task-control policy: compliant/);
   });
 

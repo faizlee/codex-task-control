@@ -37,7 +37,7 @@ if (-not $policyAudit.compliant) {
   if (-not $policyAudit.compliant) {
     throw "User AGENTS policy remains incompatible after authorized synchronization: $($policyAudit.reason)"
   }
-  Write-Output "Synchronized the managed parent-notification and adaptive-health rules in $($policyAudit.agentsPath)"
+  Write-Output "Synchronized the managed parent-notification, adaptive-health, and controller-continuity rules in $($policyAudit.agentsPath)"
 }
 
 if ((Test-Path -LiteralPath $target) -and -not $Force) {
@@ -102,4 +102,18 @@ try {
   }
 } catch {
   Write-Warning "Skill installed, but archive backlog audit could not run: $($_.Exception.Message)"
+}
+
+try {
+  $continuityAudit = (& node $auditScript audit-controller-continuity --codex-home $CodexHome | ConvertFrom-Json)
+  if ($continuityAudit.unresolvedIncidentCount -eq 0) {
+    Write-Output "Controller continuity audit: compliant ($($continuityAudit.incidentCount) resolved historical incident(s) retained)"
+  } else {
+    Write-Warning "Controller continuity audit found $($continuityAudit.unresolvedIncidentCount) unresolved controller lifecycle incident(s). Do not unarchive a terminal controller into ledger conflict; create a visible continuation, seal a predecessor checkpoint, and apply only the returned successor recovery."
+    foreach ($incident in $continuityAudit.incidents) {
+      Write-Warning "[$($incident.projectRoot)] predecessor=$($incident.predecessorThreadId) owner=$($incident.ownerControllerThreadId) violations=$($incident.violations -join ',') recoveryRequired=$($incident.recoveryRequired)"
+    }
+  }
+} catch {
+  Write-Warning "Skill installed, but controller continuity audit could not run: $($_.Exception.Message)"
 }

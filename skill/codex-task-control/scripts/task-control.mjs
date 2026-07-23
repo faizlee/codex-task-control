@@ -49,6 +49,11 @@ export const PARENT_CONTEXT_MODES = Object.freeze(['preload']);
 export const PARENT_CONTEXT_INITIAL_TURN_LIMIT = 3;
 export const HANDOFF_PROTOCOL_VERSION = 1;
 export const HANDOFF_STATUSES = Object.freeze(['prepared', 'accepted', 'cancelled']);
+export const CONTROLLER_IDENTITY_PROTOCOL_VERSION = 1;
+export const CONTROLLER_ROLES = Object.freeze(['project_controller', 'topic_controller']);
+export const CONTROLLER_IDENTITY_STATUSES = Object.freeze(['active', 'retired', 'terminated']);
+export const CONTROLLER_TERMINATION_AUTHORITIES = Object.freeze(['user_explicit_current_turn']);
+export const CONTROLLER_SUCCESSION_PROTOCOL_VERSION = 1;
 export const DIAGNOSTIC_CLASSIFICATIONS = Object.freeze(['technical_debt', 'milestone_blocker']);
 export const BLOCKER_SOURCES = Object.freeze(['diagnostic', 'external', 'contract', 'superseded']);
 export const HEARTBEAT_STATUSES = Object.freeze(['armed', 'cancelled']);
@@ -74,12 +79,13 @@ export const CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS = 30 * 1000;
 export const PARENT_NOTIFICATION_PROTOCOL_VERSION = 1;
 export const PARENT_NOTIFICATION_TARGET_STATES = Object.freeze(['running', 'idle', 'unknown']);
 export const PARENT_NOTIFICATION_DISPOSITIONS = Object.freeze(['deferred_parent', 'prepared']);
-export const USER_AGENTS_POLICY_VERSION = 2;
+export const USER_AGENTS_POLICY_VERSION = 3;
 export const USER_AGENTS_POLICY_START = '<!-- codex-task-control:parent-notification-policy:start -->';
 export const USER_AGENTS_POLICY_END = '<!-- codex-task-control:parent-notification-policy:end -->';
 export const USER_AGENTS_PARENT_NOTIFICATION_RULE = '- 子任务执行 `progress`、`complete` 或 `report-failure` 时必须先生成持久事件，再依据直接父任务的真实 turn 状态处理通知：父任务为 `running` 或 `unknown` 时必须保持 `deferred_parent`，不得调用 `send_message_to_thread`；只有确认父任务 `idle` 且命令返回 `send_thread_message` 动作时才可发送，并记录真实回执。延迟通知由父任务的 heartbeat / `controller-scan-events` 摄取并标记 `observed`，不得冒充 `sent`；只有真实发送成功才能标记 `sent`，发送失败才生成 `notification_failed`。普通完成、失败、阻塞和进度通知都不得中断父任务。';
 export const USER_AGENTS_ADAPTIVE_HEALTH_RULE = '- 每个直接主控只维护一个 `COUNT=1` 临时 heartbeat，并在同一次 `controller-scan-events` 中完成事件扫描和到期的任务健康复查，禁止再建第二套健康定时器。默认单任务 15 分钟，并发批次 10 分钟，Terra high 长任务 25 分钟，风险、失败、待审或待主控裁决状态 5 分钟；真实 progress、failure 或 completion 从事件时间重新排下一次 one-shot。健康复查只把新阶段、证据、测试结果、候选提交、完成/失败事件或阻塞范围缩小视为有效进展；重复命令、改写同一错误或“仍在处理”不得续租。无活跃、待审、路由或可执行动作时立即删除 heartbeat；等待用户决定时只通知一次并暂停，不得维持空心跳。';
-export const USER_AGENTS_PARENT_NOTIFICATION_BLOCK = `${USER_AGENTS_POLICY_START}\n${USER_AGENTS_PARENT_NOTIFICATION_RULE}\n${USER_AGENTS_ADAPTIVE_HEALTH_RULE}\n${USER_AGENTS_POLICY_END}`;
+export const USER_AGENTS_CONTROLLER_CONTINUITY_RULE = '- 长期项目主控或专题主控必须先登记独立 `controller identity`，保存稳定 role、topic、title 和 generation；禁止把主控本体登记为一次性 `control_only` task，也禁止用普通 task 的 complete、accepted、integrated、archive 收口。主控交接必须绑定 sealed checkpoint 和已接受 successor；误终态只能通过 Codex“在新任务中继续”的新可见 successor 加真实宿主回执恢复，旧终态证据不得篡改。主控身份本身不维持 heartbeat。';
+export const USER_AGENTS_PARENT_NOTIFICATION_BLOCK = `${USER_AGENTS_POLICY_START}\n${USER_AGENTS_PARENT_NOTIFICATION_RULE}\n${USER_AGENTS_ADAPTIVE_HEALTH_RULE}\n${USER_AGENTS_CONTROLLER_CONTINUITY_RULE}\n${USER_AGENTS_POLICY_END}`;
 export const LEGACY_USER_AGENTS_PARENT_NOTIFICATION_RULE = '- 子任务执行 `complete` 后必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知；发送失败必须生成 notification_failed。只有真实消息发送成功后，主控才可标记 notificationStatus=sent。';
 export const PARALLEL_BATCH_PROTOCOL_VERSION = 1;
 export const PARALLEL_BATCH_STATUSES = Object.freeze(['planned', 'dispatching', 'running', 'reconciling', 'frozen', 'closed']);
@@ -91,7 +97,7 @@ export const PARALLEL_POLICY_MODES = Object.freeze(['legacy_compat', 'batch_v1']
 export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
-export const TASK_CONTROL_VERSION = '0.22.0';
+export const TASK_CONTROL_VERSION = '0.23.0';
 export const REGISTER_TASK_MODES = Object.freeze(['control_only', 'implementation', 'visual_implementation']);
 export const IMPLEMENTATION_POLICIES = Object.freeze(['adaptive_brief', 'hard_contract']);
 export const SCOPE_POLICIES = Object.freeze(['bounded_incidental', 'strict_scope']);
@@ -145,6 +151,7 @@ const nonEmpty = (value) => typeof value === 'string' && value.trim().length > 0
 const has = (value, values) => typeof value === 'string' && values.includes(value);
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const isTransientWindowsFsError = (error) => ['EACCES', 'EBUSY', 'EPERM'].includes(error?.code);
+const controllerShapedTitle = (value) => /(?:专题|项目)主控(?:[:：\s]|$)|(?:^|[:：\s])主控(?:[:：\s]|$)|\b(?:topic|project)[\s_-]*controller\s*[:：]/i.test(value ?? '');
 
 function fail(code, message) {
   throw new TaskControlError(code, message);
@@ -1302,6 +1309,9 @@ function acceptedHandoffFor(registry, controllerThreadId) {
 function assertControllerHealthyForDispatch(registry, controllerThreadId) {
   const health = controllerHealthFor(registry, controllerThreadId);
   if (health?.status === 'handoff_required') fail('CONTROLLER_HANDOFF_REQUIRED', `主控 ${controllerThreadId} 已达到 handoff_required；必须先生成结构化 handoff 并迁移干净主控`);
+  const identity = controllerIdentityFor(registry, controllerThreadId);
+  if (identity?.status === 'terminated') fail('CONTROLLER_TERMINATED', `主控 ${controllerThreadId} 已由当前回合用户明确终止，不能再登记或派发新工作`);
+  if (identity?.status === 'retired') fail('CONTROLLER_RETIRED', `主控 ${controllerThreadId} 已由 successor ${identity.successorThreadId} 接替，旧主控不能再登记或派发新工作`);
   const handoff = preparedHandoffFor(registry, controllerThreadId);
   if (handoff) fail('CONTROLLER_HANDOFF_PREPARED', `主控 ${controllerThreadId} 已准备交接 ${handoff.handoffId}；必须由 successor 接受或由 source 取消后才能登记或派发新工作`);
   const accepted = acceptedHandoffFor(registry, controllerThreadId);
@@ -2567,6 +2577,35 @@ function validateControllerHandoff(value, knownControllers, checkpointByControll
   return { ...value };
 }
 
+function validateControllerIdentity(value, roots, tasks) {
+  if (!isObject(value) || value.schemaVersion !== CONTROLLER_IDENTITY_PROTOCOL_VERSION || !isSafeThreadId(value.controllerThreadId) || !has(value.controllerRole, CONTROLLER_ROLES) || !nonEmpty(value.topic) || !nonEmpty(value.stableTitle) || !Number.isInteger(value.generation) || value.generation < 1 || !has(value.status, CONTROLLER_IDENTITY_STATUSES) || !isTimestamp(value.registeredAt) || !isTimestamp(value.updatedAt) || !has(value.archiveStatus, ARCHIVE_STATUSES)) fail('REGISTRY_INVALID', 'controller identity 无效');
+  if (value.predecessorThreadId !== null && !isSafeThreadId(value.predecessorThreadId)) fail('REGISTRY_INVALID', 'controller identity predecessor 无效');
+  if (value.successorThreadId !== null && !isSafeThreadId(value.successorThreadId)) fail('REGISTRY_INVALID', 'controller identity successor 无效');
+  if (value.status === 'active') {
+    if (!roots.has(value.controllerThreadId) || tasks.some((task) => task.threadId === value.controllerThreadId) || value.successorThreadId !== null || value.terminationAuthority !== null || value.terminationReason !== null || value.archiveStatus !== 'not_ready' || value.archivedAt !== null || value.archiveError !== null) fail('REGISTRY_INVALID', 'active controller identity 状态无效');
+  } else {
+    if (value.archiveStatus === 'not_ready') fail('REGISTRY_INVALID', '已退休或终止的 controller identity 必须进入 archive 收口');
+    if (value.archiveStatus === 'archived' && !isTimestamp(value.archivedAt)) fail('REGISTRY_INVALID', 'controller identity archivedAt 无效');
+    if (value.archiveStatus === 'failed' && !nonEmpty(value.archiveError)) fail('REGISTRY_INVALID', 'controller identity archiveError 无效');
+    if (value.archiveStatus === 'pending' && (value.archivedAt !== null || value.archiveError !== null)) fail('REGISTRY_INVALID', 'controller identity pending archive 状态无效');
+  }
+  if (value.status === 'retired' && (!isSafeThreadId(value.successorThreadId) || value.terminationAuthority !== null || value.terminationReason !== null)) fail('REGISTRY_INVALID', 'retired controller identity 必须绑定 successor');
+  if (value.status === 'terminated' && (value.successorThreadId !== null || value.terminationAuthority !== 'user_explicit_current_turn' || !nonEmpty(value.terminationReason))) fail('REGISTRY_INVALID', 'terminated controller identity 必须绑定当前回合用户终止授权');
+  const task = tasks.find((candidate) => candidate.threadId === value.controllerThreadId);
+  if (task && (!isTerminalTask(task) || value.status !== 'retired')) fail('REGISTRY_INVALID', 'controller identity 只有在误终态恢复后才可与历史终态 task 共存');
+  return { ...value, topic: value.topic.trim(), stableTitle: value.stableTitle.trim(), terminationReason: value.terminationReason === null ? null : value.terminationReason.trim() };
+}
+
+function validateControllerSuccession(value, identities, checkpointByController) {
+  if (!isObject(value) || value.schemaVersion !== CONTROLLER_SUCCESSION_PROTOCOL_VERSION || !isSafeThreadId(value.successionId) || !isSafeThreadId(value.ownerControllerThreadId) || !isSafeThreadId(value.predecessorThreadId) || !isSafeThreadId(value.successorThreadId) || value.predecessorThreadId === value.successorThreadId || !has(value.controllerRole, CONTROLLER_ROLES) || !nonEmpty(value.topic) || !Number.isInteger(value.generation) || value.generation < 2 || !/^checkpoint-\d{4,}$/.test(value.checkpointId ?? '') || !/^[0-9a-f]{64}$/.test(value.checkpointDigest ?? '') || !nonEmpty(value.reason) || !nonEmpty(value.hostReceipt) || !isTimestamp(value.acceptedAt)) fail('REGISTRY_INVALID', 'controller succession 无效');
+  const predecessor = identities.find((entry) => entry.controllerThreadId === value.predecessorThreadId);
+  const successor = identities.find((entry) => entry.controllerThreadId === value.successorThreadId);
+  if (!predecessor || !successor || predecessor.status !== 'retired' || predecessor.successorThreadId !== successor.controllerThreadId || successor.status !== 'active' || successor.predecessorThreadId !== predecessor.controllerThreadId || successor.generation !== value.generation || successor.controllerRole !== value.controllerRole || successor.topic !== value.topic.trim()) fail('REGISTRY_INVALID', 'controller succession 与 identity 链不一致');
+  const checkpoint = checkpointByController.get(value.predecessorThreadId);
+  if (!checkpoint || checkpoint.latestCheckpointId !== value.checkpointId || checkpoint.latestCheckpointDigest !== value.checkpointDigest) fail('REGISTRY_INVALID', 'controller succession 未绑定 predecessor 的 sealed checkpoint');
+  return { ...value, topic: value.topic.trim(), reason: value.reason.trim(), hostReceipt: value.hostReceipt.trim() };
+}
+
 export function validateRegistry(value, expectedProjectKey, expectedProjectRoot) {
   if (!isObject(value) || value.schemaVersion !== 1 || !Array.isArray(value.tasks) || !Array.isArray(value.rootControllerThreadIds)) fail('REGISTRY_INVALID', '注册表 schema 无效');
   if (!nonEmpty(value.projectKey) || !nonEmpty(value.projectRoot) || !isTimestamp(value.updatedAt)) fail('REGISTRY_INVALID', '注册表头字段无效');
@@ -2666,7 +2705,29 @@ export function validateRegistry(value, expectedProjectKey, expectedProjectRoot)
     }
     return validated;
   });
-  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), controllerMessages, parallelBatches, controllerCheckpoints, controllerHandoffs, updatedAt: value.updatedAt, tasks };
+  const identityValues = value.controllerIdentities ?? [];
+  if (!Array.isArray(identityValues)) fail('REGISTRY_INVALID', 'controllerIdentities 必须是数组');
+  const identityIds = new Set();
+  const controllerIdentities = identityValues.map((identity) => {
+    const validated = validateControllerIdentity(identity, rootSet, tasks);
+    if (identityIds.has(validated.controllerThreadId)) fail('REGISTRY_INVALID', `重复 controller identity: ${validated.controllerThreadId}`);
+    identityIds.add(validated.controllerThreadId);
+    return validated;
+  });
+  for (const identity of controllerIdentities) {
+    if (identity.predecessorThreadId !== null && !identityIds.has(identity.predecessorThreadId)) fail('REGISTRY_INVALID', `controller predecessor identity 未登记: ${identity.predecessorThreadId}`);
+    if (identity.successorThreadId !== null && !identityIds.has(identity.successorThreadId)) fail('REGISTRY_INVALID', `controller successor identity 未登记: ${identity.successorThreadId}`);
+  }
+  const successionValues = value.controllerSuccessions ?? [];
+  if (!Array.isArray(successionValues)) fail('REGISTRY_INVALID', 'controllerSuccessions 必须是数组');
+  const successionIds = new Set();
+  const controllerSuccessions = successionValues.map((succession) => {
+    const validated = validateControllerSuccession(succession, controllerIdentities, checkpointByController);
+    if (successionIds.has(validated.successionId)) fail('REGISTRY_INVALID', `重复 controller succession: ${validated.successionId}`);
+    successionIds.add(validated.successionId);
+    return validated;
+  });
+  return { schemaVersion: 1, projectKey: value.projectKey, projectRoot: normalizeWindowsPath(value.projectRoot), rootControllerThreadIds: [...roots], controllerHeartbeats, controllerHealth: controllerHealth.map((entry) => ({ ...entry })), controllerMessages, parallelBatches, controllerCheckpoints, controllerHandoffs, controllerIdentities, controllerSuccessions, updatedAt: value.updatedAt, tasks };
 }
 
 async function readIndex(home) {
@@ -2710,7 +2771,7 @@ async function ensureProject(home, projectRoot, controllerThreadId) {
   } catch (error) {
     if (!(error instanceof TaskControlError) || !/ENOENT/.test(error.message)) throw error;
     if (!controllerThreadId) fail('TASK_NOT_REGISTERED', '项目注册表不存在');
-    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], controllerHealth: [], controllerMessages: [], parallelBatches: [], controllerCheckpoints: [], controllerHandoffs: [], updatedAt: new Date().toISOString(), tasks: [] };
+    const registry = { schemaVersion: 1, projectKey: paths.projectKey, projectRoot: paths.projectRoot, rootControllerThreadIds: [], controllerHeartbeats: [], controllerHealth: [], controllerMessages: [], parallelBatches: [], controllerCheckpoints: [], controllerHandoffs: [], controllerIdentities: [], controllerSuccessions: [], updatedAt: new Date().toISOString(), tasks: [] };
     return { paths, registry: await withExclusiveLock(paths.registryPath, async () => {
       try {
         return validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
@@ -2753,6 +2814,15 @@ function taskOrThrow(registry, threadId) {
 function assertTaskController(task, controllerThreadId) {
   assertSafeThreadId(controllerThreadId, 'controllerThreadId');
   if (task.directControllerThreadId !== controllerThreadId) fail('CONTROLLER_UNAUTHORIZED', 'controllerThreadId 不是该 task 的 direct controller');
+}
+
+function controllerIdentityFor(registry, controllerThreadId) {
+  return (registry.controllerIdentities ?? []).find((identity) => identity.controllerThreadId === controllerThreadId) ?? null;
+}
+
+function assertTaskNotControllerIdentity(task, registry, action) {
+  const identity = controllerIdentityFor(registry, task.threadId);
+  if (identity) fail('CONTROLLER_IDENTITY_LIFECYCLE_FORBIDDEN', `${identity.controllerRole} ${task.threadId} 不能通过普通 task ${action} 生命周期收口；必须使用 controller handoff、明确用户终止或误终态 successor 恢复协议`);
 }
 
 async function mutateController({ codexHome, taskControlHome, projectRoot, controllerThreadId, threadId, mutate, heartbeatReason = null }) {
@@ -3198,6 +3268,7 @@ export async function controllerRegisterTask(input) {
   assertSafeThreadId(input.parentThreadId, 'parentThreadId');
   if (![input.title, input.model, input.thinking].every(nonEmpty)) fail('CLI_INVALID_ARGUMENTS', 'register 字段不能为空');
   if (input.title.trim() === '等待主控登记') fail('TASK_TITLE_PLACEHOLDER_FORBIDDEN', '必须在登记时提供可区分的语义标题');
+  if (controllerShapedTitle(input.title)) fail('CONTROLLER_TITLE_AS_TASK_FORBIDDEN', '标题表明该 thread 是长期项目/专题主控；请先用 controller-register-identity 登记，禁止把主控本体包装成一次性 task');
   if (!has(input.thinking, THINKING_LEVELS)) fail('CLI_INVALID_ARGUMENTS', `thinking 非法: ${input.thinking}`);
   if (input.delegationMode !== 'explicit') fail('DELEGATION_NOT_AUTHORIZED', '默认禁止子智能体；必须由主控显式授权 --delegation explicit');
   if (input.executionSurface !== 'visible_task') fail('INTERNAL_SUBAGENT_FORBIDDEN', '禁止 Codex 内部 subagent；子任务必须使用可见 task/thread');
@@ -3257,6 +3328,7 @@ export async function controllerRegisterTask(input) {
     const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
     assertControllerCycleBusinessReady({ ...registry, tasks: ensureTaskControls(registry.tasks, registry.rootControllerThreadIds) }, input.controllerThreadId);
     assertControllerHealthyForDispatch(registry, input.controllerThreadId);
+    if (controllerIdentityFor(registry, input.threadId)) fail('CONTROLLER_IDENTITY_AS_TASK_FORBIDDEN', `已登记 controller identity ${input.threadId} 不能被重新登记为一次性 task`);
     if (registry.tasks.some((task) => task.threadId === input.threadId)) fail('DUPLICATE_THREAD', `重复 threadId: ${input.threadId}`);
     if (input.threadId === input.controllerThreadId) fail('DUPLICATE_THREAD', '任务不能等于 direct controller');
     let rootControllers = [...registry.rootControllerThreadIds];
@@ -3972,6 +4044,7 @@ export async function controllerSealCheckpoint(input) {
     const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
     assertControllerKnown(registry, input.controllerThreadId);
     if (preparedHandoffFor(registry, input.controllerThreadId) || acceptedHandoffFor(registry, input.controllerThreadId)) fail('CHECKPOINT_FROZEN_BY_HANDOFF', 'handoff prepared 或 accepted 后不能替换其绑定的 checkpoint');
+    if (registry.controllerSuccessions.some((succession) => succession.predecessorThreadId === input.controllerThreadId)) fail('CHECKPOINT_FROZEN_BY_SUCCESSION', '误终态 successor 已接受后不能替换 predecessor 绑定的 checkpoint');
     const manifest = validateCheckpointManifest(parsed, { projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId });
     const previous = checkpointPointerFor(registry, input.controllerThreadId);
     const sequence = (previous?.sequence ?? 0) + 1;
@@ -4025,6 +4098,174 @@ function controllerHandoffBlockers(registry, controllerThreadId) {
   return blockers;
 }
 
+function newControllerIdentity({ controllerThreadId, controllerRole, topic, stableTitle, generation, predecessorThreadId = null, successorThreadId = null, status = 'active', registeredAt, updatedAt, archiveStatus = 'not_ready', archivedAt = null, archiveError = null, terminationAuthority = null, terminationReason = null }) {
+  return { schemaVersion: CONTROLLER_IDENTITY_PROTOCOL_VERSION, controllerThreadId, controllerRole, topic: topic.trim(), stableTitle: stableTitle.trim(), generation, predecessorThreadId, successorThreadId, status, terminationAuthority, terminationReason, registeredAt, updatedAt, archiveStatus, archivedAt, archiveError };
+}
+
+export async function controllerRegisterIdentity(input) {
+  const home = resolveTaskControlHome(input);
+  assertSafeThreadId(input.registrarThreadId, 'registrarThreadId');
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  if (!has(input.controllerRole, CONTROLLER_ROLES) || !nonEmpty(input.topic) || !nonEmpty(input.stableTitle)) fail('CLI_INVALID_ARGUMENTS', 'controller identity 必须提供合法 role、topic 和 stable title');
+  const { paths } = await ensureProject(home, input.projectRoot, input.controllerThreadId);
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const registrarKnown = input.registrarThreadId === input.controllerThreadId || registry.rootControllerThreadIds.includes(input.registrarThreadId) || registry.tasks.some((task) => task.threadId === input.registrarThreadId);
+    if (!registrarKnown) fail('CONTROLLER_UNAUTHORIZED', '登记者必须是 controller 本身或当前项目已知 controller');
+    if (registry.tasks.some((task) => task.threadId === input.controllerThreadId)) fail('CONTROLLER_IDENTITY_TASK_COLLISION', '普通 task 已占用该 thread；必须走误终态 successor 恢复，不能原地改写身份');
+    if (controllerIdentityFor(registry, input.controllerThreadId)) fail('CONTROLLER_IDENTITY_DUPLICATE', 'controller identity 已登记');
+    const now = new Date().toISOString();
+    const identity = newControllerIdentity({ controllerThreadId: input.controllerThreadId, controllerRole: input.controllerRole, topic: input.topic, stableTitle: input.stableTitle, generation: 1, registeredAt: now, updatedAt: now });
+    const rootControllerThreadIds = registry.rootControllerThreadIds.includes(input.controllerThreadId) ? registry.rootControllerThreadIds : [...registry.rootControllerThreadIds, input.controllerThreadId];
+    const next = validateRegistry({ ...registry, rootControllerThreadIds, controllerIdentities: [...registry.controllerIdentities, identity], updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...identity, protectedFromTaskLifecycle: true, heartbeatRequired: false };
+  });
+}
+
+export async function controllerRecoverTerminalSuccessor(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  for (const [field, value] of [['ownerControllerThreadId', input.ownerControllerThreadId], ['predecessorThreadId', input.predecessorThreadId], ['successorThreadId', input.successorThreadId]]) assertSafeThreadId(value, field);
+  if (!has(input.controllerRole, CONTROLLER_ROLES) || !nonEmpty(input.topic) || !nonEmpty(input.stableTitle) || !nonEmpty(input.reason) || !nonEmpty(input.hostReceipt) || input.authority !== 'user_explicit_current_turn') fail('CLI_INVALID_ARGUMENTS', '误终态恢复必须记录 role、topic、stable title、reason、真实 continuation receipt 和当前回合用户授权');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const predecessorTask = taskOrThrow(registry, input.predecessorThreadId);
+    assertTaskController(predecessorTask, input.ownerControllerThreadId);
+    if (!isTerminalTask(predecessorTask)) fail('CONTROLLER_RECOVERY_NOT_TERMINAL', '只有已经被误收口的终态 task 才能走 controller successor 恢复');
+    if (input.predecessorThreadId === input.successorThreadId || registry.rootControllerThreadIds.includes(input.successorThreadId) || registry.tasks.some((task) => task.threadId === input.successorThreadId) || controllerIdentityFor(registry, input.successorThreadId)) fail('CONTROLLER_SUCCESSOR_INVALID', 'successor 必须是由“在新任务中继续”创建的全新可见 task');
+    const existing = controllerIdentityFor(registry, input.predecessorThreadId);
+    if (existing?.successorThreadId) fail('CONTROLLER_SUCCESSOR_ALREADY_RECORDED', 'predecessor 已有 successor，禁止重复恢复');
+    const pointer = checkpointPointerFor(registry, input.predecessorThreadId);
+    if (!pointer || pointer.latestCheckpointId !== input.checkpointId || pointer.latestCheckpointDigest !== input.checkpointDigest) fail('CONTROLLER_RECOVERY_CHECKPOINT_REQUIRED', '误终态恢复必须绑定 predecessor 最新 sealed checkpoint');
+    const checkpoint = await readVerifiedCheckpoint(pointer, { projectKey: paths.projectKey, controllerThreadId: input.predecessorThreadId });
+    const now = new Date().toISOString();
+    const predecessorGeneration = existing?.generation ?? 1;
+    const predecessor = newControllerIdentity({
+      controllerThreadId: input.predecessorThreadId,
+      controllerRole: input.controllerRole,
+      topic: input.topic,
+      stableTitle: input.stableTitle,
+      generation: predecessorGeneration,
+      predecessorThreadId: existing?.predecessorThreadId ?? null,
+      successorThreadId: input.successorThreadId,
+      status: 'retired',
+      registeredAt: existing?.registeredAt ?? predecessorTask.objectiveCreatedAt ?? predecessorTask.updatedAt,
+      updatedAt: now,
+      archiveStatus: predecessorTask.archiveStatus,
+      archivedAt: predecessorTask.archivedAt,
+      archiveError: predecessorTask.archiveError,
+    });
+    const successor = newControllerIdentity({ controllerThreadId: input.successorThreadId, controllerRole: input.controllerRole, topic: input.topic, stableTitle: input.stableTitle, generation: predecessorGeneration + 1, predecessorThreadId: input.predecessorThreadId, registeredAt: now, updatedAt: now });
+    const succession = { schemaVersion: CONTROLLER_SUCCESSION_PROTOCOL_VERSION, successionId: `succession_${randomUUID().replaceAll('-', '')}`, ownerControllerThreadId: input.ownerControllerThreadId, predecessorThreadId: input.predecessorThreadId, successorThreadId: input.successorThreadId, controllerRole: input.controllerRole, topic: input.topic.trim(), generation: successor.generation, checkpointId: pointer.latestCheckpointId, checkpointDigest: pointer.latestCheckpointDigest, reason: input.reason.trim(), hostReceipt: input.hostReceipt.trim(), acceptedAt: now };
+    const controllerIdentities = [...registry.controllerIdentities.filter((identity) => identity.controllerThreadId !== input.predecessorThreadId), predecessor, successor];
+    const rootControllerThreadIds = registry.rootControllerThreadIds.includes(input.successorThreadId) ? registry.rootControllerThreadIds : [...registry.rootControllerThreadIds, input.successorThreadId];
+    const next = validateRegistry({ ...registry, rootControllerThreadIds, controllerIdentities, controllerSuccessions: [...registry.controllerSuccessions, succession], updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...succession, predecessorTerminalEvidencePreserved: true, successorRegisteredAsRoot: true, heartbeatRequired: false, preload: checkpointPreload(checkpoint, 'preload'), threadActions: [{ type: 'set_thread_title', threadId: input.successorThreadId, title: successor.stableTitle }] };
+  });
+}
+
+export async function controllerTerminateIdentity(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  if (input.authority !== 'user_explicit_current_turn' || !nonEmpty(input.reason)) fail('CONTROLLER_TERMINATION_AUTHORITY_REQUIRED', '长期 controller 只能由当前回合用户明确授权终止，并记录原因');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const identity = controllerIdentityFor(registry, input.controllerThreadId);
+    if (!identity || identity.status !== 'active') fail('CONTROLLER_IDENTITY_NOT_ACTIVE', '只能终止 active controller identity');
+    const blockers = controllerHandoffBlockers(registry, input.controllerThreadId);
+    if (blockers.length) fail('CONTROLLER_TERMINATION_NOT_QUIESCENT', `主控尚未收口，不能终止: ${blockers.map((entry) => `${entry.code}=${entry.count}`).join(', ')}`);
+    const pointer = checkpointPointerFor(registry, input.controllerThreadId);
+    if (!pointer) fail('CONTROLLER_TERMINATION_CHECKPOINT_REQUIRED', '终止长期 controller 前必须 seal checkpoint');
+    await readVerifiedCheckpoint(pointer, { projectKey: paths.projectKey, controllerThreadId: input.controllerThreadId });
+    const now = new Date().toISOString();
+    const terminated = { ...identity, status: 'terminated', terminationAuthority: input.authority, terminationReason: input.reason.trim(), archiveStatus: 'pending', archivedAt: null, archiveError: null, updatedAt: now };
+    const next = validateRegistry({ ...registry, controllerIdentities: registry.controllerIdentities.map((entry) => entry.controllerThreadId === identity.controllerThreadId ? terminated : entry), updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...terminated, heartbeatRequired: false, threadActions: [{ type: 'set_thread_archived', threadId: identity.controllerThreadId, archived: true }] };
+  });
+}
+
+export async function controllerRecordIdentityArchiveSucceeded(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const identity = controllerIdentityFor(registry, input.controllerThreadId);
+    if (!identity || !['retired', 'terminated'].includes(identity.status) || identity.archiveStatus !== 'pending') fail('CONTROLLER_ARCHIVE_NOT_READY', '只有已接受 successor 或当前回合明确终止的 pending controller identity 可以归档');
+    const now = new Date().toISOString();
+    const archived = { ...identity, archiveStatus: 'archived', archivedAt: now, archiveError: null, updatedAt: now };
+    const next = validateRegistry({ ...registry, controllerIdentities: registry.controllerIdentities.map((entry) => entry.controllerThreadId === identity.controllerThreadId ? archived : entry), updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...archived, heartbeatRequired: false };
+  });
+}
+
+export async function controllerRecordIdentityArchiveFailed(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'controller archive 失败必须记录原因');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const identity = controllerIdentityFor(registry, input.controllerThreadId);
+    if (!identity || !['retired', 'terminated'].includes(identity.status) || identity.archiveStatus !== 'pending') fail('CONTROLLER_ARCHIVE_NOT_READY', 'controller identity archive action 不在 pending');
+    const now = new Date().toISOString();
+    const failed = { ...identity, archiveStatus: 'failed', archivedAt: null, archiveError: input.reason.trim(), updatedAt: now };
+    const next = validateRegistry({ ...registry, controllerIdentities: registry.controllerIdentities.map((entry) => entry.controllerThreadId === identity.controllerThreadId ? failed : entry), updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...failed, heartbeatRequired: false };
+  });
+}
+
+export async function controllerRetryIdentityArchive(input) {
+  const home = resolveTaskControlHome(input);
+  const { paths } = await ensureProject(home, input.projectRoot);
+  assertSafeThreadId(input.controllerThreadId, 'controllerThreadId');
+  if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'controller archive 重试必须记录原因');
+  return withExclusiveLock(paths.registryPath, async () => {
+    const registry = validateRegistry(await readJson(paths.registryPath, 'REGISTRY_READ_FAILED'), paths.projectKey, paths.projectRoot);
+    const identity = controllerIdentityFor(registry, input.controllerThreadId);
+    if (!identity || !['retired', 'terminated'].includes(identity.status) || identity.archiveStatus !== 'failed' || !nonEmpty(identity.archiveError)) fail('CONTROLLER_ARCHIVE_NOT_FAILED', '只有 failed controller identity archive 可以显式重试');
+    const now = new Date().toISOString();
+    const pending = { ...identity, archiveStatus: 'pending', archivedAt: null, archiveError: null, updatedAt: now };
+    const next = validateRegistry({ ...registry, controllerIdentities: registry.controllerIdentities.map((entry) => entry.controllerThreadId === identity.controllerThreadId ? pending : entry), updatedAt: now }, paths.projectKey, paths.projectRoot);
+    await atomicWriteJson(paths.registryPath, next);
+    return { ...pending, retryReason: input.reason.trim(), heartbeatRequired: false, threadActions: [{ type: 'set_thread_archived', threadId: identity.controllerThreadId, archived: true }] };
+  });
+}
+
+export async function auditControllerContinuity(input = {}) {
+  const home = resolveTaskControlHome(input);
+  const index = await readIndex(home);
+  const incidents = [];
+  const threadActions = [];
+  for (const project of index.projects) {
+    const { registry } = await readProjectRegistry(home, project);
+    const identities = new Map(registry.controllerIdentities.map((identity) => [identity.controllerThreadId, identity]));
+    for (const task of registry.tasks) {
+      const identity = identities.get(task.threadId);
+      const suspectedController = identity !== undefined || controllerShapedTitle(`${task.title} ${task.desiredThreadTitle ?? ''}`);
+      if (!suspectedController || !isTerminalTask(task)) continue;
+      const violations = [];
+      if (!identity || identity.successorThreadId === null) violations.push('terminal_controller_without_successor');
+      if (!identity || identity.stableTitle !== task.title) violations.push('controller_title_repurposed');
+      violations.push('controller_closed_as_worker');
+      const recoveryRequired = !identity?.successorThreadId;
+      incidents.push({ projectKey: registry.projectKey, projectRoot: registry.projectRoot, predecessorThreadId: task.threadId, ownerControllerThreadId: task.directControllerThreadId, taskStatus: task.status, archiveStatus: task.archiveStatus, observedTaskTitle: task.title, stableTitle: identity?.stableTitle ?? null, controllerRole: identity?.controllerRole ?? null, topic: identity?.topic ?? null, generation: identity?.generation ?? null, violations: [...new Set(violations)], recoveryRequired, severity: recoveryRequired ? 'error' : 'historical', recoveryAction: recoveryRequired ? { type: 'continue_thread_as_successor', requiresHostContinuation: true, requiresSealedCheckpoint: true, command: `controller-recover-terminal-successor --project-root <root> --controller ${task.directControllerThreadId} --predecessor ${task.threadId} --successor <new-visible-task-id> --controller-role topic_controller --topic <topic> --stable-title <stable-title> --checkpoint <checkpoint-id> --checkpoint-digest <sha256> --reason <reason> --host-receipt <continue-in-new-task-receipt> --authority user_explicit_current_turn` } : null });
+    }
+    for (const identity of registry.controllerIdentities) {
+      if (identity.status === 'retired' && identity.successorThreadId === null) incidents.push({ projectKey: registry.projectKey, projectRoot: registry.projectRoot, predecessorThreadId: identity.controllerThreadId, ownerControllerThreadId: null, violations: ['terminal_controller_without_successor'], recoveryRequired: true });
+      if (['retired', 'terminated'].includes(identity.status) && identity.archiveStatus === 'pending') threadActions.push({ projectKey: registry.projectKey, projectRoot: registry.projectRoot, type: 'set_thread_archived', threadId: identity.controllerThreadId, archived: true });
+    }
+  }
+  const unresolvedIncidentCount = incidents.filter((incident) => incident.recoveryRequired).length;
+  return { compliant: unresolvedIncidentCount === 0, incidentCount: incidents.length, unresolvedIncidentCount, incidents, readyActionCount: threadActions.length, threadActions, heartbeatRequired: false, auditedAt: new Date().toISOString() };
+}
+
 export async function controllerPrepareHandoff(input) {
   const home = resolveTaskControlHome(input);
   const { paths } = await ensureProject(home, input.projectRoot);
@@ -4064,7 +4305,15 @@ export async function controllerAcceptHandoff(input) {
     const accepted = { ...handoff, status: 'accepted', acceptedAt };
     const rootControllerThreadIds = registry.rootControllerThreadIds.includes(input.successorThreadId) ? registry.rootControllerThreadIds : [...registry.rootControllerThreadIds, input.successorThreadId];
     const controllerHandoffs = registry.controllerHandoffs.map((entry) => entry.handoffId === handoff.handoffId ? accepted : entry);
-    const next = validateRegistry({ ...registry, rootControllerThreadIds, controllerHandoffs, updatedAt: acceptedAt }, paths.projectKey, paths.projectRoot);
+    const sourceIdentity = controllerIdentityFor(registry, input.controllerThreadId);
+    let controllerIdentities = registry.controllerIdentities;
+    if (sourceIdentity) {
+      if (sourceIdentity.status !== 'active' || controllerIdentityFor(registry, input.successorThreadId)) fail('CONTROLLER_IDENTITY_HANDOFF_INVALID', 'handoff source 必须是 active identity，successor 不能已有 identity');
+      const retired = { ...sourceIdentity, status: 'retired', successorThreadId: input.successorThreadId, archiveStatus: 'pending', archivedAt: null, archiveError: null, updatedAt: acceptedAt };
+      const successor = newControllerIdentity({ controllerThreadId: input.successorThreadId, controllerRole: sourceIdentity.controllerRole, topic: sourceIdentity.topic, stableTitle: sourceIdentity.stableTitle, generation: sourceIdentity.generation + 1, predecessorThreadId: sourceIdentity.controllerThreadId, registeredAt: acceptedAt, updatedAt: acceptedAt });
+      controllerIdentities = [...registry.controllerIdentities.filter((entry) => entry.controllerThreadId !== sourceIdentity.controllerThreadId), retired, successor];
+    }
+    const next = validateRegistry({ ...registry, rootControllerThreadIds, controllerHandoffs, controllerIdentities, updatedAt: acceptedAt }, paths.projectKey, paths.projectRoot);
     await atomicWriteJson(paths.registryPath, next);
     return { ...accepted, sourceRetired: true, successorRegisteredAsRoot: true, heartbeatRequired: false, preload: checkpointPreload(record, 'preload') };
   });
@@ -4332,7 +4581,8 @@ export async function controllerIngestCompletion(input) {
   const event = await readArtifact(input.eventPath, 'task_completed');
   if (event.projectKey !== paths.projectKey) fail('PROJECT_MISMATCH', 'completion event projectKey 不匹配');
   if (event.status !== 'awaiting_review' || !nonEmpty(event.candidateCommit)) fail('EVENT_INVALID', 'completion event 必须是 awaiting_review 且有 candidateCommit');
-  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: event.threadId, heartbeatReason: 'completion', mutate: async (task) => {
+  return mutateController({ codexHome: input.codexHome, taskControlHome: input.taskControlHome, projectRoot: input.projectRoot, controllerThreadId: input.controllerThreadId, threadId: event.threadId, heartbeatReason: 'completion', mutate: async (task, registry) => {
+    assertTaskNotControllerIdentity(task, registry, 'completion');
     if (event.parentThreadId !== task.parentThreadId || event.controllerThreadId !== task.directControllerThreadId) fail('EVENT_INVALID', 'completion event parent/controller 不匹配');
     if (!currentAttemptDispatched(task)) fail('EVENT_STALE', '当前轮任务尚未登记真实派发');
     if (event.attemptCount !== undefined && event.attemptCount !== task.attemptCount) fail('EVENT_STALE', 'completion event 不属于当前执行轮次');
@@ -4991,7 +5241,8 @@ export async function controllerRefreshCloseoutReport(input) {
 }
 
 export async function controllerMarkAccepted(input) {
-  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task, registry) => {
+    assertTaskNotControllerIdentity(task, registry, 'accepted');
     if (task.status !== 'awaiting_review' || !nonEmpty(task.candidateCommit)) fail('TASK_TRANSITION_INVALID', '只有有 candidateCommit 的 awaiting_review 可以 accepted');
     const deliverableHistory = reviewCurrentDeliverable(task, 'accepted', input.reason, input.selectedArtifactIds ?? []);
     const now = new Date().toISOString();
@@ -5027,7 +5278,8 @@ async function verifyGitIntegration(projectRoot, recordedCandidateCommit, target
 }
 
 export async function controllerMarkIntegrated(input) {
-  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: async (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: async (task, registry) => {
+    assertTaskNotControllerIdentity(task, registry, 'integrated');
     if (task.status !== 'accepted') fail('TASK_TRANSITION_INVALID', `不能从 ${task.status} 转 integrated`);
     const integrationProof = implementationTask(task) ? await verifyGitIntegration(input.projectRoot, task.candidateCommit, input.integrationTargetRef ?? 'HEAD') : (task.integrationProof ?? null);
     const deliverableHistory = integrateCurrentDeliverable(task);
@@ -5058,6 +5310,7 @@ export async function controllerRecordTitleFailed(input) {
 
 export async function controllerRecordArchiveSucceeded(input) {
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task, registry) => {
+    assertTaskNotControllerIdentity(task, registry, 'archive');
     if (!isTerminalTask(task)) fail('TASK_TRANSITION_INVALID', '只有 integrated、blocked 或 reclaimed 任务可以归档');
     if (task.titleSyncStatus !== 'synced') fail('THREAD_ARCHIVE_NOT_READY', '终态 title 尚未同步');
     if (!descendantsOf(registry.tasks, task.threadId).every((descendant) => descendant.archiveStatus === 'archived')) fail('THREAD_ARCHIVE_NOT_READY', '必须先归档所有可见后代任务');
@@ -5069,7 +5322,8 @@ export async function controllerRecordArchiveSucceeded(input) {
 
 export async function controllerRecordArchiveFailed(input) {
   if (!nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', 'archive 失败原因不能为空');
-  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task) => {
+  return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task, registry) => {
+    assertTaskNotControllerIdentity(task, registry, 'archive');
     if (!isTerminalTask(task)) fail('TASK_TRANSITION_INVALID', '只有 integrated、blocked 或 reclaimed 任务可以记录 archive 失败');
     if (task.archiveStatus !== 'pending') fail('THREAD_ACTION_NOT_PENDING', '只能记录 pending archive action 的失败');
     const now = new Date().toISOString();
@@ -5080,6 +5334,7 @@ export async function controllerRecordArchiveFailed(input) {
 export async function controllerRetryThreadAction(input) {
   if (!has(input.action, THREAD_ACTION_TYPES) || !nonEmpty(input.reason)) fail('CLI_INVALID_ARGUMENTS', '显式重试必须提供合法 action 和非空原因');
   return mutateController({ ...input, heartbeatReason: 'reconcile', mutate: (task, registry) => {
+    if (input.action === 'set_thread_archived') assertTaskNotControllerIdentity(task, registry, 'archive');
     const now = new Date().toISOString();
     if (input.action === 'set_thread_title') {
       if (task.titleSyncStatus !== 'failed' || !nonEmpty(task.titleSyncError)) fail('THREAD_ACTION_NOT_FAILED', '只有 failed title action 可以显式重新排队');
@@ -5303,6 +5558,7 @@ export async function createProgressEvent(input) {
 
 export async function createCompletionEvent(input) {
   const result = await querySelf(input);
+  assertTaskNotControllerIdentity(result.task, result.registry, 'completion');
   assertWorkerActionAllowedDuringRecovery(result.task, 'complete');
   if (!childArtifactAllowed(result.task)) fail('TASK_DISPATCH_NOT_AUTHORIZED', '当前轮任务尚未登记真实派发，任务不得提交 completion');
   if (input.status !== undefined && input.status !== 'awaiting_review') fail('CHILD_STATUS_FORBIDDEN', '子任务只能提交 awaiting_review');
@@ -5437,6 +5693,11 @@ function helpText() {
     '  controller-ingest-context-health --project-root <root> --controller <id> --receipt <json>',
     '  controller-seal-checkpoint --project-root <root> --controller <id> --manifest <absolute-json>',
     '  controller-query-checkpoint --project-root <root> --controller <id> [--checkpoint latest] [--mode preload|full] [--point <fact-id>]',
+    '  controller-register-identity --project-root <root> --controller <registrar-id> --thread <controller-id> --controller-role project_controller|topic_controller --topic <topic> --stable-title <title>',
+    '  audit-controller-continuity [--codex-home <CODEX_HOME>]',
+    '  controller-recover-terminal-successor --project-root <root> --controller <owner-id> --predecessor <old-id> --successor <new-visible-task-id> --controller-role topic_controller --topic <topic> --stable-title <title> --checkpoint <id> --checkpoint-digest <sha256> --reason <text> --host-receipt <receipt> --authority user_explicit_current_turn',
+    '  controller-terminate-identity --project-root <root> --controller <id> --authority user_explicit_current_turn --reason <text>',
+    '  controller-record-identity-archive-succeeded|controller-record-identity-archive-failed|controller-retry-identity-archive --project-root <root> --controller <id> [--reason <text>]',
     '  controller-prepare-handoff --project-root <root> --controller <source-id> --successor <new-visible-task-id> --checkpoint <latest-checkpoint-id>',
     '  controller-accept-handoff --project-root <root> --controller <source-id> --successor <new-visible-task-id> --handoff-id <id> --checkpoint-digest <sha256>',
     '  controller-cancel-handoff --project-root <root> --controller <source-id> --handoff-id <id> --reason <text>',
@@ -5464,6 +5725,7 @@ function helpText() {
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
     'worker 到直接父主控同样采用事件先入账：父主控 running/unknown 时只保留 deferred_parent，不返回发送动作；确认 idle 才返回 send_thread_message。父主控扫描入账 deferred 事件后标记 observed，只有真实发送成功才标记 sent。',
     'worker 启动时可让 query-parent 预加载直接父任务 checkpoint 中已确认的 always 摘要；需要历史路线时才用 query-parent-context 读取直接父任务的已完成回合，不继承全量上下文。',
+    '长期 project/topic controller 必须先登记独立 identity，不能再作为普通 task complete/accepted/integrated/archive。误终态恢复使用新可见 successor、sealed checkpoint 和真实 continuation receipt，旧 task 证据保持不变。',
     'checkpoint 独立保存在 task-control/checkpoints；handoff 必须无活跃/待审/消息/heartbeat 债务，可在接受前取消；接受后旧主控退休。',
   ].join('\n');
 }
@@ -5497,6 +5759,7 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'audit-model-routing') result = await auditModelRouting(storage);
   else if (command === 'audit-thinking-routing') result = await auditThinkingRouting(storage);
   else if (command === 'audit-archive-backlog') result = await auditArchiveBacklog(storage);
+  else if (command === 'audit-controller-continuity') result = await auditControllerContinuity(storage);
   else if (command === 'audit-parallel-routing') result = await auditParallelRouting(storage);
   else if (command === 'audit-user-agents-policy') result = await auditUserAgentsPolicy({ codexHome: required(args, '--codex-home') });
   else if (command === 'sync-user-agents-policy') result = await syncUserAgentsPolicy({ codexHome: required(args, '--codex-home'), authorization: required(args, '--authorization') });
@@ -5554,6 +5817,12 @@ export async function runCli(args = process.argv.slice(2)) {
   else if (command === 'controller-ingest-context-health') result = await controllerIngestContextHealth({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), receiptPath: required(args, '--receipt') });
   else if (command === 'controller-seal-checkpoint') result = await controllerSealCheckpoint({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), manifestPath: required(args, '--manifest') });
   else if (command === 'controller-query-checkpoint') result = await controllerQueryCheckpoint({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), checkpointId: option(args, '--checkpoint') ?? 'latest', mode: option(args, '--mode') ?? 'preload', factId: option(args, '--point') });
+  else if (command === 'controller-register-identity') result = await controllerRegisterIdentity({ ...storage, projectRoot: required(args, '--project-root'), registrarThreadId: required(args, '--controller'), controllerThreadId: required(args, '--thread'), controllerRole: required(args, '--controller-role'), topic: required(args, '--topic'), stableTitle: required(args, '--stable-title') });
+  else if (command === 'controller-recover-terminal-successor') result = await controllerRecoverTerminalSuccessor({ ...storage, projectRoot: required(args, '--project-root'), ownerControllerThreadId: required(args, '--controller'), predecessorThreadId: required(args, '--predecessor'), successorThreadId: required(args, '--successor'), controllerRole: required(args, '--controller-role'), topic: required(args, '--topic'), stableTitle: required(args, '--stable-title'), checkpointId: required(args, '--checkpoint'), checkpointDigest: required(args, '--checkpoint-digest'), reason: required(args, '--reason'), hostReceipt: required(args, '--host-receipt'), authority: required(args, '--authority') });
+  else if (command === 'controller-terminate-identity') result = await controllerTerminateIdentity({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), authority: required(args, '--authority'), reason: required(args, '--reason') });
+  else if (command === 'controller-record-identity-archive-succeeded') result = await controllerRecordIdentityArchiveSucceeded({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller') });
+  else if (command === 'controller-record-identity-archive-failed') result = await controllerRecordIdentityArchiveFailed({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: required(args, '--reason') });
+  else if (command === 'controller-retry-identity-archive') result = await controllerRetryIdentityArchive({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), reason: required(args, '--reason') });
   else if (command === 'controller-prepare-handoff') result = await controllerPrepareHandoff({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), successorThreadId: required(args, '--successor'), checkpointId: required(args, '--checkpoint') });
   else if (command === 'controller-accept-handoff') result = await controllerAcceptHandoff({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), successorThreadId: required(args, '--successor'), handoffId: required(args, '--handoff-id'), checkpointDigest: required(args, '--checkpoint-digest') });
   else if (command === 'controller-cancel-handoff') result = await controllerCancelHandoff({ ...storage, projectRoot: required(args, '--project-root'), controllerThreadId: required(args, '--controller'), handoffId: required(args, '--handoff-id'), reason: required(args, '--reason') });

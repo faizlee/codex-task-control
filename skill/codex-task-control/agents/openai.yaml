@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Task Control"
-  short_description: "Visible tasks with adaptive health watchdogs"
-  default_prompt: "Use $codex-task-control to coordinate visible tasks with queued notifications, meaningful-progress health review, adaptive one-shot heartbeats, and auditable evidence."
+  short_description: "Visible tasks with protected controller continuity"
+  default_prompt: "Use $codex-task-control to protect long-lived controller identity, recover accidental terminal closure through a visible successor, and coordinate auditable task lifecycle."
