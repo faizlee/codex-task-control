@@ -37,7 +37,7 @@ if (-not $policyAudit.compliant) {
   if (-not $policyAudit.compliant) {
     throw "User AGENTS policy remains incompatible after authorized synchronization: $($policyAudit.reason)"
   }
-  Write-Output "Synchronized the managed parent-notification rule in $($policyAudit.agentsPath)"
+  Write-Output "Synchronized the managed parent-notification and adaptive-health rules in $($policyAudit.agentsPath)"
 }
 
 if ((Test-Path -LiteralPath $target) -and -not $Force) {
@@ -57,7 +57,7 @@ try {
   if (-not $installedPolicyAudit.compliant) {
     throw "Installed Skill and user AGENTS policy disagree: $($installedPolicyAudit.reason)"
   }
-  Write-Output "User AGENTS parent-notification policy: compliant (version $($installedPolicyAudit.policyVersion))"
+  Write-Output "User AGENTS task-control policy: compliant (version $($installedPolicyAudit.policyVersion))"
 } catch {
   throw "Skill copied, but the required user AGENTS policy verification failed: $($_.Exception.Message)"
 }

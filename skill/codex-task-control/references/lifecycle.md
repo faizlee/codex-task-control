@@ -18,7 +18,7 @@ The project key is derived from a normalized, case-folded Windows path and a has
 
 Each registry has `schemaVersion: 1`, `projectKey`, `projectRoot`, `rootControllerThreadIds`, `controllerHeartbeats`, `parallelBatches`, `updatedAt`, and `tasks`. New task records include delegation evidence plus `displayKey`, `desiredThreadTitle`, `titleSyncStatus`, `lastSyncedTitle`, `titleSyncError`, `archiveStatus`, `archivedAt`, `archiveError`, append-only `threadActionHistory`, optional schema-v1 `integrationProof`, and schema-v1 lightweight `observabilityReceipts`. `lastDispatchedAttempt` and `lastDispatchedAt` prove that the current work prompt was really sent; title sync alone is not execution evidence. Progress ingestion records `progressEventCreatedAt` and `lastProgressSummary`; completion ingestion records `completionEventCreatedAt` as the notification-failure freshness anchor. Legacy records remain readable; missing observability or integration-proof fields are not fabricated during read-only access, while partial field groups fail closed. A task's `directControllerThreadId` equals its `parentThreadId`.
 
-Each `controllerHeartbeats` entry stores confirmed physical automation identity plus `logicalLeaseDueAt`/`logicalLeaseUpdatedAt`. Protocol v3 also stores pending host action, stale/trigger/delete-failure/no-progress counters, business-cycle fingerprints, fuse evidence, bounded history, retired IDs, and manual-resume evidence. Progress can extend the logical lease without replacing an untriggered physical one-shot. Heartbeat state is observability/control-plane evidence, never business lifecycle authority.
+Each `controllerHeartbeats` entry stores confirmed physical automation identity plus `logicalLeaseDueAt`/`logicalLeaseUpdatedAt`. Protocol v3 also stores pending host action, stale/trigger/delete-failure/no-progress counters, business-cycle fingerprints, fuse evidence, bounded history, retired IDs, and manual-resume evidence. Progress, authoritative failure, and completion reschedule a new two-phase one-shot from the event time; no confirmed generation changes before host acknowledgement. Heartbeat state is observability/control-plane evidence, never business lifecycle authority.
 
 New registrations also store routing evidence: `workClass`, `decisionStatus`, `scope`, `acceptance`, and `forbiddenDecisions`, plus an explicit `taskMode`. Execution truth is separate from review truth through `executionStatus`, `nextOwner`, `attemptCount`, `failureClass`, `changesRequestedReason`, and `reclaimedReason`. Legacy records without these complete field groups remain readable and gain deterministic execution defaults during the next controller mutation. Records created before v0.6.0 that lack the complete implementation-control field group are read in memory as `taskMode: legacy_unclassified`; a read-only scan does not rewrite the registry. New registrations missing `taskMode` fail with `TASK_MODE_REQUIRED`.
 
@@ -210,14 +210,14 @@ Interrupt delivery is exceptional. Only `kind=stop|cancel` with `interruptAuthor
 
 A file under `events/` does not wake a Codex task by itself. Progress and completion commands return a short notification for the registered direct parent. The direct controller also maintains exactly one confirmed one-shot heartbeat as a recovery watchdog; fixed repeating cron and in-place heartbeat replacement are forbidden.
 
-The heartbeat starts only after the work prompt was successfully sent and `controller-record-dispatched` succeeds. Its execution cadence is derived from recorded routing evidence:
+The heartbeat starts only after the work prompt was successfully sent and `controller-record-dispatched` succeeds. It is also the only task-health timer; no second automation is created. Its execution cadence is derived from the current controller workload:
 
-- `repeatable` / Luna medium: 3 minutes.
-- `bounded_reasoning` / Terra medium: 5 minutes.
-- `bounded_reasoning` / Terra high: 10 minutes.
-- actionable controller review, routing, title, and archive queues: 5 minutes.
+- one ordinary Luna-medium or Terra-medium task: 15 minutes.
+- an active concurrent batch or two or more active direct tasks: 10 minutes.
+- one Terra-high task with no competing queue: 25 minutes.
+- actionable failure, review, routing, closeout, title, or archive work: 5 minutes.
 
-For several simultaneous obligations, the controller uses the shortest interval across active direct tasks and controller queues. A Terra-high active task plus pending review, routing, title, or archive cleanup therefore uses 5 minutes, not 10.
+Risk and controller work take precedence over the relaxed cadence. A Terra-high active task plus pending review, routing, title, or archive cleanup therefore uses 5 minutes, not 25. A real progress, failure, or completion event prepares a new one-shot from the event time through the existing create/confirm/retire protocol, so a nearly expired earlier heartbeat cannot cause an immediate redundant health review.
 
 ## Heartbeat two-phase commit
 
@@ -227,9 +227,21 @@ For create, the host creates a new Codex App heartbeat rather than updating the 
 
 If create succeeded but its response was lost, the matching action ID can self-confirm. An expired pending action returns `compensate_timed_out_heartbeat_action`, but does not close business recovery paths. Failure ingestion, reclaim, zombie recovery, and unrelated registration remain available while host cleanup is separately recorded.
 
-A meaningful child checkpoint creates `task_progress`. Successful ingestion updates `logicalLeaseDueAt`; progress, authoritative failure, and finalization reuse an untriggered confirmed physical one-shot instead of replacing its generation. Once a valid scan records that the one-shot fired, or it is deleted/consumed, the next actionable lifecycle update may prepare a fresh one-shot.
+A meaningful child checkpoint creates `task_progress`. Successful progress, authoritative failure, and completion ingestion reset the cadence from the event time and prepare a replacement one-shot; finalization may reuse an untriggered one-shot when no new task evidence changed the schedule. Every replacement remains two-phase and never advances the confirmed generation before the App returns a new automation ID.
 
-Heartbeat protocol v3 stores `lastCycleFingerprint`, an idempotent cycle receipt key, `consecutiveNoProgressCycles`, the last meaningful progress time, fuse count, and manual-resume evidence. The fingerprint covers direct-task lifecycle timestamps and states, pending events, controller-message states, and parallel-batch candidate states; it excludes heartbeat bookkeeping itself. The first valid scan establishes a baseline. Two later consecutive scans with the same fingerprint disable automatic rearm, set one notification, and make `shouldKeepHeartbeat=false` even while a worker remains active. This is a stability fuse, not a business blocker: event ingestion, review, reclaim, recovery, registration, and manual scans remain available.
+Heartbeat protocol v3 stores `lastCycleFingerprint`, an idempotent cycle receipt key, `consecutiveNoProgressCycles`, the last meaningful progress time, fuse count, and manual-resume evidence. The fingerprint covers stage/evidence progress, incidental repair, authoritative failure, completion/candidate, review/integration state, pending events, controller-message state, and parallel-batch candidate state. It excludes heartbeat, title, archive, report, and unrelated task `updatedAt` bookkeeping. Repeated commands, a rephrased copy of the same error, or unstructured “still working” text do not create a durable event and therefore do not count as progress. The first valid scan establishes a baseline. Two later consecutive scans with the same fingerprint disable automatic rearm, set one notification, and make `shouldKeepHeartbeat=false` even while a worker remains active. Failure ingestion, review, reclaim, recovery, and closeout remain available, but new registration and dispatch fail closed until heartbeat cleanup plus explicit `controller-resume-watchdog`.
+
+Every normal scan also returns schema-v1 `taskHealthReview` without making another provider request or worker turn:
+
+- `healthy`: valid progress remains inside the current cadence; continue silently.
+- `at_risk`: the normal interval elapsed but the stall deadline has not; continue and recheck in 5 minutes without yet forcing controller action.
+- `stalled`: meaningful progress exceeded `max(2 * task cadence, 30 minutes)`; freeze new dispatch and require direct-controller review.
+- `blocked_controller`: completion/failure/review/routing or incident evidence requires a controller decision before more work.
+- `blocked_user`: an external/user-authority blocker is being closed out; confirm the worker stop, notify once, then delete the heartbeat.
+- `runaway`: an objective retry/time fuse opened; freeze new dispatch and show the incident summary.
+- `idle`: no dispatched active task exists; delete the heartbeat once all other queues are empty.
+
+The health result reports `lastMeaningfulProgressAt`, task age, review/stall thresholds, reasons, a recommended action, and whether new dispatch is allowed. It is deterministic control-plane evidence, not a model judgment about code quality.
 
 Real dispatch, progress, completion, or authoritative failure resets the no-progress counter. After the fused automation is confirmed deleted, `controller-resume-watchdog --reason ...` records the manual review reason, clears the fuse, and creates a new one-shot only if actionable work still exists. Resume fails closed while an automation or manual-cleanup action remains unresolved.
 
@@ -245,7 +257,7 @@ This ordering cannot stop the Codex App from spending one model wake before the 
 
 Worker-to-controller notification is event-first. `running` and `unknown` direct-parent states never return a host send action; the event remains `deferred_parent`, and direct-controller scan/ingestion records `notificationStatus: observed`. Confirmed `idle` may return a short-lived `send_thread_message` action using `start_next_turn_only`; ingestion stays `pending` until the real host receipt is recorded as `sent`. Only a real attempted idle-send failure may create `notification_failed`. Legacy events without an envelope preserve the former `pending` behavior. A later valid failure receipt remains ingestible because freshness is compared with `completionEventCreatedAt`, not the controller's later ingestion timestamp.
 
-`audit-user-agents-policy --codex-home ...` is read-only and verifies the marked user-level parent-notification rule. `sync-user-agents-policy` requires the literal current-turn authorization token and may replace only the managed block, its exact legacy direct-send rule, or the exact unmarked current rule. Ambiguous or missing policy locations fail closed. The installer audits before replacing the Skill; `-SyncUserAgents` is valid only after explicit user authorization and synchronizes that one marked rule, never project files or the live task ledger.
+`audit-user-agents-policy --codex-home ...` is read-only and verifies the marked user-level parent-notification plus adaptive-health rules. `sync-user-agents-policy` requires the literal current-turn authorization token and may replace only the managed block, its exact legacy direct-send rule, or the exact unmarked notification rule. Ambiguous or missing policy locations fail closed. The installer audits before replacing the Skill; `-SyncUserAgents` is valid only after explicit user authorization and synchronizes only that marked block, never project files or the live task ledger.
 
 ## Lock contract
 

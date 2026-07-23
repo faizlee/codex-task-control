@@ -4,7 +4,7 @@
 
 前沿模型适合规划、判断和审查，但重复机械操作会白白消耗昂贵额度。Codex Task Control 让前沿模型继续主控，禁止不可见的内部 subagent，只把确有额度收益的机械工作交给侧边栏里可检查、可单独选择便宜模型的 Codex task。
 
-> v0.21.0 把子任务到主控的进度、完成和失败通知改成“事件先入账、运行中不直发”：父任务正在运行或状态未知时只保留 `deferred_parent`，明确空闲时才返回下一回合发送动作。安装时还会审计配套的用户级 `AGENTS.md` 受管理规则，全程不调用模型 provider。
+> v0.22.0 把主控健康复查合并进唯一的 one-shot heartbeat：普通单任务 15 分钟、并发 10 分钟、Terra high 25 分钟、风险状态 5 分钟；真实进度从事件时间重排下一次检查。子任务通知继续采用“事件先入账、运行中不直发”，全程不调用模型 provider。
 
 [English](README.md)
 
@@ -12,7 +12,12 @@
 
 [MP4 版本](media/codex-task-control-demo.mp4) · 由 [`demo/render_demo.py`](demo/render_demo.py) 在临时隔离台账中运行真实 CLI 流程后生成。
 
-## v0.21.0 已经解决什么
+## v0.22.0 已经解决什么
+
+- 每个直接主控仍只有一个 `COUNT=1` heartbeat；事件扫描与健康复查共用它，不会再创建第二个 10 分钟定时器。
+- `controller-scan-events` 返回结构化 `taskHealthReview`：`healthy` 静默继续，`at_risk` 缩短复查，`stalled`、`blocked_controller`、`blocked_user`、`runaway` 给出不同的停止与裁决动作。
+- 健康判断只认新阶段、证据、测试结果、候选提交、完成/失败事件或阻塞范围缩小；重复命令、换一种说法描述同一错误、标题/归档 bookkeeping 和“仍在处理”不算进度。
+- 无进展 watchdog 熔断后，失败入账、收回、恢复和收口仍可继续，但禁止新登记和派发，直到主控完成清理并显式 `controller-resume-watchdog`，避免一边失控一边继续开新任务。
 
 - 子任务执行 progress、complete 或 report-failure 时先落持久事件；父主控为 `running`/`unknown` 时不返回宿主发送动作，只有确认 `idle` 才允许发送。
 - 区分 `observed` 与 `sent`：主控 heartbeat/scan 摄取延迟事件只表示“已观察”，真实宿主发送成功才表示“已发送”。
@@ -36,7 +41,7 @@
 - 扫描会直接列出 `zombieAttempts` 与 `preparedReworks`。历史上 attempt 已增加但没有真实派发回执的任务，可以用 `controller-recover-undispatched-attempt` 恢复，不受 heartbeat 故障阻塞。
 - implementation 默认使用轻量简报：worker 先探索真实链路，自主选择实现位置和验证方法；失败时报告实际阶段、命令摘要和证据，不伪装成预先批准的唯一 validator。
 - heartbeat 待确认、超时或删除失败仍会返回明确清理动作，但不再阻塞失败入账、收回、恢复或无关任务登记。只有并发 dispatch wave 部分发送这一种真实业务原子性缺口继续 fail closed。
-- progress 在物理 one-shot 尚未触发时只续台账中的逻辑租约，不再每次都创建、替换、删除 Codex App automation。
+- 真实 progress、failure 或 completion 会从事件时间准备新的 one-shot；仍严格走 create、confirm、切换、删除旧 automation 的两阶段流程，不会原地替换或提前推进 generation。
 - 并发要求的是“有独立增量价值的候选”，不是凑两个任务。初始单候选仍需退化证据；真实 wave 启动后，QA/只读候选完成造成自然收缩时无需再次补退化回执。
 - HTML 顶部明确区分“已验证业务交付、实现候选提交、控制审查通过”。控制任务不再显示成业务集成；若业务交付为 0，会直接写出“本专题没有可验证的业务交付”。
 
@@ -102,7 +107,7 @@
 - 视觉任务完成前校验 presentation stage、必需 artifact 类型/里程碑、任务归属、合同允许根目录、文件存在、非零尺寸、SHA-256 去重以及 PNG/JPEG/GIF 可解码尺寸。
 - 每个 attempt 的成果历史只追加不覆盖；reclaimed、blocked、changes_requested 证据明确显示为失败，并严格区分候选、已接受未集成、已集成。
 - 直接主控可确定性生成手机/桌面自适应 HTML：`$CODEX_HOME/task-control/reports/<project-key>/<controller-thread-id>/index.html`，不写项目仓库。
-- 自适应间隔为 Luna repeatable 3 分钟、Terra medium 5 分钟、Terra high 10 分钟、主控队列 5 分钟；多种义务并存时取最短间隔，旧 generation 触发时只允许清理它自己的 automation。
+- 自适应间隔为普通 Luna/Terra medium 单任务 15 分钟、并发批次 10 分钟、单个 Terra high 25 分钟、风险/失败/待审/路由/收口队列 5 分钟；风险优先，旧 generation 触发时仍只允许清理它自己的 automation。
 - 把可执行清理与历史债务分开：标题/归档工具调用一旦记录失败，仍可审计，但不会反复生成动作或单独维持 heartbeat。
 - 只有登记的直接主控可以带原因显式重新排队失败的侧边栏动作。
 - `integrated`、`blocked` 或 `reclaimed` 的可见任务按后代优先顺序归档，但完整台账历史永久保留。
@@ -113,14 +118,14 @@
 - 不覆盖项目自己的规则、命令、测试和验收流程。
 - 台账操作零 provider 调用。
 
-## v0.21.0 不做什么
+## v0.22.0 不做什么
 
 - 不读取或重置 Codex 额度。
 - 不承诺固定节省百分比。
 - 不自动创建、停止、发送或 steer Codex task；Skill 只返回带身份约束的宿主动作，并记录真实回执。
-- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.21.0 用本地 dispatch wave 和双向消息延后做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
+- 当前 Codex App 的程序化发消息工具没有显式 queue/steer、原子多任务发送或“已进入队列”的回执。因此 v0.22.0 用本地 dispatch wave 和双向消息延后做安全补偿；未来宿主提供原生 batch/queue + ack 后才能替换。
 - 无法拦截绕过 skill 直接调用的内部 subagent 工具，因此还必须用 `AGENTS.md` 明确禁止这类调用。
-- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.21.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
+- 无法保证 heartbeat 消息在进入模型上下文前就被 Codex App 删除，也不能取消已经挂起的宿主工具调用。v0.22.0 接受可能多消耗一次唤醒，但保持业务恢复开放，并在有界证据后停止自动续期；宿主 hook 只用于消除这一次额外唤醒，不再是避免循环的前提。
 - 不替项目判断截图“好不好看”；adaptive 视觉任务由 worker 选择真实交互证据并交直接主控审查，hard contract 才可绑定固定 visual oracle。
 - 当前只对 Windows 项目路径做了完整验证。
 
@@ -146,7 +151,7 @@ pwsh -File .\scripts\install.ps1 -Force
 pwsh -File .\scripts\install.ps1 -Force -SyncUserAgents
 ```
 
-不带该参数时只审计，且会在覆盖旧 Skill 前停止；带参数时也只修改带标记的父通知规则，不改项目文件或实时台账。安装器随后复制到 `${CODEX_HOME:-~/.codex}/skills/codex-task-control`，再次核验规则，并执行只读的模型路由、thinking 路由和终态归档积压审计。
+不带该参数时只审计，且会在覆盖旧 Skill 前停止；带参数时也只修改带标记的父通知与自适应健康规则，不改项目文件或实时台账。安装器随后复制到 `${CODEX_HOME:-~/.codex}/skills/codex-task-control`，再次核验规则，并执行只读的模型路由、thinking 路由和终态归档积压审计。
 
 核心规则：绝不使用内部 subagent 或 `spawn_agent`；委派只能创建用户可见的 Codex task/thread。先规划并发批次，默认至少保留两个安全候选；单任务必须登记退化证据。每个候选都要独立登记和真实改名，整批通过 `controller-prepare-parallel-dispatch` 后才逐个发送并记录。后续普通消息必须先经过 `controller-prepare-message`；运行中不直接调用宿主发送，确认 idle 后才 release，interrupt 只用于有权限的停止/取消。
 
@@ -241,7 +246,7 @@ node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\ex
 如果旧版 task-control 已经把有效 worktree 候选停成 `changes_requested`，安装修复版本后由直接主控只恢复同一 completion：
 
 ```powershell
-node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.21.0" --reason "v0.21.0 继续保留已登记 worktree 成果权威；业务 scope 与证据未改变。" --host-receipt "<真实主控授权回执>"
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.22.0" --reason "v0.22.0 继续保留已登记 worktree 成果权威；业务 scope 与证据未改变。" --host-receipt "<真实主控授权回执>"
 ```
 
 不能在没有真实改名的情况下伪造同步成功，也不能在提示词真实发送前登记派发。每个 prepared heartbeat action 都必须创建新的 `COUNT=1` automation，在 prompt 中带 action ID 和 generation；App 返回新 ID 后执行 `controller-confirm-heartbeat-action`，再删除返回的 retired ID。App 报错或 30 秒超时必须执行 `controller-record-heartbeat-action-failed`，不得伪造成功或提前推进 generation。终态后代先归档，父任务后归档，台账历史不会删除。

@@ -61,6 +61,8 @@ export const HEARTBEAT_STALE_LIMIT = 2;
 export const HEARTBEAT_DELETE_FAILURE_LIMIT = 2;
 export const HEARTBEAT_NO_PROGRESS_LIMIT = 2;
 export const HEARTBEAT_MAX_OCCURRENCES = 1;
+export const CONTROLLER_TASK_HEALTH_PROTOCOL_VERSION = 1;
+export const CONTROLLER_TASK_HEALTH_STATUSES = Object.freeze(['idle', 'healthy', 'at_risk', 'stalled', 'blocked_controller', 'blocked_user', 'runaway']);
 export const CONTROLLER_MESSAGE_PROTOCOL_VERSION = 1;
 export const CONTROLLER_MESSAGE_KINDS = Object.freeze(['follow_up', 'clarification', 'evidence_request', 'notification', 'stop', 'cancel']);
 export const CONTROLLER_MESSAGE_DELIVERY_MODES = Object.freeze(['queue', 'interrupt']);
@@ -72,11 +74,12 @@ export const CONTROLLER_MESSAGE_ACTION_TIMEOUT_MS = 30 * 1000;
 export const PARENT_NOTIFICATION_PROTOCOL_VERSION = 1;
 export const PARENT_NOTIFICATION_TARGET_STATES = Object.freeze(['running', 'idle', 'unknown']);
 export const PARENT_NOTIFICATION_DISPOSITIONS = Object.freeze(['deferred_parent', 'prepared']);
-export const USER_AGENTS_POLICY_VERSION = 1;
+export const USER_AGENTS_POLICY_VERSION = 2;
 export const USER_AGENTS_POLICY_START = '<!-- codex-task-control:parent-notification-policy:start -->';
 export const USER_AGENTS_POLICY_END = '<!-- codex-task-control:parent-notification-policy:end -->';
 export const USER_AGENTS_PARENT_NOTIFICATION_RULE = '- 子任务执行 `progress`、`complete` 或 `report-failure` 时必须先生成持久事件，再依据直接父任务的真实 turn 状态处理通知：父任务为 `running` 或 `unknown` 时必须保持 `deferred_parent`，不得调用 `send_message_to_thread`；只有确认父任务 `idle` 且命令返回 `send_thread_message` 动作时才可发送，并记录真实回执。延迟通知由父任务的 heartbeat / `controller-scan-events` 摄取并标记 `observed`，不得冒充 `sent`；只有真实发送成功才能标记 `sent`，发送失败才生成 `notification_failed`。普通完成、失败、阻塞和进度通知都不得中断父任务。';
-export const USER_AGENTS_PARENT_NOTIFICATION_BLOCK = `${USER_AGENTS_POLICY_START}\n${USER_AGENTS_PARENT_NOTIFICATION_RULE}\n${USER_AGENTS_POLICY_END}`;
+export const USER_AGENTS_ADAPTIVE_HEALTH_RULE = '- 每个直接主控只维护一个 `COUNT=1` 临时 heartbeat，并在同一次 `controller-scan-events` 中完成事件扫描和到期的任务健康复查，禁止再建第二套健康定时器。默认单任务 15 分钟，并发批次 10 分钟，Terra high 长任务 25 分钟，风险、失败、待审或待主控裁决状态 5 分钟；真实 progress、failure 或 completion 从事件时间重新排下一次 one-shot。健康复查只把新阶段、证据、测试结果、候选提交、完成/失败事件或阻塞范围缩小视为有效进展；重复命令、改写同一错误或“仍在处理”不得续租。无活跃、待审、路由或可执行动作时立即删除 heartbeat；等待用户决定时只通知一次并暂停，不得维持空心跳。';
+export const USER_AGENTS_PARENT_NOTIFICATION_BLOCK = `${USER_AGENTS_POLICY_START}\n${USER_AGENTS_PARENT_NOTIFICATION_RULE}\n${USER_AGENTS_ADAPTIVE_HEALTH_RULE}\n${USER_AGENTS_POLICY_END}`;
 export const LEGACY_USER_AGENTS_PARENT_NOTIFICATION_RULE = '- 子任务执行 `complete` 后必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知；发送失败必须生成 notification_failed。只有真实消息发送成功后，主控才可标记 notificationStatus=sent。';
 export const PARALLEL_BATCH_PROTOCOL_VERSION = 1;
 export const PARALLEL_BATCH_STATUSES = Object.freeze(['planned', 'dispatching', 'running', 'reconciling', 'frozen', 'closed']);
@@ -88,7 +91,7 @@ export const PARALLEL_POLICY_MODES = Object.freeze(['legacy_compat', 'batch_v1']
 export const THREAD_ACTION_TYPES = Object.freeze(['set_thread_title', 'set_thread_archived']);
 export const THREAD_ACTION_OUTCOMES = Object.freeze(['succeeded', 'failed', 'retry_requested']);
 export const TASK_MODES = Object.freeze(['legacy_unclassified', 'control_only', 'implementation', 'visual_implementation']);
-export const TASK_CONTROL_VERSION = '0.21.0';
+export const TASK_CONTROL_VERSION = '0.22.0';
 export const REGISTER_TASK_MODES = Object.freeze(['control_only', 'implementation', 'visual_implementation']);
 export const IMPLEMENTATION_POLICIES = Object.freeze(['adaptive_brief', 'hard_contract']);
 export const SCOPE_POLICIES = Object.freeze(['bounded_incidental', 'strict_scope']);
@@ -121,10 +124,10 @@ export const INTEGRATION_PROOF_PROTOCOL_VERSION = 1;
 const OBSERVABILITY_CLOCK_ID = `task-control-${process.pid}-${randomUUID().replaceAll('-', '')}`;
 const execFile = promisify(execFileCallback);
 export const HEARTBEAT_INTERVALS_MS = Object.freeze({
-  repeatable: 3 * 60 * 1000,
-  bounded_reasoning_medium: 5 * 60 * 1000,
-  bounded_reasoning_high: 10 * 60 * 1000,
-  controller_queue: 5 * 60 * 1000,
+  normal_single: 15 * 60 * 1000,
+  parallel_batch: 10 * 60 * 1000,
+  bounded_reasoning_high: 25 * 60 * 1000,
+  controller_risk: 5 * 60 * 1000,
 });
 
 export class TaskControlError extends Error {
@@ -1303,6 +1306,11 @@ function assertControllerHealthyForDispatch(registry, controllerThreadId) {
   if (handoff) fail('CONTROLLER_HANDOFF_PREPARED', `主控 ${controllerThreadId} 已准备交接 ${handoff.handoffId}；必须由 successor 接受或由 source 取消后才能登记或派发新工作`);
   const accepted = acceptedHandoffFor(registry, controllerThreadId);
   if (accepted) fail('CONTROLLER_RETIRED', `主控 ${controllerThreadId} 已交接给 ${accepted.successorThreadId}；旧主控不能再登记或派发新工作`);
+  const heartbeat = registry.controllerHeartbeats.find((entry) => entry.controllerThreadId === controllerThreadId);
+  const watchdog = heartbeat === undefined ? null : heartbeatEvidenceDefaults(heartbeat);
+  if (watchdog?.disabledAt !== null && watchdog?.disabledAt !== undefined && watchdog.disableReason?.includes('without business progress')) {
+    fail('CONTROLLER_HEALTH_REVIEW_REQUIRED', `主控 ${controllerThreadId} 的无进展 watchdog 已熔断；先审查停滞任务、完成 heartbeat 清理，再显式 resume，不能继续派发新工作`);
+  }
 }
 
 function objectiveTasks(tasks, objectiveId) {
@@ -1817,10 +1825,27 @@ function preserveLegacyFailure(task, action, detail) {
 }
 
 export function heartbeatIntervalForTask(task) {
-  if (task.workClass === 'repeatable') return HEARTBEAT_INTERVALS_MS.repeatable;
   if (task.workClass === 'bounded_reasoning' && task.thinking === 'high') return HEARTBEAT_INTERVALS_MS.bounded_reasoning_high;
-  if (task.workClass === 'bounded_reasoning') return HEARTBEAT_INTERVALS_MS.bounded_reasoning_medium;
-  return HEARTBEAT_INTERVALS_MS.controller_queue;
+  return HEARTBEAT_INTERVALS_MS.normal_single;
+}
+
+function taskLastMeaningfulProgressAt(task) {
+  return latestTimestamp(task.controlPlaneRecovery?.status === 'completion_only' ? task.controlPlaneRecovery.preparedAt : null, task.incidentalRepairEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt);
+}
+
+function controllerHeartbeatInterval(queues, now = Date.now()) {
+  if (queues.queuedTasks.length > 0 || queues.cleanupTasks.length > 0) return HEARTBEAT_INTERVALS_MS.controller_risk;
+  if (queues.activeTasks.some((task) => {
+    const lastMeaningfulProgressAt = taskLastMeaningfulProgressAt(task);
+    return !isTimestamp(lastMeaningfulProgressAt) || now - Date.parse(lastMeaningfulProgressAt) >= heartbeatIntervalForTask(task);
+  })) return HEARTBEAT_INTERVALS_MS.controller_risk;
+  if (queues.activeTasks.length > 1
+    || queues.parallel.pendingDispatches.length > 0
+    || queues.parallel.batches.some((batch) => ['dispatching', 'running', 'reconciling'].includes(batch.status))) {
+    return HEARTBEAT_INTERVALS_MS.parallel_batch;
+  }
+  if (queues.activeTasks.length === 1) return heartbeatIntervalForTask(queues.activeTasks[0]);
+  return HEARTBEAT_INTERVALS_MS.controller_risk;
 }
 
 function controllerWorkQueues(tasks, controllerThreadId) {
@@ -1911,9 +1936,7 @@ function heartbeatEvidenceDefaults(state) {
 }
 
 function heartbeatDesiredState(controllerThreadId, generation, queues, reason, triggerTaskThreadId, now) {
-  const intervalCandidates = queues.activeTasks.map(heartbeatIntervalForTask);
-  if (queues.queuedTasks.length > 0 || queues.cleanupTasks.length > 0) intervalCandidates.push(HEARTBEAT_INTERVALS_MS.controller_queue);
-  const intervalMs = intervalCandidates.length > 0 ? Math.min(...intervalCandidates) : HEARTBEAT_INTERVALS_MS.controller_queue;
+  const intervalMs = controllerHeartbeatInterval(queues, now.getTime());
   const updatedAt = now.toISOString();
   return queues.shouldKeepHeartbeat
     ? { controllerThreadId, generation, status: 'armed', dueAt: new Date(now.getTime() + intervalMs).toISOString(), intervalMs, reason, triggerTaskThreadId, updatedAt }
@@ -2011,7 +2034,7 @@ function rearmControllerHeartbeatInRegistry(registry, controllerThreadId, reason
     const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
     return { registry: { ...registry, controllerHeartbeats, updatedAt: now.toISOString() }, state, pendingState: desired, heartbeatAction: null, reusedPendingAction: false };
   }
-  if (['progress', 'failure', 'finalize'].includes(reason) && base.status === 'armed' && desired.status === 'armed' && base.observedTriggerCount === 0 && isSafeThreadId(base.automationId) && isTimestamp(base.dueAt) && now.getTime() < Date.parse(base.dueAt)) {
+  if (reason === 'finalize' && base.status === 'armed' && desired.status === 'armed' && base.observedTriggerCount === 0 && isSafeThreadId(base.automationId) && isTimestamp(base.dueAt) && now.getTime() < Date.parse(base.dueAt)) {
     const state = { ...base, reason, triggerTaskThreadId, logicalLeaseDueAt: desired.dueAt, logicalLeaseUpdatedAt: now.toISOString(), updatedAt: now.toISOString() };
     const controllerHeartbeats = [...registry.controllerHeartbeats.filter((heartbeat) => heartbeat.controllerThreadId !== controllerThreadId), state];
     return { registry: { ...registry, controllerHeartbeats, updatedAt: now.toISOString() }, state, pendingState: desired, heartbeatAction: null, reusedPendingAction: true, logicalLeaseRenewed: true };
@@ -4415,7 +4438,7 @@ function heartbeatRruleCount(value) {
 function controllerBusinessFingerprint(registry, controllerThreadId, pendingEvents, parallel) {
   const tasks = registry.tasks
     .filter((task) => task.directControllerThreadId === controllerThreadId)
-    .map((task) => ({ threadId: task.threadId, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, updatedAt: task.updatedAt, lastDispatchedAt: task.lastDispatchedAt ?? null, progressEventCreatedAt: task.progressEventCreatedAt ?? null, incidentalRepairEventCreatedAt: task.incidentalRepairEventCreatedAt ?? null, controlPlaneRecoveryStatus: task.controlPlaneRecovery?.status ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, candidateCommit: task.candidateCommit ?? null, notificationStatus: task.notificationStatus }))
+    .map((task) => ({ threadId: task.threadId, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, lastDispatchedAt: task.lastDispatchedAt ?? null, progressEventCreatedAt: task.progressEventCreatedAt ?? null, incidentalRepairEventCreatedAt: task.incidentalRepairEventCreatedAt ?? null, failureEventCreatedAt: task.failureEventCreatedAt ?? null, controlPlaneRecoveryStatus: task.controlPlaneRecovery?.status ?? null, completionEventCreatedAt: task.completionEventCreatedAt ?? null, candidateCommit: task.candidateCommit ?? null, reviewVerdict: task.reviewVerdict, integrationStatus: task.integrationStatus, notificationStatus: task.notificationStatus }))
     .sort((left, right) => left.threadId.localeCompare(right.threadId));
   const events = pendingEvents.map((event) => ({ type: event.type, threadId: event.threadId, createdAt: event.createdAt, eventPath: event.eventPath })).sort((left, right) => left.eventPath.localeCompare(right.eventPath));
   const messages = registry.controllerMessages
@@ -4523,7 +4546,7 @@ function staleHeartbeatResult(registry, state, input, reason, extra = {}) {
 }
 
 function stalledActiveTask(task, now = Date.now()) {
-  const lastObservedAt = latestTimestamp(task.controlPlaneRecovery?.status === 'completion_only' ? task.controlPlaneRecovery.preparedAt : null, task.incidentalRepairEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt);
+  const lastObservedAt = taskLastMeaningfulProgressAt(task);
   if (!isTimestamp(lastObservedAt)) return null;
   const intervalMs = heartbeatIntervalForTask(task);
   const stallAfterMs = Math.max(intervalMs * 2, 10 * 60 * 1000);
@@ -4536,6 +4559,79 @@ function stalledActiveTask(task, now = Date.now()) {
   if (!nonEmpty(candidateCommit) && !isTimestamp(task.completionEventCreatedAt)) reasons.push('no_candidate_or_completion');
   if (task.objectiveProtocolVersion === OBJECTIVE_PROTOCOL_VERSION && ageMs >= task.objectiveBudgetMinutes * 60 * 1000) reasons.push('attempt_budget_exceeded');
   return { threadId: task.threadId, displayKey: task.displayKey, objectiveId: task.objectiveId, attemptCount: task.attemptCount, lastObservedAt, ageMs, stallAfterMs, missingStages, candidateCommit, completionEventCreatedAt: task.completionEventCreatedAt ?? null, reasons };
+}
+
+function activeTaskHealth(task, now = Date.now()) {
+  const lastMeaningfulProgressAt = taskLastMeaningfulProgressAt(task);
+  const intervalMs = heartbeatIntervalForTask(task);
+  const ageMs = isTimestamp(lastMeaningfulProgressAt) ? Math.max(0, now - Date.parse(lastMeaningfulProgressAt)) : null;
+  const stallAfterMs = Math.max(intervalMs * 2, 30 * 60 * 1000);
+  const status = ageMs === null ? 'at_risk' : ageMs >= stallAfterMs ? 'stalled' : ageMs >= intervalMs ? 'at_risk' : 'healthy';
+  return {
+    threadId: task.threadId,
+    displayKey: task.displayKey,
+    workClass: task.workClass,
+    thinking: task.thinking,
+    status,
+    lastMeaningfulProgressAt,
+    ageMs,
+    reviewIntervalMs: intervalMs,
+    stallAfterMs,
+    evidenceDefinition: 'new_stage_or_evidence_or_test_result_or_candidate_or_completion_or_failure_or_narrowed_blocker',
+  };
+}
+
+function controllerTaskHealthReview({ directTasks, pendingEvents, reviewQueue, routingQueue, objectiveFuses, incidentQueue, taskQueues, parallel, now = Date.now() }) {
+  const active = directTasks.filter((task) => task.status === 'executing' && currentAttemptDispatched(task)).map((task) => activeTaskHealth(task, now));
+  const stalled = active.filter((task) => task.status === 'stalled');
+  const atRisk = active.filter((task) => task.status === 'at_risk');
+  const blockedUserTasks = directTasks.filter((task) => task.status === 'blocked' && task.blockerSource === 'external' && task.closeout !== null && !closeoutComplete(task));
+  const controllerEvents = pendingEvents.filter((event) => event.type === 'task_completed' || FAILURE_EVENT_TYPES.includes(event.type));
+  let status = 'healthy';
+  const reasons = [];
+  let recommendedAction = 'continue_silently';
+  if (objectiveFuses.length > 0) {
+    status = 'runaway';
+    reasons.push('objective_retry_or_time_fuse_open');
+    recommendedAction = 'freeze_new_dispatch_and_show_incident';
+  } else if (blockedUserTasks.length > 0) {
+    status = 'blocked_user';
+    reasons.push('external_or_user_authority_required');
+    recommendedAction = 'stop_confirm_notify_once_then_delete_heartbeat';
+  } else if (stalled.length > 0) {
+    status = 'stalled';
+    reasons.push('meaningful_progress_deadline_exceeded');
+    recommendedAction = 'freeze_new_dispatch_and_controller_review';
+  } else if (routingQueue.length > 0 || reviewQueue.length > 0 || controllerEvents.length > 0 || incidentQueue.length > 0) {
+    status = 'blocked_controller';
+    reasons.push('controller_decision_or_review_required');
+    recommendedAction = 'controller_resolve_before_more_dispatch';
+  } else if (atRisk.length > 0) {
+    status = 'at_risk';
+    reasons.push('meaningful_progress_not_seen_by_normal_interval');
+    recommendedAction = 'continue_and_recheck_sooner';
+  } else if (active.length === 0) {
+    status = 'idle';
+    reasons.push('no_dispatched_active_task');
+    recommendedAction = 'delete_heartbeat_when_queues_are_empty';
+  }
+  const riskState = ['at_risk', 'stalled', 'blocked_controller', 'blocked_user', 'runaway'].includes(status);
+  const intervalMs = riskState ? HEARTBEAT_INTERVALS_MS.controller_risk : controllerHeartbeatInterval({ ...taskQueues, parallel }, now);
+  return {
+    protocolVersion: CONTROLLER_TASK_HEALTH_PROTOCOL_VERSION,
+    evaluatedAt: new Date(now).toISOString(),
+    status,
+    reasons,
+    recommendedAction,
+    newDispatchAllowed: !['stalled', 'blocked_controller', 'blocked_user', 'runaway'].includes(status),
+    intervalMs,
+    nextHealthCheckAt: new Date(now + intervalMs).toISOString(),
+    activeTasks: active,
+    stalledTaskIds: stalled.map((task) => task.threadId),
+    atRiskTaskIds: atRisk.map((task) => task.threadId),
+    meaningfulProgressDefinition: ['new_stage', 'new_evidence', 'new_test_result', 'candidate_commit', 'completion_or_failure_event', 'narrowed_blocker'],
+    ignoredAsProgress: ['repeated_command', 'rephrased_same_error', 'still_working_text', 'heartbeat_bookkeeping', 'title_or_archive_bookkeeping'],
+  };
 }
 
 function incidentSummary(task) {
@@ -4616,7 +4712,7 @@ export async function controllerScanPendingEvents(input) {
   const activeTaskRecords = directTasks.filter((task) => task.status === 'executing' && currentAttemptDispatched(task));
   const activeTasks = activeTaskRecords.map((task) => {
     const intervalMs = heartbeatIntervalForTask(task);
-    const lastObservedAt = latestTimestamp(task.controlPlaneRecovery?.status === 'completion_only' ? task.controlPlaneRecovery.preparedAt : null, task.incidentalRepairEventCreatedAt, task.progressEventCreatedAt, task.lastDispatchedAt);
+    const lastObservedAt = taskLastMeaningfulProgressAt(task);
     return { threadId: task.threadId, displayKey: task.displayKey, status: task.status, executionStatus: task.executionStatus, attemptCount: task.attemptCount, notificationStatus: task.notificationStatus, lastObservedAt, heartbeatIntervalMs: intervalMs, heartbeatDueAt: new Date(Date.parse(lastObservedAt) + intervalMs).toISOString() };
   });
   const overdueTasks = activeTasks.filter((task) => Date.parse(task.heartbeatDueAt) <= now);
@@ -4644,6 +4740,8 @@ export async function controllerScanPendingEvents(input) {
   });
   const taskQueues = controllerWorkQueues(registry.tasks, input.controllerThreadId);
   const parallel = controllerParallelRuntime(registry, input.controllerThreadId);
+  const taskHealthReview = controllerTaskHealthReview({ directTasks, pendingEvents, reviewQueue, routingQueue, objectiveFuses, incidentQueue, taskQueues, parallel, now });
+  const taskHealthNeedsAttention = ['stalled', 'blocked_controller', 'blocked_user', 'runaway'].includes(taskHealthReview.status);
   let cycleEvidence = null;
   if (input.heartbeatGeneration !== undefined && isSafeThreadId(input.heartbeatAutomationId)) {
     const fingerprint = controllerBusinessFingerprint(registry, input.controllerThreadId, pendingEvents, parallel);
@@ -4665,6 +4763,7 @@ export async function controllerScanPendingEvents(input) {
     activeTasks,
     overdueTasks,
     stalledActiveTasks,
+    taskHealthReview,
     zombieAttempts,
     preparedReworks,
     objectiveFuses,
@@ -4692,7 +4791,7 @@ export async function controllerScanPendingEvents(input) {
     heartbeatAction,
     notificationRequired: heartbeatState?.notificationStatus === 'pending',
     notificationText: heartbeatState?.notificationStatus === 'pending' ? `主控 watchdog 已停止自动续期：${heartbeatState.disableReason}。业务台账仍可继续；完成清理后使用 controller-resume-watchdog 显式恢复。` : null,
-    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || overdueTasks.length > 0 || stalledActiveTasks.length > 0 || zombieAttempts.length > 0 || preparedReworks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0 || parallel.fanoutRequired || parallel.singleDispatchReady || parallel.pendingDispatches.length > 0 || heartbeatState?.notificationStatus === 'pending',
+    needsControllerAttention: pendingEvents.length > 0 || reviewQueue.length > 0 || routingQueue.length > 0 || taskHealthNeedsAttention || zombieAttempts.length > 0 || preparedReworks.length > 0 || objectiveFuses.length > 0 || incidentQueue.length > 0 || contextHealth?.status === 'handoff_required' || threadActions.length > 0 || pendingMessageActions.length > 0 || staleDeferredMessages.length > 0 || parallel.fanoutRequired || parallel.singleDispatchReady || parallel.pendingDispatches.length > 0 || heartbeatState?.notificationStatus === 'pending',
     shouldKeepHeartbeat: queues.shouldKeepHeartbeat,
   };
 }
@@ -5311,7 +5410,7 @@ function optionalBoolean(args, name, defaultValue = false) {
 
 function helpText() {
   return [
-    'codex-task-control v0.21.0',
+    `codex-task-control v${TASK_CONTROL_VERSION}`,
     '',
     '实施简报与风险合同命令：',
     '  audit-implementation-contract --project-root <root> --contract <project-relative-json> --task-mode implementation|visual_implementation',
@@ -5326,7 +5425,7 @@ function helpText() {
     '  progress --self <thread> --summary <text> [--parent-turn-state running|idle|unknown] [--stage <stage-id>] [--evidence-ref <id=reference> ...]',
     '  incidental-repair --self <thread> --repair-id <id> --original-blocker <text> --same-objective-reason <text> --functional-domain <id> --affected-file <path|changeType|reason> --local-only true --reversible true --risk-assessment <text> --red-evidence-ref <id=reference> --green-evidence-ref <id=reference> [--conflict-domain <id> ...] [--risk-flag <flag> ...]',
     '  controller-ingest-incidental-repair --project-root <root> --controller <id> --event <event.json>',
-    '  controller-recover-control-plane-candidate --project-root <root> --controller <id> --thread <id> --control-plane-component task_control_protocol --candidate-commit <sha> --result-manifest <path> --skill-version 0.21.0 --reason <reason> --host-receipt <receipt>',
+    `  controller-recover-control-plane-candidate --project-root <root> --controller <id> --thread <id> --control-plane-component task_control_protocol --candidate-commit <sha> --result-manifest <path> --skill-version ${TASK_CONTROL_VERSION} --reason <reason> --host-receipt <receipt>`,
     '  report-failure --self <thread> --event-type task_failed|task_blocked --attempted-stage <stage> --failure-class <class> --failure-domain <domain> --command-summary <text> --mechanical-retry-eligible true|false [--parent-turn-state running|idle|unknown] [--evidence-command-id <contract-id>] [--evidence-ref <id=reference> ...]',
     '  complete --self <thread> --candidate-commit <sha> --result-manifest <project-relative-json> [--parent-turn-state running|idle|unknown]',
     '  notification-failed --self <thread> --action-id <returned-idle-send-action-id> --reason <host-error>',
@@ -5360,7 +5459,8 @@ function helpText() {
     '',
     'implementation 默认使用 adaptive_brief + bounded_incidental：同目标、同功能域、本地可逆的小缺陷可登记附带修复并继续；strict_scope/hard_contract 仍 fail closed。成果包必须报告实际影响文件、理由和验证依据。',
     'parallel batch 先规划候选矩阵，再登记/改名所有 wave 成员；单候选缺退化证据或部分 wave 未派发时 fail closed。',
-    'heartbeat 使用单次 watchdog；连续两轮无业务变化自动熔断，删除只自动补偿一次，清理失败后必须人工确认并显式 resume。',
+    'heartbeat 只有一个 COUNT=1 one-shot：普通单任务 15 分钟、并发 10 分钟、Terra high 25 分钟、风险/主控队列 5 分钟；scan 同时返回 taskHealthReview。',
+    '真实 progress/failure/completion 从事件时间重排 one-shot；连续两轮无有效业务进展自动熔断，阻止新派发但保留失败入账、收回、恢复和收口。',
     '运行中任务的普通消息先保存为 deferred_local；只有确认 idle 才返回 send_thread_message。stop/cancel 只有显式 authority 才返回 steer_thread_message。',
     'worker 到直接父主控同样采用事件先入账：父主控 running/unknown 时只保留 deferred_parent，不返回发送动作；确认 idle 才返回 send_thread_message。父主控扫描入账 deferred 事件后标记 observed，只有真实发送成功才标记 sent。',
     'worker 启动时可让 query-parent 预加载直接父任务 checkpoint 中已确认的 always 摘要；需要历史路线时才用 query-parent-context 读取直接父任务的已完成回合，不继承全量上下文。',

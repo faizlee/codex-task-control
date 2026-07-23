@@ -4,7 +4,7 @@ An auditable, review-gated controller for user-visible Codex tasks that forbids 
 
 Frontier models are valuable for planning and review, but repetitive work can burn their quota unnecessarily. Codex Task Control keeps the frontier model in control, forbids invisible internal subagents, and routes justified mechanical work only to inspectable Codex tasks using economical models.
 
-> Windows-first v0.21.0 preview. Worker-to-controller progress, completion, and failure notifications are now event-first and queued: a running or unknown parent is never interrupted, while an idle parent can receive a receipt-backed next-turn message. Installation also audits the matching managed user-level `AGENTS.md` rule. The tool makes zero model-provider calls.
+> Windows-first v0.22.0 preview. The controller now folds deterministic task-health review into its single adaptive one-shot heartbeat: 15 minutes for one ordinary task, 10 for concurrent work, 25 for Terra high, and 5 for risk/controller queues. Worker notifications remain event-first and queued. The tool makes zero model-provider calls.
 
 [简体中文](README.zh-CN.md)
 
@@ -23,11 +23,16 @@ Codex Task Control is for workflows where a controller delegates visible work an
 
 It records those facts in a project-isolated ledger and fails closed when identity or lifecycle evidence is ambiguous.
 
-## What v0.21.0 does
+## What v0.22.0 does
+
+- Keeps one `COUNT=1` heartbeat per direct controller; event ingestion and due health review share it instead of creating a second timer.
+- Returns schema-v1 `taskHealthReview` with `healthy`, `at_risk`, `stalled`, `blocked_controller`, `blocked_user`, `runaway`, and `idle` states plus reasons and a bounded next action.
+- Counts only durable stage/evidence/test/candidate/completion/failure or narrowed-blocker changes as meaningful progress. Repeated commands, rephrased errors, generic “still working” text, and title/archive bookkeeping do not reset the watchdog.
+- Keeps recovery and closeout open after a no-progress fuse, but blocks new registration/dispatch until cleanup and an explicit watchdog resume.
 
 - Writes worker progress, completion, and failure events before considering a parent notification. `running` or `unknown` parents receive `deferred_parent` with no host action; only confirmed `idle` returns `send_thread_message`.
 - Distinguishes `observed` from `sent`: direct-parent heartbeat/scan ingestion is enough to observe a deferred result, while `sent` still requires a real host delivery receipt.
-- Adds a read-only user `AGENTS.md` policy audit. Authorized installation can synchronize only the marked parent-notification rule; drift otherwise stops installation before the existing Skill is replaced.
+- Adds a read-only user `AGENTS.md` policy audit. Authorized installation can synchronize only the marked parent-notification and adaptive-health rules; drift otherwise stops installation before the existing Skill is replaced.
 
 - Extends the backward-compatible `query-parent` command with `--context-mode preload`: startup receives only the direct parent's verified `always` checkpoint facts, or a non-blocking `unavailable` result when no checkpoint exists.
 - Adds read-only `query-parent-context`. It returns a bounded host `read_thread` action for the registered direct parent, starting with three completed turns and no tool outputs; older pages are followed only while they add relevant evidence.
@@ -45,7 +50,7 @@ It records those facts in a project-isolated ledger and fails closed when identi
 
 - Prepares rework without incrementing the attempt. `controller-confirm-rework-dispatched` advances lifecycle only after a real host delivery receipt; cancellation and zombie-attempt recovery remain available independently of heartbeat health.
 - Requires implementation failures to bind a controller-fixed evidence command before they become lifecycle-authoritative. Ad-hoc command failures remain non-authoritative diagnostics.
-- Keeps heartbeat cleanup auditable but outside the business gate. Progress renews a logical lease without repeatedly replacing the App automation.
+- Keeps heartbeat cleanup auditable but outside recovery paths. Real progress, failure, and completion reschedule the one-shot from the event time through create/confirm/retire; no in-place replacement is allowed.
 - Requires parallel candidates to have incremental value, while allowing a started batch to shrink naturally after a peer reaches a terminal state.
 - Separates verified business deliveries, candidate commits, and passed control reviews in the HTML executive summary; zero verified delivery is stated explicitly.
 
@@ -105,7 +110,7 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Uses two-phase heartbeat commit: prepare locally, create a new App automation, confirm/switch the ledger, then delete the retired automation. An App failure cannot advance the confirmed generation.
 - Finalizes each controller cycle through one entry point. A terminal/quiescent controller with an unconfirmed replacement create receives a bounded `finalize_controller_cycle` action that compare-deletes that pending create and deletes the last confirmed automation.
 - Returns bounded compensation for expired heartbeat actions without letting host cleanup block failure ingestion, reclaim, recovery, or unrelated registration. Partial parallel send waves remain fail-closed.
-- Uses adaptive `COUNT=1` cadence: Luna repeatable 3 minutes, Terra medium 5 minutes, Terra high 10 minutes, and controller queues 5 minutes; simultaneous obligations take the shortest interval.
+- Uses adaptive `COUNT=1` cadence: one ordinary Luna/Terra-medium task 15 minutes, concurrent work 10 minutes, one Terra-high task 25 minutes, and risk/failure/review/routing/closeout queues 5 minutes.
 - Turns the first stale, wrong-ID, expired, repeated, or misconfigured heartbeat invocation into an empty-queue `delete_stale_automation` path; a repeated failure becomes manual-only instead of another automatic loop.
 - Persists last successful generation, automation ID, pending action, trigger/stale/delete-failure/no-progress counts, business fingerprint, fuse evidence, manual-resume reason, and one-time notification state.
 - Requires schema-v2 result manifests for new implementation tasks. They capture the candidate commit, actual affected files and reasons, worker-selected validation rationale, incomplete items, tests/metrics, and typed artifact references.
@@ -122,14 +127,14 @@ It records those facts in a project-isolated ledger and fails closed when identi
 - Keeps project-local `AGENTS.md`, workflows, tests, and acceptance rules authoritative.
 - Runs ledger operations without calling a model provider.
 
-## What v0.21.0 does not do
+## What v0.22.0 does not do
 
 - It does not read or reset your Codex quota.
 - It does not claim a fixed percentage of token savings.
 - It does not automatically spawn, stop, send to, or steer Codex tasks; it returns identity-scoped host actions and records their real receipts.
-- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.21.0 therefore persists dispatch waves and both message directions locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
+- The current programmatic Codex App message tool does not expose an explicit queue/steer mode, an atomic multi-task send, or a queue acknowledgement. v0.22.0 therefore persists dispatch waves and both message directions locally; a future host API can replace this compensation layer with native batch/queue delivery plus explicit receipts.
 - It cannot intercept a raw internal-subagent tool call made outside the skill; `AGENTS.md` must prohibit those calls.
-- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.21.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
+- It cannot make Codex App compare-and-delete an automation before a heartbeat message enters model context, atomically defer a scheduled message during an active turn, or cancel a host tool call that has already hung. v0.22.0 accepts a possible extra wake, keeps business recovery open, and stops automatic rearm after bounded evidence. A host-native hook would remove that remaining wake but is not required for loop safety.
 - It does not decide whether a screenshot looks good. The project visual oracle and registered direct controller still own visual judgment and acceptance.
 - It is currently tested on Windows paths; cross-platform project-root handling is planned.
 
@@ -151,7 +156,7 @@ To replace an existing installation:
 pwsh -File .\scripts\install.ps1 -Force
 ```
 
-If this release reports that the managed parent-notification rule in the user-level `AGENTS.md` is missing or still uses the legacy direct-send wording, obtain explicit user authorization in the current conversation, then run:
+If this release reports that the managed parent-notification or adaptive-health rule in the user-level `AGENTS.md` is missing or stale, obtain explicit user authorization in the current conversation, then run:
 
 ```powershell
 pwsh -File .\scripts\install.ps1 -Force -SyncUserAgents
@@ -159,13 +164,13 @@ pwsh -File .\scripts\install.ps1 -Force -SyncUserAgents
 
 Without that flag, the audit is read-only and installation fails before replacing the existing Skill. With the authorized flag, only the marked parent-notification block is changed; project files and the live task ledger are untouched.
 
-macOS/Linux can install the skill files, but the v0.21.0 ledger remains Windows-first:
+macOS/Linux can install the skill files, but the v0.22.0 ledger remains Windows-first:
 
 ```bash
 ./scripts/install.sh
 ```
 
-The installer first audits the managed user-level parent-notification rule, copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`, verifies the rule again, then runs read-only model-routing, thinking-routing, and terminal archive-backlog audits. It never edits the live task ledger. Any reported legacy task must be handled by its registered direct controller.
+The installer first audits the managed user-level task-control policy block, copies the skill to `${CODEX_HOME:-~/.codex}/skills/codex-task-control`, verifies the block again, then runs read-only model-routing, thinking-routing, and terminal archive-backlog audits. It never edits the live task ledger. Any reported legacy task must be handled by its registered direct controller.
 
 ## Configure the controller policy
 
@@ -275,7 +280,7 @@ node $TaskControl controller-ingest-incidental-repair --project-root "C:\work\ex
 If an older task-control protocol already stopped a valid registered-worktree candidate, the direct controller may reopen only its frozen completion after installing the fixed version:
 
 ```powershell
-node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.21.0" --reason "v0.21.0 preserves registered worktree result authority; business scope and evidence are unchanged." --host-receipt "<real controller approval receipt>"
+node $TaskControl controller-recover-control-plane-candidate --project-root "C:\work\example" --controller "controller-1" --thread "worker-1" --control-plane-component "task_control_protocol" --candidate-commit "<sha>" --result-manifest "docs/test-reports/result-manifest-v2.json" --skill-version "0.22.0" --reason "v0.22.0 preserves registered worktree result authority; business scope and evidence are unchanged." --host-receipt "<real controller approval receipt>"
 ```
 
 Do not record title success unless the Codex sidebar was actually renamed, and do not record dispatch unless the prompt was really sent. For every prepared heartbeat action, create a new `COUNT=1` automation whose prompt contains the action ID and generation, confirm the returned new ID with `controller-confirm-heartbeat-action`, then delete the returned retired ID. On App error or a 30-second timeout, call `controller-record-heartbeat-action-failed`; do not advance or fabricate success. Terminal descendants archive before their parent while audit records remain on disk.

@@ -169,6 +169,7 @@ describe('project-isolated task control', () => {
     const after = await readFile(agentsPath, 'utf8');
     assert.match(after, /codex-task-control:parent-notification-policy:start/);
     assert.match(after, /deferred_parent/);
+    assert.match(after, /默认单任务 15 分钟，并发批次 10 分钟，Terra high 长任务 25 分钟/);
     assert.doesNotMatch(after, /必须使用命令返回的 `parentThreadId` 和 `notificationText` 真实发送短通知/);
   });
 
@@ -189,7 +190,8 @@ describe('project-isolated task control', () => {
     const agents = await readFile(agentsPath, 'utf8');
     assert.match(agents, /codex-task-control:parent-notification-policy:start/);
     assert.match(agents, /deferred_parent/);
-    assert.match(installed.stdout, /User AGENTS parent-notification policy: compliant/);
+    assert.match(agents, /每个直接主控只维护一个 `COUNT=1` 临时 heartbeat/);
+    assert.match(installed.stdout, /User AGENTS task-control policy: compliant/);
   });
 
   it('keeps same-name tasks isolated between projects', async () => {

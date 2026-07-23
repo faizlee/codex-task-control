@@ -913,7 +913,7 @@ test('task-control protocol failure recovers the same candidate for completion o
     assert.equal(failed.status, 'changes_requested');
     assert.equal(failed.failureHistory.length, 1);
     const originalFailure = structuredClone(failed.failureHistory[0]);
-    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.21.0', reason: 'v0.21.0 preserves registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
+    const recovered = await controllerRecoverControlPlaneCandidate({ ...input, controlPlaneComponent: 'task_control_protocol', candidateCommit: git.candidateCommit, resultManifestPath: manifestRelativePath, skillVersion: '0.22.0', reason: 'v0.22.0 preserves registered candidate-worktree result authority without changing business scope or evidence.', hostReceipt: 'controller-approved-completion-only-recovery' });
     assert.equal(recovered.status, 'executing');
     assert.equal(recovered.attemptCount, 1);
     assert.equal(recovered.controlPlaneRecovery.status, 'completion_only');
@@ -2237,7 +2237,7 @@ test('controller scan discovers a fresh completion and keeps the heartbeat', asy
   });
 });
 
-test('adaptive heartbeat starts on dispatch, renews a logical lease on progress, and only reschedules at a real boundary', async () => {
+test('adaptive heartbeat starts on dispatch and real progress reschedules the single one-shot from the event time', async () => {
   const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-heartbeat-'));
   const projectRoot = 'E:\\work\\project\\adaptive-heartbeat';
   const input = {
@@ -2274,7 +2274,7 @@ test('adaptive heartbeat starts on dispatch, renews a logical lease on progress,
 
     const dispatched = await controllerRecordDispatched(input);
     assert.equal(dispatched.heartbeatAction.type, 'create_controller_heartbeat');
-    assert.equal(dispatched.heartbeatAction.intervalMs, 3 * 60 * 1000);
+    assert.equal(dispatched.heartbeatAction.intervalMs, 15 * 60 * 1000);
     assert.equal(dispatched.heartbeatAction.mode, 'one_shot');
     assert.equal(dispatched.heartbeatState.generation, 0, 'prepare must not advance confirmed generation');
     const dispatchGeneration = dispatched.heartbeatAction.generation;
@@ -2289,15 +2289,18 @@ test('adaptive heartbeat starts on dispatch, renews a logical lease on progress,
     assert.deepEqual(scan.pendingEvents.map((event) => event.type), ['task_progress']);
     const progressed = await controllerIngestProgress({ ...input, eventPath: progressPath });
     assert.equal(progressed.heartbeatState.generation, dispatchGeneration);
-    assert.equal(progressed.heartbeatAction, null, 'progress must not replace the physical App automation');
-    assert.ok(Date.parse(progressed.heartbeatState.logicalLeaseDueAt) > Date.parse(dispatchDueAt));
+    assert.equal(progressed.heartbeatAction.type, 'create_controller_heartbeat');
+    assert.equal(progressed.heartbeatAction.intervalMs, 15 * 60 * 1000);
+    assert.ok(Date.parse(progressed.heartbeatAction.dueAt) > Date.parse(dispatchDueAt));
+    const progressedGeneration = progressed.heartbeatAction.generation;
+    await controllerConfirmHeartbeatAction({ ...input, actionId: progressed.heartbeatAction.actionId, automationId: 'heartbeat-auto-2' });
 
     await delay();
     const completionPath = await createCompletionEvent({ taskControlHome, selfThreadId: input.threadId, candidateCommit: 'adaptive-candidate-1' });
     const completed = await controllerIngestCompletion({ ...input, eventPath: completionPath });
-    assert.equal(completed.heartbeatState.generation, dispatchGeneration);
+    assert.equal(completed.heartbeatState.generation, progressedGeneration);
     assert.equal(completed.heartbeatAction.intervalMs, 5 * 60 * 1000);
-    assert.ok(completed.heartbeatAction.generation > dispatchGeneration);
+    assert.ok(completed.heartbeatAction.generation > progressedGeneration);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
@@ -2315,8 +2318,8 @@ test('heartbeat replacement failure does not advance the confirmed generation', 
     const progressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'bounded check reached a real checkpoint' });
     const prepared = await controllerIngestProgress({ ...input, eventPath: progressPath });
     assert.equal(prepared.heartbeatState.generation, 1);
-    assert.equal(prepared.heartbeatAction, null);
-    const replacement = await controllerRearmHeartbeat({ ...input, reason: 'reconcile' });
+    assert.equal(prepared.heartbeatAction.type, 'create_controller_heartbeat');
+    const replacement = prepared;
     assert.equal(replacement.heartbeatAction.generation, 2);
     const failed = await controllerRecordHeartbeatActionFailed({ ...input, actionId: replacement.heartbeatAction.actionId, reason: 'automation_update timed out' });
     assert.equal(failed.heartbeatState.generation, 1);
@@ -2572,6 +2575,10 @@ test('two consecutive no-progress watchdog cycles stop automatic rearm without b
     assert.equal(third.shouldKeepHeartbeat, false);
     assert.equal(third.heartbeatAction.type, 'controller_finalize_cycle');
     assert.equal((await controllerAssertBusinessReady(input)).businessAllowed, true);
+    await assert.rejects(
+      controllerRegisterTask({ ...input, threadId: 'watchdog-no-progress-new-worker', title: 'Must wait for controller health review' }),
+      (error) => error instanceof TaskControlError && error.code === 'CONTROLLER_HEALTH_REVIEW_REQUIRED',
+    );
 
     await delay();
     const lateProgressPath = await createProgressEvent({ taskControlHome, selfThreadId: input.threadId, summary: 'Late progress arrived after the watchdog fuse opened.' });
@@ -2634,7 +2641,8 @@ test('terminal closeout supersedes an unconfirmed create without blocking unrela
       evidence: [{ id: 'runner-log', reference: 'logs/runner-blocked.txt' }],
     });
     const failed = await controllerIngestFailure({ ...input, eventPath: failurePath, eventType: 'task_blocked' });
-    assert.equal(failed.heartbeatAction, null, 'failure must reuse the untriggered confirmed one-shot');
+    assert.equal(failed.heartbeatAction.type, 'create_controller_heartbeat', 'failure must reschedule a five-minute risk review from the failure event');
+    assert.equal(failed.heartbeatAction.intervalMs, 5 * 60 * 1000);
 
     const reclaimed = await controllerReclaimTask({ ...input, reason: 'A second blocker requires controller recovery.', userSummary: 'The failed attempt was closed without another automatic replacement.' });
     await controllerMarkCloseoutNotificationSent(input);
@@ -2703,7 +2711,7 @@ test('adaptive heartbeat cadence follows the active work class and thinking leve
   };
   try {
     const { dispatched } = await register(input);
-    assert.equal(dispatched.heartbeatAction.intervalMs, 10 * 60 * 1000);
+    assert.equal(dispatched.heartbeatAction.intervalMs, 25 * 60 * 1000);
     await controllerConfirmHeartbeatAction({ ...input, actionId: dispatched.heartbeatAction.actionId, automationId: 'routing-terra-auto-1' });
 
     const cleanupInput = {
@@ -2716,9 +2724,50 @@ test('adaptive heartbeat cadence follows the active work class and thinking leve
       quotaReason: 'repeatable cleanup setup saves premium controller quota',
     };
     const { dispatched: cleanupDispatched } = await register(cleanupInput);
+    assert.equal(cleanupDispatched.heartbeatAction.intervalMs, 10 * 60 * 1000, 'two active direct tasks use the concurrent cadence');
     await controllerConfirmHeartbeatAction({ ...cleanupInput, actionId: cleanupDispatched.heartbeatAction.actionId, automationId: 'routing-cleanup-auto-2' });
     const blocked = await controllerMarkBlocked({ ...cleanupInput, reason: 'superseded test task', userSummary: 'The test task is superseded and safely stopped.', blockerSource: 'superseded' });
     assert.equal(blocked.heartbeatAction.intervalMs, 5 * 60 * 1000);
+  } finally {
+    await rm(taskControlHome, { recursive: true, force: true });
+  }
+});
+
+test('task health review is quiet at normal risk and becomes actionable only after the meaningful-progress stall deadline', async () => {
+  const taskControlHome = await mkdtemp(join(tmpdir(), 'codex-task-control-health-review-'));
+  const projectRoot = 'E:\\work\\project\\controller-task-health';
+  try {
+    const { input, dispatched } = await createHeartbeatFixture(taskControlHome, projectRoot, { threadId: 'health-review-worker' });
+    await controllerConfirmHeartbeatAction({ ...input, actionId: dispatched.heartbeatAction.actionId, automationId: 'health-review-auto-1' });
+    const registryPath = join(taskControlHome, 'projects', projectKeyForRoot(projectRoot), 'task-registry.json');
+    const registry = JSON.parse(await readFile(registryPath, 'utf8'));
+    const task = registry.tasks.find((entry) => entry.threadId === input.threadId);
+    task.lastDispatchedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    registry.updatedAt = new Date().toISOString();
+    await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8');
+
+    let scan = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 1, heartbeatAutomationId: 'health-review-auto-1', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=15;COUNT=1', heartbeatOccurrence: 1 });
+    assert.equal(scan.taskHealthReview.protocolVersion, 1);
+    assert.equal(scan.taskHealthReview.status, 'at_risk');
+    assert.equal(scan.taskHealthReview.intervalMs, 5 * 60 * 1000);
+    assert.equal(scan.taskHealthReview.newDispatchAllowed, true);
+    assert.equal(scan.needsControllerAttention, false);
+    assert.deepEqual(scan.taskHealthReview.ignoredAsProgress, ['repeated_command', 'rephrased_same_error', 'still_working_text', 'heartbeat_bookkeeping', 'title_or_archive_bookkeeping']);
+    const rearmed = await controllerFinalizeCycle(input);
+    assert.equal(rearmed.heartbeatAction.intervalMs, 5 * 60 * 1000, 'the next physical one-shot must match the at-risk health recommendation');
+    await controllerConfirmHeartbeatAction({ ...input, actionId: rearmed.heartbeatAction.actionId, automationId: 'health-review-auto-2' });
+
+    task.lastDispatchedAt = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+    registry.updatedAt = new Date().toISOString();
+    const refreshed = JSON.parse(await readFile(registryPath, 'utf8'));
+    refreshed.tasks.find((entry) => entry.threadId === input.threadId).lastDispatchedAt = task.lastDispatchedAt;
+    refreshed.updatedAt = registry.updatedAt;
+    await writeFile(registryPath, `${JSON.stringify(refreshed, null, 2)}\n`, 'utf8');
+    scan = await controllerScanPendingEvents({ ...input, heartbeatGeneration: 2, heartbeatAutomationId: 'health-review-auto-2', heartbeatRrule: 'FREQ=MINUTELY;INTERVAL=5;COUNT=1', heartbeatOccurrence: 1 });
+    assert.equal(scan.taskHealthReview.status, 'stalled');
+    assert.equal(scan.taskHealthReview.newDispatchAllowed, false);
+    assert.deepEqual(scan.taskHealthReview.stalledTaskIds, [input.threadId]);
+    assert.equal(scan.needsControllerAttention, true);
   } finally {
     await rm(taskControlHome, { recursive: true, force: true });
   }
